@@ -24,7 +24,7 @@ actually cares about live: the WhatsApp template contract and phone normalizatio
 
 ### 1. The template contract — `templates.py`
 
-`TEMPLATE_BODY` documents the approved `ar` template with its 4 placeholders.
+`TEMPLATE_BODY` documents the approved `en_EG` template with its 4 placeholders.
 `InvoiceTemplateBuilder.build(invoice, to_phone)` produces the full Meta payload,
 ordering the parameters **{{1}} name, {{2}} number, {{3}} date, {{4}} total**
 exactly as the body expects, and `parameters(invoice)` is the ordered list — kept

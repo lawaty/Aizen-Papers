@@ -27,7 +27,7 @@ class Settings:
     default_country_code: str = "20"
     wa_api_version: str = "v25.0"
     wa_template_name: str = "aizen_invoice"
-    wa_template_lang: str = "ar"
+    wa_template_lang: str = "en_EG"
     wa_timeout: float = 15.0
     dry_run: bool = False
     log_level: str = "INFO"
@@ -37,16 +37,17 @@ class Settings:
         cls,
         env: Mapping[str, str] | None = None,
         require_whatsapp: bool = False,
+        require_daftra: bool = True,
     ) -> "Settings":
         source = os.environ if env is None else env
-        required = ["DAFTRA_API_KEY"]
+        required = ["DAFTRA_API_KEY"] if require_daftra else []
         if require_whatsapp:
             required += ["WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID"]
         missing = [name for name in required if not source.get(name)]
         if missing:
             raise RuntimeError(f"Missing required env vars: {', '.join(missing)}")
         return cls(
-            daftra_api_key=source["DAFTRA_API_KEY"],
+            daftra_api_key=source.get("DAFTRA_API_KEY", ""),
             wa_access_token=source.get("WHATSAPP_ACCESS_TOKEN", ""),
             wa_phone_number_id=source.get("WHATSAPP_PHONE_NUMBER_ID", ""),
             daftra_base_url=source.get("DAFTRA_BASE_URL", DAFTRA_BASE_URL).rstrip("/"),
@@ -54,8 +55,8 @@ class Settings:
             default_country_code=source.get("DEFAULT_COUNTRY_CODE", "20").strip(),
             wa_api_version=source.get("WHATSAPP_API_VERSION", "v25.0"),
             wa_template_name=source.get("WHATSAPP_TEMPLATE_NAME", "aizen_invoice"),
-            wa_template_lang=source.get("WHATSAPP_TEMPLATE_LANG", "ar"),
+            wa_template_lang=source.get("WHATSAPP_TEMPLATE_LANG", "en_EG"),
             wa_timeout=_env_float(source, "WHATSAPP_TIMEOUT", 15.0),
-            dry_run=source.get("WHATSAPP_DRY_RUN", "false").lower() in ("1", "true", "yes"),
-            log_level=source.get("LOG_LEVEL", "INFO"),
+            dry_run=(source.get("WHATSAPP_DRY_RUN") or "false").strip().lower() in ("1", "true", "yes"),
+            log_level=(source.get("LOG_LEVEL") or "INFO").strip(),
         )

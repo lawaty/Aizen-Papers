@@ -18,8 +18,8 @@ dumb: parse args, build the object graph, call the use case, print output.
 
 | Command | Flags | Net effect |
 |---|---|---|
-| `send` | `--invoice-id` (req), `--to`, `--dry-run` | build + send; prints the wamid on success |
-| `preview` | `--invoice-id` (req), `--to` | print payload JSON, **never sends** |
+| `send` | `--invoice-id` (req), `--to`, `--dry-run`, `--freeform` | build + send; prints the wamid on success; `--freeform` sends plain text instead of template |
+| `preview` | `--invoice-id` (req), `--to`, `--freeform` | print payload JSON, **never sends**; `--freeform` previews the plain-text payload |
 | `show` | `--invoice-id` (req), `--raw` | print normalized invoice (or raw Daftra JSON) |
 | `list` | `--limit` (default 10) | print recent invoices as a table |
 

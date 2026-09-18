@@ -35,7 +35,7 @@ Copy `.env.example` to `.env` and fill in the values:
 | `DAFTRA_TIMEOUT` | no (default `15`) | Daftra HTTP timeout (s) |
 | `WHATSAPP_API_VERSION` | no (default `v25.0`) | Graph API version |
 | `WHATSAPP_TEMPLATE_NAME` | no (default `aizen_invoice`) | approved template name |
-| `WHATSAPP_TEMPLATE_LANG` | no (default `ar`) | template language code |
+| `WHATSAPP_TEMPLATE_LANG` | no (default `en_EG`) | template language code |
 | `WHATSAPP_TIMEOUT` | no (default `15`) | Meta HTTP timeout (s) |
 | `WHATSAPP_DRY_RUN` | no (default `false`) | never really send |
 | `DEFAULT_COUNTRY_CODE` | no (default `20`) | for local→E.164 phone conversion |

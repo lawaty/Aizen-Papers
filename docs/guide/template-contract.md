@@ -10,7 +10,7 @@ business-initiated message. It mirrors `TEMPLATE_BODY` inside
 
 ## The approved body
 
-Language: `ar`. Body text (as registered in Meta's template manager):
+Language: `en_EG` (English - Egypt). Body text (as registered in Meta's template manager):
 
 ```
 مَرْحَبًا {{1}}، 👋
@@ -51,7 +51,7 @@ Including it produces `1,500.00 ج.م ج.م`.
   "type": "template",
   "template": {
     "name": "aizen_invoice",
-    "language": { "code": "ar" },
+    "language": { "code": "en" },
     "components": [
       { "type": "body", "parameters": [
         { "type": "text", "text": "Ahmed Hassan" },
@@ -70,7 +70,7 @@ Including it produces `1,500.00 ج.م ج.م`.
 
 - **Placeholder count mismatch** — more or fewer than 4 parameters.
 - **Wrong order** — params must match `{{1}}`→`{{4}}` left to right.
-- **Wrong language code** — must be `ar` (what the template was approved as).
+- **Wrong language code** — must be `en_EG` (what the template was approved as).
 - **Non-E.164 recipient** — `to` must be international (`2010…`, not `010…`).
 - **Unsanitized text** — parameters must not contain newlines/tabs/4+ spaces and
   must be ≤512 chars.

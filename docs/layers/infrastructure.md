@@ -54,7 +54,7 @@ the dry-run flag — every knob is centralized here. Secrets
 (`daftra_api_key`, `wa_access_token`) are `field(repr=False)`. WhatsApp
 credentials are required **lazily**: `from_env(require_whatsapp=…)` only demands
 them when a command actually needs the sender. All knobs have sane defaults
-(Daftra base URL, template name `aizen_invoice`, lang `ar`, country `20`,
+(Daftra base URL, template name `aizen_invoice`, lang `en_EG`, country `20`,
 Graph `v25.0`).
 
 ### `util.py`

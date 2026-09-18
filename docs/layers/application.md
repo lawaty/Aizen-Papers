@@ -36,8 +36,9 @@ stub source or sender for testing with no magic.
 | `get_raw_invoice(id)` | pass through the unmapped Daftra JSON (debugging) |
 | `list_invoices(limit)` | list recent invoices |
 | `build_message(invoice, to_phone)` | produce the payload dict for a given recipient |
-| `preview_invoice(id, to?)` | invoice + resolved recipient + payload, **no send** |
+| `preview_invoice(id, to?, freeform?)` | invoice + resolved recipient + payload, **no send**; `freeform=True` builds a plain-text payload |
 | `send_invoice(id, to?, dry_run?)` | the full send path |
+| `send_freeform(id, to?, dry_run?)` | the full send path using plain text instead of template |
 
 ## Sequencing rules owned here
 

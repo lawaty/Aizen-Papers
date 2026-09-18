@@ -28,7 +28,7 @@ class InvoiceNotificationService:
     def build_message(self, invoice: Invoice, to_phone: str) -> dict:
         return self._builder.build(invoice, to_phone)
 
-    def preview_invoice(self, invoice_id: int | str, to_phone: str | None = None):
+    def preview_invoice(self, invoice_id: int | str, to_phone: str | None = None, freeform: bool = False):
         invoice = self.get_invoice(invoice_id)
         recipient = to_phone or invoice.customer_phone
         if not recipient:
@@ -36,12 +36,22 @@ class InvoiceNotificationService:
                 f"Invoice {invoice.number} has no valid WhatsApp phone on file "
                 "(missing or failed normalization); pass --to explicitly."
             )
-        return invoice, recipient, self._builder.build(invoice, recipient)
+        builder_method = self._builder.build_text if freeform else self._builder.build
+        return invoice, recipient, builder_method(invoice, recipient)
 
     def send_invoice(self, invoice_id: int | str, to_phone: str | None = None, dry_run: bool = False) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
         invoice, recipient, payload = self.preview_invoice(invoice_id, to_phone)
+        if dry_run:
+            return {"dry_run": True, "invoice": invoice, "payload": payload, "to": recipient}
+        response = self._sender.send(payload)
+        return {"invoice": invoice, "payload": payload, "response": response, "to": recipient}
+
+    def send_freeform(self, invoice_id: int | str, to_phone: str | None = None, dry_run: bool = False) -> dict:
+        if self._sender is None:
+            raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
+        invoice, recipient, payload = self.preview_invoice(invoice_id, to_phone, freeform=True)
         if dry_run:
             return {"dry_run": True, "invoice": invoice, "payload": payload, "to": recipient}
         response = self._sender.send(payload)

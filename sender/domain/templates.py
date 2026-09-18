@@ -18,7 +18,7 @@ class InvoiceTemplateBuilder:
         "✨ ثِقتكم مَحلُّ تقديرنا دائمًا."
     )
 
-    def __init__(self, template_name: str, language: str = "ar", country_code: str = "20") -> None:
+    def __init__(self, template_name: str, language: str = "en_EG", country_code: str = "20") -> None:
         self._name = template_name
         self._lang = language
         self._country_code = country_code
@@ -43,6 +43,22 @@ class InvoiceTemplateBuilder:
             self._text(self._format_date(invoice.issue_date)),
             self._text(self._money(invoice.total)),
         ]
+
+    def render_text(self, invoice: Invoice) -> str:
+        values = [p["text"] for p in self.parameters(invoice)]
+        body = self.TEMPLATE_BODY
+        for i, value in enumerate(values, start=1):
+            body = body.replace(f"{{{{{i}}}}}", value)
+        return body
+
+    def build_text(self, invoice: Invoice, to_phone: str) -> dict:
+        return {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": normalize_phone(to_phone, self._country_code),
+            "type": "text",
+            "text": {"body": self.render_text(invoice)},
+        }
 
     def _text(self, value, max_length: int = 512) -> dict:
         return {"type": "text", "text": self._sanitize(value, max_length)}

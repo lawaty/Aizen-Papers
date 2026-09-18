@@ -74,10 +74,11 @@ configurable via env. See the [domain](layers/domain.md) page.
 
 ## 6. Meta constraints baked in
 
-- Business-initiated messages *must* use a template; free-form is blocked.
+- Business-initiated messages *must* use a template; a freeform plain-text path
+  exists for layout testing while template approval is pending (see `--freeform`).
 - In test mode, recipients are limited to the **≤5 verified phone numbers**; the
   recipient's number must appear in test numbers or `recipient_type` fails.
-- The language code must match the template's approved language (`ar`).
+- The language code must match the template's approved language (`en_EG`).
 - Retries are restricted to HTTP 429 (rate limit), which is the one transient,
   safe-to-retry class of failure.
 
