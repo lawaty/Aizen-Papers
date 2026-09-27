@@ -24,7 +24,13 @@ A small, dependency-light Python command-line tool that:
 2. **Normalizes** it into a clean internal `Invoice` model,
 3. **Builds** a WhatsApp template payload whose 4 variables (`{{1}}`–`{{4}}`)
    are filled with the customer name, invoice number, issue date, and total,
-4. **Sends** it through the Meta API to the customer's phone.
+   and attaches the invoice **PDF** — rendered here and uploaded to Meta, because
+   Daftra exposes no export and its own file URL is behind a login
+   (builder auto-switches as the template is updated in WhatsApp Manager),
+4. **Sends** it through the Meta API to the customer's phone,
+5. **Polls** Daftra continuously (`poll`): each cycle lists recent invoices from
+   every configured Daftra app (one or two tenants), sends the *new* ones to
+   their customers, and remembers what it already handled in `poll_state.json`.
 
 The result is a single repeatable command:
 
@@ -32,7 +38,15 @@ The result is a single repeatable command:
 python -m sender send --invoice-id <id>
 ```
 
-with `preview`, `show`, and `list` commands for safe, non-destructive inspection.
+or, to automate the whole flow:
+
+```bash
+python -m sender poll
+```
+
+with `preview`, `show`, and `list` commands for safe, non-destructive
+inspection, `poll-status`/`poll-reset` to inspect and reset the poll state, and
+a persistent `--stub` mode to rehearse the whole flow offline.
 
 ## Reading this documentation
 
@@ -47,7 +61,9 @@ docs/
 ├── design.md                    ← why it's built this way (decisions)
 ├── guide/
 │   ├── getting-started.md       ← install, configure, run
-│   └── template-contract.md     ← the aizen_invoice template & variable mapping
+│   ├── template-contract.md     ← the aizen_invoice template & variable mapping
+│   ├── invoice-pdf.md           ← how the invoice PDF is attached
+│   └── delivery-status.md       ← webhook setup, 200-wamid trap, error codes
 └── layers/
     ├── domain.md                ← domain layer (pure, no dependencies)
     ├── application.md           ← application/use-case layer
@@ -61,6 +77,8 @@ docs/
 - [Design decisions](design.md)
 - [Guides — getting started](guide/getting-started.md)
 - [Guides — WhatsApp template contract](guide/template-contract.md)
+- [Guides — invoice PDF attachment](guide/invoice-pdf.md)
+- [Guides — delivery status & webhook](guide/delivery-status.md)
 - [Layers — domain](layers/domain.md)
 - [Layers — application](layers/application.md)
 - [Layers — infrastructure](layers/infrastructure.md)

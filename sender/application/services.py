@@ -16,14 +16,23 @@ class InvoiceNotificationService:
         self._sender = sender
         self._builder = builder
 
+    @property
+    def builder(self) -> InvoiceTemplateBuilder:
+        return self._builder
+
+    def swap_builder(self, builder: InvoiceTemplateBuilder) -> None:
+        self._builder = builder
+
     def get_invoice(self, invoice_id: int | str) -> Invoice:
         return self._source.get_invoice(invoice_id)
 
     def get_raw_invoice(self, invoice_id: int | str) -> dict:
         return self._source.get_raw_invoice(invoice_id)
 
-    def list_invoices(self, limit: int = 10) -> list[Invoice]:
-        return self._source.list_invoices(limit=limit)
+    def list_invoices(self, limit: int = 10, page: int = 1) -> list[Invoice]:
+        # The port declares a page (the poller pages over saturated listings);
+        # dropping it here silently pinned every caller to the first page.
+        return self._source.list_invoices(limit=limit, page=page)
 
     def build_message(self, invoice: Invoice, to_phone: str) -> dict:
         return self._builder.build(invoice, to_phone)

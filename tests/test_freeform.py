@@ -1,10 +1,11 @@
 """Offline checks for the freeform (plain-text) WhatsApp send path."""
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 
 from sender.domain.models import Invoice
-from sender.domain.templates import InvoiceTemplateBuilder
+from sender.domain.templates import LegacyInvoiceTemplateBuilder
 
 
 def _sample_invoice() -> Invoice:
@@ -17,8 +18,8 @@ def _sample_invoice() -> Invoice:
     )
 
 
-def _builder() -> InvoiceTemplateBuilder:
-    return InvoiceTemplateBuilder(template_name="aizen_invoice", language="en_EG", country_code="20")
+def _builder() -> LegacyInvoiceTemplateBuilder:
+    return LegacyInvoiceTemplateBuilder(template_name="aizen_invoice", language="en", country_code="20")
 
 
 def test_render_text_contains_exact_values():
@@ -48,13 +49,20 @@ def test_build_text_payload_shape():
 def test_parameters_unchanged():
     params = _builder().parameters(_sample_invoice())
     texts = [param["text"] for param in params]
-    assert texts == ["Ahmed Hassan", "INV-001", "01/09/2026", "1,500.00"]
+    assert texts == [
+        "\u2068Ahmed Hassan\u2069",
+        "\u2066INV-001\u2069",
+        "\u206601/09/2026\u2069",
+        "\u20661,500.00\u2069",
+    ]
     assert all(param["type"] == "text" for param in params)
 
 
 def test_build_template_unchanged():
-    payload = _builder().build(_sample_invoice(), "01027693262")
+    invoice = replace(_sample_invoice(), public_url="https://demo.daftra.com/invoices/INV-001.pdf")
+    payload = _builder().build(invoice, "01027693262")
     assert payload["to"] == "201027693262"
     assert payload["type"] == "template"
     assert payload["template"]["name"] == "aizen_invoice"
-    assert payload["template"]["language"]["code"] == "en_EG"
+    assert payload["template"]["language"]["code"] == "en"
+    assert [component["type"] for component in payload["template"]["components"]] == ["header", "body"]

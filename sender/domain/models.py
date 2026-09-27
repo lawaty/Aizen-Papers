@@ -28,3 +28,7 @@ class Invoice:
     issue_date: date | None = None
     items: tuple[InvoiceItem, ...] = ()
     public_url: str | None = None
+    #: The invoice PDF itself, when the source exposes one (``invoice_pdf_url``).
+    #: ``public_url`` stays the human-facing page (Daftra's HTML preview), which is
+    #: a *different* resource: the template header document must point at the PDF.
+    pdf_url: str | None = None

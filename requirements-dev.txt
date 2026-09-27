@@ -1,0 +1,3 @@
+# Test-only dependencies; the sender itself needs just requirements.txt.
+# Install with: pip install -r requirements-dev.txt
+pytest>=8

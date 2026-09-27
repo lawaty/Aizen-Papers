@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from sender.domain.models import Invoice, InvoiceItem
 from sender.domain.phones import normalize_phone
+
+log = logging.getLogger(__name__)
 
 STATUS_LABELS = {
     -1: "Draft",
@@ -23,10 +26,39 @@ PAID_KEYS = ("summary_paid", "total_paid", "paid_amount")
 BALANCE_KEYS = ("summary_unpaid", "balance_due", "remaining", "due_amount")
 ISSUE_KEYS = ("date", "issue_date", "invoice_date")
 CURRENCY_KEYS = ("currency_code", "currency", "default_currency_code")
-URL_KEYS = ("invoice_html_url", "invoice_pdf_url", "public_url", "permalink")
+#: The human-facing page the customer can open. Deliberately *not* the PDF: the
+#: template's body already links to this, and it is what the mapper has always
+#: exposed, so keeping the two apart is a behaviour change in name only.
+PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
+#: The actual PDF. Daftra only ever exposes this as ``invoice_pdf_url``, and it
+#: is session-gated (it redirects to the login page without a browser session),
+#: which is why the sender renders its own copy instead of linking to it.
+PDF_URL_KEYS = ("invoice_pdf_url",)
+
+
+def _raise_money(value, cause: Exception | None = None) -> Decimal:
+    """Raise the mapper's canonical "this amount cannot be parsed" error.
+
+    Returning a helper keeps the message and the exception type in one place so
+    every caller (the integer path, the string path, the ``Decimal`` fallback)
+    fails identically.
+    """
+    error = ValueError(f"Unparseable money value: {value!r}")
+    if cause is not None:
+        raise error from cause
+    raise error
 
 
 class DaftraInvoiceMapper:
+    def __init__(self, country_code: str = "20") -> None:
+        # The phone is normalized here with the *configured* country code rather
+        # than a hardcoded 20: the poller re-normalizes with the same setting, so
+        # two passes that disagree (a Saudi local number read as Egyptian, a value
+        # dropped as "unusable" and fetched again) silently corrupted the number.
+        # Kept as "20" by default so the historic Egypt-only behaviour is the
+        # default of a bare DaftraInvoiceMapper().
+        self._country_code = country_code
+
     def to_invoice(self, raw: dict) -> Invoice:
         node = self._data_node(raw)
         if not isinstance(node, dict):
@@ -38,8 +70,9 @@ class DaftraInvoiceMapper:
             )
         if not invoice.get("id") and not invoice.get("no"):
             raise ValueError(f"Malformed Daftra response: missing invoice data in {list(node)[:6]}")
-        client = node.get("Client") if isinstance(node.get("Client"), dict) else {}
-        items_raw = node.get("InvoiceItem") or []
+        client_raw = self._embedded(invoice, node, "Client")
+        client = client_raw if isinstance(client_raw, dict) else {}
+        items_raw = self._embedded(invoice, node, "InvoiceItem") or []
         if isinstance(items_raw, dict):
             items_raw = [items_raw]
         if not isinstance(items_raw, list):
@@ -65,19 +98,47 @@ class DaftraInvoiceMapper:
             balance_due=self._money(balance),
             issue_date=self._date(self._first(invoice, ISSUE_KEYS)),
             items=items,
-            public_url=self._first(invoice, URL_KEYS),
+            public_url=self._first(invoice, PUBLIC_URL_KEYS),
+            pdf_url=self._first(invoice, PDF_URL_KEYS),
         )
 
     def to_invoices(self, raw: dict) -> list[Invoice]:
         data = raw.get("data") if isinstance(raw, dict) else None
         rows = data if isinstance(data, list) else []
-        return [self.to_invoice(row) for row in rows if isinstance(row, dict)]
+        invoices: list[Invoice] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                invoices.append(self.to_invoice(row))
+            except ValueError as exc:
+                # One invoice that cannot be normalized (e.g. a genuinely
+                # unparseable amount) must not take the whole tenant's cycle
+                # down: skip it so the rest of the listing flows, and warn so
+                # the operator sees it. It is never marked seen, so it is
+                # re-attempted on the next cycle and stays visible until the
+                # source data is fixed.
+                log.warning(
+                    "skipping an invoice that could not be normalized (%s); it will "
+                    "be re-attempted on the next cycle",
+                    exc,
+                )
+        return invoices
 
     def _data_node(self, raw: dict) -> dict:
         if not isinstance(raw, dict):
             return raw
         data = raw.get("data")
         return data if isinstance(data, dict) else raw
+
+    @staticmethod
+    def _embedded(invoice: dict, node: dict, key: str):
+        """Daftra nests Client/InvoiceItem inside the Invoice object; older
+        payloads and the offline stub place them beside it. Prefer the nested
+        value whenever the key is present on the invoice itself."""
+        if isinstance(invoice, dict) and key in invoice:
+            return invoice[key]
+        return node.get(key)
 
     def _to_item(self, item: dict) -> InvoiceItem:
         return InvoiceItem(
@@ -142,28 +203,65 @@ class DaftraInvoiceMapper:
 
     @staticmethod
     def _money(value) -> Decimal:
+        """Parse a money value into a Decimal, failing loudly on a *present but
+        unparseable* value instead of silently sending a wrong amount.
+
+        Daftra returns JSON numbers today, but a formatted string from the API or
+        an intermediary (``"EGP 1,250.00"``, ``"12,345,678"``, ``"1 250,00"``)
+        must parse to the right amount — a silent ``0.00`` on a customer-facing
+        document is the worst failure this mapper can have. The last of ``,``/``.``
+        wins as the decimal separator when both are present; a lone comma with 1-2
+        digits after it is a decimal point (``1,99``), otherwise a thousands
+        separator; a lone dot is a decimal point. Thousand groups are validated so
+        ``1.234.567`` parses but ``12..34`` raises.
+        """
         if isinstance(value, bool):
             return Decimal("1" if value else "0")
         if value is None or value == "":
             return Decimal("0")
-        if isinstance(value, Decimal):
-            return value if value.is_finite() else Decimal("0")
-        text = str(value).strip()
-        if "," in text and "." in text:
-            if text.rindex(",") > text.rindex("."):
-                text = text.replace(".", "").replace(",", ".")
+        if isinstance(value, (int, float, Decimal)):
+            result = Decimal(str(value))
+            return result if result.is_finite() else _raise_money(value)
+        cleaned = re.sub(r"[^\d.,\s-]", "", str(value)).strip().replace(" ", "")
+        if not cleaned or cleaned in ("-", ".", ","):
+            _raise_money(value)
+        if "," in cleaned and "." in cleaned:
+            dec, th = (",", ".") if cleaned.rindex(",") > cleaned.rindex(".") else (".", ",")
+            whole, _, frac = cleaned.rpartition(dec)
+            if not (frac.isdigit() and len(frac) <= 2) or not DaftraInvoiceMapper._valid_thousands(whole, th):
+                _raise_money(value)
+            cleaned = whole.replace(th, "") + "." + frac
+        elif "," in cleaned:
+            whole, _, frac = cleaned.partition(",")
+            if frac.isdigit() and len(frac) <= 2:
+                cleaned = whole + "." + frac
             else:
-                text = text.replace(",", "")
-        elif "," in text:
-            if re.fullmatch(r"\d{1,3},\d{3}", text):
-                text = text.replace(",", "")
-            else:
-                text = text.replace(",", ".")
+                if not DaftraInvoiceMapper._valid_thousands(cleaned, ","):
+                    _raise_money(value)
+                cleaned = cleaned.replace(",", "")
+        elif cleaned.count(".") > 1:
+            if not DaftraInvoiceMapper._valid_thousands(cleaned, "."):
+                _raise_money(value)
+            cleaned = cleaned.replace(".", "")
         try:
-            result = Decimal(text)
-        except (InvalidOperation, ValueError):
-            return Decimal("0")
-        return result if result.is_finite() else Decimal("0")
+            result = Decimal(cleaned)
+        except (InvalidOperation, ValueError) as exc:
+            _raise_money(value, exc)
+        return result if result.is_finite() else _raise_money(value)
+
+    @staticmethod
+    def _valid_thousands(whole: str, sep: str) -> bool:
+        """Whether *whole* is digits grouped by *sep* into 1-3 digit groups.
+
+        The first group may carry a leading minus (``-1,250``). An empty group
+        (``12..34``) or an over-long one (``1234,567``) is malformed, so the
+        caller raises instead of guessing.
+        """
+        for index, group in enumerate(whole.split(sep)):
+            digits = group[1:] if index == 0 and group.startswith("-") else group
+            if not (digits.isdigit() and 1 <= len(digits) <= 3):
+                return False
+        return True
 
     @staticmethod
     def _date(value) -> date | None:
@@ -181,11 +279,10 @@ class DaftraInvoiceMapper:
                 continue
         return None
 
-    @staticmethod
-    def _phone(value) -> str | None:
+    def _phone(self, value) -> str | None:
         if value is None or value == "":
             return None
         try:
-            return normalize_phone(value)
+            return normalize_phone(value, self._country_code)
         except ValueError:
             return None

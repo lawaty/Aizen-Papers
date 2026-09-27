@@ -3,3 +3,10 @@
 __pycache__/
 *.pyc
 test curl.txt
+template_state.json
+poll_state.json
+poll_state.stub.json
+poll_state.json.lock
+stub_invoices.json
+webhook_events.jsonl
+*.bak

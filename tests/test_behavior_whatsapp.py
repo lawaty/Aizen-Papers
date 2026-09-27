@@ -8,19 +8,60 @@ import pytest
 from fakes import CapturingSender, FailingSender, StubInvoiceSource, make_stub_invoice
 from sender.application.services import InvoiceNotificationService
 from sender.domain.errors import WhatsAppApiError
-from sender.domain.templates import InvoiceTemplateBuilder
+from sender.domain.templates import LegacyInvoiceTemplateBuilder
 
 
 CONTRACT_VALUES = ["Ahmed Hassan", "INV-001", "01/09/2026", "1,500.00"]
 
 
-def _builder() -> InvoiceTemplateBuilder:
-    return InvoiceTemplateBuilder(template_name="aizen_invoice", language="en_EG", country_code="20")
+def _builder() -> LegacyInvoiceTemplateBuilder:
+    return LegacyInvoiceTemplateBuilder(template_name="aizen_invoice", language="en", country_code="20")
+
+
+def _body_parameters(payload: dict) -> list[dict]:
+    components = payload["template"]["components"]
+    assert [component["type"] for component in components] == ["header", "body"]
+    return components[1]["parameters"]
 
 
 def _service(sender, invoices=None) -> InvoiceNotificationService:
     source = StubInvoiceSource(invoices or [make_stub_invoice()])
     return InvoiceNotificationService(source=source, sender=sender, builder=_builder())
+
+
+class RecordingListSource:
+    """Records the arguments the service hands to the port's list_invoices."""
+
+    def __init__(self, invoices=()) -> None:
+        self._invoices = list(invoices)
+        self.list_calls: list[dict] = []
+
+    def list_invoices(self, limit: int = 10, page: int = 1):
+        self.list_calls.append({"limit": limit, "page": page})
+        return list(self._invoices)
+
+    def get_invoice(self, invoice_id):
+        return self._invoices[0]
+
+    def get_raw_invoice(self, invoice_id):
+        return {}
+
+
+def test_list_invoices_passes_the_page_through_to_the_source():
+    from sender.presentation.stubs import default_stub_invoices
+
+    source = RecordingListSource(default_stub_invoices())
+    service = InvoiceNotificationService(source=source, sender=CapturingSender(), builder=_builder())
+    invoices = service.list_invoices(limit=5, page=3)
+    assert source.list_calls == [{"limit": 5, "page": 3}]
+    assert {invoice.number for invoice in invoices} == {"INV-001", "INV-002", "INV-003"}
+
+
+def test_list_invoices_defaults_to_the_first_page():
+    source = RecordingListSource()
+    service = InvoiceNotificationService(source=source, sender=CapturingSender(), builder=_builder())
+    service.list_invoices(2)
+    assert source.list_calls == [{"limit": 2, "page": 1}]
 
 
 def test_send_invoice_delivers_exactly_one_payload_to_the_sender():
@@ -46,20 +87,32 @@ def test_template_payload_carries_the_approved_template_name_and_language():
     _service(sender).send_invoice("1")
     payload = sender.payloads[0]
     assert payload["template"]["name"] == "aizen_invoice"
-    assert payload["template"]["language"] == {"code": "en_EG"}
-    assert len(payload["template"]["components"]) == 1
-    assert payload["template"]["components"][0]["type"] == "body"
+    assert payload["template"]["language"] == {"code": "en"}
+    assert [component["type"] for component in payload["template"]["components"]] == ["header", "body"]
+
+
+def test_template_header_attaches_the_invoice_public_url_document():
+    sender = CapturingSender()
+    _service(sender).send_invoice("1")
+    header = sender.payloads[0]["template"]["components"][0]
+    source = StubInvoiceSource([make_stub_invoice()])
+    expected_link = source.get_invoice("1").public_url
+    assert header == {
+        "type": "header",
+        "parameters": [
+            {"type": "document", "document": {"link": expected_link, "filename": "INV-001.pdf"}}
+        ],
+    }
 
 
 def test_template_body_parameters_are_the_four_contract_values_in_order():
     sender = CapturingSender()
     _service(sender).send_invoice("1")
-    payload = sender.payloads[0]
-    assert payload["template"]["components"][0]["parameters"] == [
-        {"type": "text", "text": "Ahmed Hassan"},
-        {"type": "text", "text": "INV-001"},
-        {"type": "text", "text": "01/09/2026"},
-        {"type": "text", "text": "1,500.00"},
+    assert _body_parameters(sender.payloads[0]) == [
+        {"type": "text", "text": "\u2068Ahmed Hassan\u2069"},
+        {"type": "text", "text": "\u2066INV-001\u2069"},
+        {"type": "text", "text": "\u206601/09/2026\u2069"},
+        {"type": "text", "text": "\u20661,500.00\u2069"},
     ]
 
 
@@ -110,7 +163,7 @@ def test_freeform_values_appear_in_the_template_parameter_order():
     service = _service(sender)
     service.send_invoice("1")
     service.send_freeform("1")
-    template_values = [param["text"] for param in sender.payloads[0]["template"]["components"][0]["parameters"]]
+    template_values = [param["text"] for param in _body_parameters(sender.payloads[0])]
     positions = [sender.payloads[1]["text"]["body"].index(value) for value in template_values]
     assert positions == sorted(positions)
 
@@ -153,8 +206,13 @@ def test_source_resolves_the_requested_invoice_by_id():
     )
     sender = CapturingSender()
     _service(sender, invoices=[make_stub_invoice(), second]).send_invoice("2")
-    texts = [p["text"] for p in sender.payloads[0]["template"]["components"][0]["parameters"]]
-    assert texts == ["Mona Farouk", "INV-002", "05/09/2026", "3,200.50"]
+    texts = [p["text"] for p in _body_parameters(sender.payloads[0])]
+    assert texts == [
+        "\u2068Mona Farouk\u2069",
+        "\u2066INV-002\u2069",
+        "\u206605/09/2026\u2069",
+        "\u20663,200.50\u2069",
+    ]
 
 
 def test_stub_registry_resolves_by_id_and_number():

@@ -1,4 +1,25 @@
-"""Live WhatsApp Cloud API tests using real credentials from .env."""
+"""Live WhatsApp Cloud API tests using real credentials from .env.
+
+These tests send **real** WhatsApp messages to a real phone number and cost
+money on the business account, so they are opt-in and skipped by default. They
+only run when all of the following hold:
+
+- ``WHATSAPP_LIVE_TESTS`` is truthy (``1``/``true``/``yes``/``on``,
+  case-insensitive). Credentials merely *looking* real is not consent, so a
+  plain ``pytest`` run on a checkout that happens to have a filled-in ``.env``
+  still skips every test below.
+- ``WHATSAPP_ACCESS_TOKEN`` and ``WHATSAPP_PHONE_NUMBER_ID`` are configured and
+  the token is not a placeholder.
+- ``DAFTRA_API_KEY`` is configured.
+- ``WHATSAPP_VERIFIED_RECIPIENT`` names a number added to the app's verified
+  numbers. There is deliberately no default recipient: guessing one would send
+  real messages to a number nobody verified.
+
+To run them:
+
+    WHATSAPP_LIVE_TESTS=1 WHATSAPP_VERIFIED_RECIPIENT=<your verified number> \\
+        .venv/bin/python -m pytest tests/test_whatsapp_live.py
+"""
 
 import re
 from datetime import date
@@ -9,7 +30,7 @@ import pytest
 from sender.domain.errors import WhatsAppApiError
 from sender.domain.models import Invoice
 from sender.domain.phones import normalize_phone
-from sender.domain.templates import InvoiceTemplateBuilder
+from sender.domain.templates import LegacyInvoiceTemplateBuilder
 from sender.infrastructure.whatsapp.client import WhatsAppClient
 
 
@@ -20,11 +41,12 @@ def _live_invoice() -> Invoice:
         customer_name="Aizen Test",
         issue_date=date(2026, 9, 1),
         total=Decimal("1500.00"),
+        public_url="https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
     )
 
 
 def test_live_send_template_to_verified_recipient(live_settings, live_recipient):
-    builder = InvoiceTemplateBuilder(
+    builder = LegacyInvoiceTemplateBuilder(
         template_name=live_settings.wa_template_name,
         language=live_settings.wa_template_lang,
         country_code=live_settings.default_country_code,
@@ -48,7 +70,7 @@ def test_live_send_template_to_verified_recipient(live_settings, live_recipient)
 
 
 def test_live_fake_token_raises_whatsapp_api_error(live_settings, live_recipient):
-    builder = InvoiceTemplateBuilder(
+    builder = LegacyInvoiceTemplateBuilder(
         template_name=live_settings.wa_template_name,
         language=live_settings.wa_template_lang,
         country_code=live_settings.default_country_code,
@@ -74,7 +96,7 @@ def test_live_send_freeform_to_verified_recipient(live_settings, live_recipient)
     """Freeform text send — currently fails with Meta 131037 on the 555 test
     number (display name not approved). Will turn green on a BYO number swap
     once the recipient has an open 24h customer-service window."""
-    builder = InvoiceTemplateBuilder(
+    builder = LegacyInvoiceTemplateBuilder(
         template_name=live_settings.wa_template_name,
         language=live_settings.wa_template_lang,
         country_code=live_settings.default_country_code,
