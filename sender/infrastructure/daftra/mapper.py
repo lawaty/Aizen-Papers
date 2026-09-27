@@ -35,6 +35,24 @@ PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
 #: which is why the sender renders its own copy instead of linking to it.
 PDF_URL_KEYS = ("invoice_pdf_url",)
 
+#: Arabic/Persian localizations of the ASCII number glyphs the rest of ``_money``
+#: assumes. Without this fold, an amount a proxy localized for the customer's
+#: locale would have its separators stripped by the regex and silently change
+#: magnitude (``١٢٥٠٫٠٠`` would become 125000), or its Unicode minus (``−``)
+#: would be dropped and a credit read as a positive charge. ``str.translate``
+#: maps each source code point to one target code point.
+_MONEY_TRANSLATIONS = str.maketrans(
+    {
+        "٫": ".",  # Arabic decimal separator
+        "٬": ",",  # Arabic thousands separator
+        "−": "-",  # Unicode minus
+        "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+        "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",  # Arabic-Indic digits
+        "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+        "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",  # Extended Arabic-Indic
+    }
+)
+
 
 def _raise_money(value, cause: Exception | None = None) -> Decimal:
     """Raise the mapper's canonical "this amount cannot be parsed" error.
@@ -47,6 +65,21 @@ def _raise_money(value, cause: Exception | None = None) -> Decimal:
     if cause is not None:
         raise error from cause
     raise error
+
+
+def _row_label(row: dict) -> str:
+    """A human-readable identity for an unnormalizable listing row.
+
+    Daftra nests the Invoice object inside the row (or the row *is* the invoice
+    in the flat shape), so the number/id is pulled from whichever shape the row
+    actually carries. Falls back to a generic label so the warning is never
+    empty.
+    """
+    node = row.get("Invoice") if isinstance(row.get("Invoice"), dict) else row
+    ident = node.get("no") if isinstance(node, dict) else None
+    if not ident:
+        ident = node.get("id") if isinstance(node, dict) else None
+    return f"invoice {ident}" if ident else "an invoice"
 
 
 class DaftraInvoiceMapper:
@@ -114,14 +147,14 @@ class DaftraInvoiceMapper:
             except ValueError as exc:
                 # One invoice that cannot be normalized (e.g. a genuinely
                 # unparseable amount) must not take the whole tenant's cycle
-                # down: skip it so the rest of the listing flows, and warn so
-                # the operator sees it. It is never marked seen, so it is
-                # re-attempted on the next cycle and stays visible until the
-                # source data is fixed.
+                # down: skip it so the rest of the listing flows, and warn with
+                # the invoice's own identity so the operator can find it. It is
+                # never marked seen, so it is re-attempted on the next cycle and
+                # stays visible until the source data is fixed.
                 log.warning(
-                    "skipping an invoice that could not be normalized (%s); it will "
+                    "skipping %s, which could not be normalized (%s); it will "
                     "be re-attempted on the next cycle",
-                    exc,
+                    _row_label(row), exc,
                 )
         return invoices
 
@@ -213,7 +246,10 @@ class DaftraInvoiceMapper:
         wins as the decimal separator when both are present; a lone comma with 1-2
         digits after it is a decimal point (``1,99``), otherwise a thousands
         separator; a lone dot is a decimal point. Thousand groups are validated so
-        ``1.234.567`` parses but ``12..34`` raises.
+        ``1.234.567`` parses but ``12..34`` raises. Arabic/Persian localizations
+        are folded to the ASCII forms first (``٫``→``.``, ``٬``→``,``, ``−``→``-``,
+        and Arabic-Indic digits to 0-9), so a value a proxy localized for the
+        customer's locale cannot silently change magnitude.
         """
         if isinstance(value, bool):
             return Decimal("1" if value else "0")
@@ -222,8 +258,18 @@ class DaftraInvoiceMapper:
         if isinstance(value, (int, float, Decimal)):
             result = Decimal(str(value))
             return result if result.is_finite() else _raise_money(value)
-        cleaned = re.sub(r"[^\d.,\s-]", "", str(value)).strip().replace(" ", "")
-        if not cleaned or cleaned in ("-", ".", ","):
+        if isinstance(value, (list, tuple, dict, set)):
+            _raise_money(value)
+        text = str(value).translate(_MONEY_TRANSLATIONS)
+        cleaned = re.sub(r"[^\d.,\s-]", "", text).strip().replace(" ", "")
+        if not cleaned:
+            # Whitespace-only after the strip means "no amount was present", the
+            # same as an empty string; anything else that reduces to nothing
+            # (``"n/a"``) is a present-but-unparseable value and fails loudly.
+            if not str(value).strip():
+                return Decimal("0")
+            _raise_money(value)
+        if cleaned in ("-", ".", ","):
             _raise_money(value)
         if "," in cleaned and "." in cleaned:
             dec, th = (",", ".") if cleaned.rindex(",") > cleaned.rindex(".") else (".", ",")

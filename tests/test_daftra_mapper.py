@@ -228,13 +228,41 @@ def test_money_raises_on_a_present_but_unparseable_amount(mapper, raw):
         mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": raw}})
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("١٢٥٠٫٠٠", Decimal("1250.00")),  # Arabic decimal separator
+        ("12٫50", Decimal("12.50")),
+        ("١٢٣,٤٥٦", Decimal("123456")),  # Arabic-Indic digits, ASCII thousands
+        ("١٢٥٠.٠٠", Decimal("1250.00")),  # Arabic-Indic digits, ASCII dot
+        ("−1,250.00", Decimal("-1250.00")),  # Unicode minus on a credit/refund
+        ("۱٬۲۵۰٫۵۰", Decimal("1250.50")),  # Persian digits + localized separators
+    ],
+)
+def test_money_parses_localized_arabic_and_persian_amounts(mapper, raw, expected):
+    """A proxy/localization must not change an amount's magnitude: Arabic decimal
+    separators, Arabic-Indic digits and the Unicode minus all fold to ASCII."""
+    invoice = mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": raw}})
+    assert invoice.total == expected
+
+
+def test_money_rejects_non_scalar_values(mapper):
+    with pytest.raises(ValueError, match="Unparseable money value"):
+        mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": [1, 2]}})
+
+
+def test_money_treats_whitespace_only_as_empty(mapper):
+    assert mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": "   "}}).total == Decimal("0")
+
+
 def test_money_still_accepts_json_numbers_and_empty_values(mapper):
     assert mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": 35000}}).total == Decimal("35000")
     assert mapper.to_invoice({"Invoice": {"id": "1", "no": "000001"}}).total == Decimal("0")
 
 
 def test_to_invoices_skips_a_bad_row_without_losing_the_rest(caplog):
-    """One unparseable invoice must not take the tenant's whole cycle down."""
+    """One unparseable invoice must not take the tenant's whole cycle down, and
+    the warning must name the invoice so the operator can find it."""
     rows = [
         {"Invoice": {"id": "1", "no": "000001", "summary_total": 100}},
         {"Invoice": {"id": "2", "no": "000002", "summary_total": "not-money"}},
@@ -244,3 +272,4 @@ def test_to_invoices_skips_a_bad_row_without_losing_the_rest(caplog):
         invoices = DaftraInvoiceMapper().to_invoices({"data": rows})
     assert [invoice.id for invoice in invoices] == ["1", "3"]
     assert any("could not be normalized" in record.message for record in caplog.records)
+    assert any("invoice 000002" in record.message for record in caplog.records)

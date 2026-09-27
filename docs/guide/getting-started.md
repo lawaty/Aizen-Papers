@@ -136,7 +136,7 @@ customer:
 # Run forever, one cycle every 60s (default)
 python -m sender poll
 
-# One cycle, machine-readable summary on stdout, exit 0 (for cron/systemd)
+# One cycle, per-app summary on stdout, exit 0 (for cron/systemd)
 python -m sender poll --once
 
 # Bounded runs
@@ -166,20 +166,26 @@ failed or was interrupted mid-cycle. A cron entry that sends every new invoice
 within five minutes looks like this:
 
 ```cron
-*/5 * * * * cd "/home/lawaty/Projects/Daftra Project" && .venv/bin/python -m sender poll --once >> poll.log 2>&1
+*/5 * * * * cd "/home/lawaty/Projects/Daftra Project" && .venv/bin/python -m sender poll --once --timeout 240 >> poll.log 2>&1
 ```
 
 - **Use the venv's python, not a bare `pytest`/`python` on PATH.** A pyenv/PATH
   shim can break under cron, where the environment is minimal (verified: the
   PATH shim fails with exit 127).
+- **`--timeout 240` bounds a single run.** No HTTP call can hang (every call has
+  a timeout, `Retry-After` is capped by `WHATSAPP_MAX_RETRY_WAIT`), but a run
+  that legitimately takes longer than five minutes would otherwise overlap the
+  next tick — which is safe (the loser exits 1, no double-send) but skips a
+  cycle. The timeout stops the cycle at 4 minutes instead. If you want an
+  external guarantee too, wrap the command in `flock -n`.
 - **Redirect stdout/stderr to a log.** `--once` prints a summary to stdout every
   run; without a redirect cron emails you every five minutes. The first run of
   each app **seeds** without sending (see the warning above), so the first few
   summaries read `seeded N existing invoice(s) without sending`.
 - **The lock protects you.** Each run takes an exclusive lock on
   `poll_state.json.lock`; if two runs overlap, the second exits `1` with
-  `another poller is already running` — so a run that takes longer than five
-  minutes is *noticed*, not silently double-sent.
+  `another poller is already running` — so an overlap is *noticed*, not silently
+  double-sent.
 - **A systemd timer** is equivalent: a `.service` unit running
   `ExecStart=/path/to/.venv/bin/python -m sender poll --once` with
   `OnCalendar=*:0/5` in the matching `.timer` unit, plus

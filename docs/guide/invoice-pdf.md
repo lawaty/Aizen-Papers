@@ -163,11 +163,12 @@ scanlines are Flate-compressed into an image XObject
 (`/Subtype /Image`, `/ColorSpace /DeviceRGB`, `/BitsPerComponent 8`); the alpha
 becomes a second, DeviceGray image XObject referenced as the colour image's
 `/SMask` (PDF 1.4 transparency) — so the transparent background does not render
-as a black square. The decoder is byte-for-byte cross-checked against Pillow in
-`tests/test_logo.py`. To replace the logo, overwrite the committed PNG at
-`sender/infrastructure/assets/logo.png` with another 8-bit RGBA PNG of the same
-name; the image objects are inserted after the fonts in the fixed object
-numbering (see the table in `_assemble`).
+as a black square. The committed 360×360 RGBA asset decodes byte-for-byte
+identically to a reference decoder (Pillow on the build machine, used only for
+that one-off cross-check, never at runtime). To replace the logo, overwrite the
+committed PNG at `sender/infrastructure/assets/logo.png` with another 8-bit RGBA
+PNG of the same name; the image objects are inserted after the fonts in the
+fixed object numbering (see the table in `_assemble`).
 
 ### Text that cannot be drawn
 
