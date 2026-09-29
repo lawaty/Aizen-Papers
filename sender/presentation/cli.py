@@ -74,9 +74,11 @@ def _attachment_provider(
             f"{', '.join(ATTACHMENT_MODES)}"
         )
     logging.info(
-        "invoice attachment mode is %s: a PDF is rendered per invoice and uploaded to "
-        "Meta to obtain a media id (this happens even for preview and --dry-run, "
-        "because the payload has to carry the real id)",
+        "invoice attachment mode is %s: whenever the active template builder attaches "
+        "documents, a PDF is rendered per invoice and uploaded to Meta to obtain a "
+        "media id (this happens even for preview and --dry-run, because the payload "
+        "has to carry the real id). The clean text template attaches no document, so "
+        "nothing is rendered and nothing is uploaded there",
         ATTACH_UPLOAD,
     )
     return UploadedMediaProvider(
@@ -486,9 +488,12 @@ def _run_poll(args: argparse.Namespace, settings: Settings) -> int:
     )
     if dry_run and attachment_mode == ATTACH_UPLOAD:
         logging.warning(
-            "poll --dry-run with the %s attachment mode still uploads a PDF to Meta "
-            "for every invoice, because the payload has to reference a real media id; "
-            "use --attachment link for a run that touches nothing",
+            "poll --dry-run with the %s attachment mode can still upload a PDF to "
+            "Meta for every invoice, because a document-header template payload has "
+            "to reference a real media id; a clean text-header template attaches no "
+            "document and uploads nothing, so check which builder is active "
+            "(python -m sender template-status). To guarantee a run that touches "
+            "nothing, pass --attachment link",
             ATTACH_UPLOAD,
         )
     if args.stub:

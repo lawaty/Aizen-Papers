@@ -26,6 +26,13 @@ send; once approved (within the TTL, see `WHATSAPP_TEMPLATE_TTL`) it switches to
 the clean builder and marks the legacy one deprecated. Failures fall back to the
 cached state, or to the legacy builder when there is no cache.
 
+The selection tracks the structure of the **last approved** revision, not the raw
+status, so the switch is **bidirectional in practice**: re-approving a
+`DOCUMENT`-header revision makes the registry pick
+`LegacyInvoiceTemplateBuilder` — and the PDF attachment — again, with no code
+change, no config change and no redeploy. "Deprecated" describes the current
+approval, it is not a one-way removal.
+
 Control:
 
 ```bash
@@ -110,12 +117,47 @@ Language: `en` (English). Body text (as registered in Meta's template manager):
 💰 إجمالي الفاتورة: {{4}} ج.م
 
 شُكرًا لثقتكم الغالية، ونَسعد دائمًا باستمرار تعاونكم معنا. 🤝
-
-Aizen Paper
-✨ ثِقتكم مَحلُّ تقديرنا دائمًا.
 ```
 
 Exactly **4 placeholders**, in this order.
+
+### The live template shape
+
+| Component | Value |
+|---|---|
+| Header | `TEXT` — `فاتورة مبيعات \| Aizen Paper` (WhatsApp renders a `TEXT` header bold by itself; no formatting is allowed in a header) |
+| Body | the 4-variable Arabic text above |
+| Footer | `Aizen Paper  ثِقتكم مَحلُّ تقديرنا دائمًا.` |
+
+Registered under language code **`en`** despite the Arabic text — only the
+`{{1}}`–`{{4}}` contract matters to the payload, and a code that does not match
+`WHATSAPP_TEMPLATE_LANG` exactly is the `132001` above.
+
+A `TEXT` header has no document slot, so this revision is a *clean* one: the
+registry selects `CleanTextTemplateBuilder`, no PDF is rendered, and nothing is
+uploaded. `TEMPLATE_BODY` in `sender/domain/templates.py` still carries the two
+footer lines at the end; that only shows in the **free-form** fallback, which
+reuses `TEMPLATE_BODY` as plain text — the template itself renders header and
+footer from Meta's own components.
+
+### Revision in review: `DOCUMENT` header
+
+To bring the PDF attachment back the template was re-submitted with a
+**`DOCUMENT`** header. The header line moved into the **body** as a bold first
+line, so the (now document-carrying) header slot can hold the uploaded PDF:
+
+```
+*فاتورة مبيعات | Aizen Paper*
+```
+
+The body keeps exactly the same **4 placeholders**; only the literal line above
+them is added. The registry reads a `DOCUMENT` header as "not clean", so the
+re-approval flips the builder back to `LegacyInvoiceTemplateBuilder` on its own.
+
+Bold may be applied to **literal template text only**, never to a parameter
+value: the four parameters are filled from customer data, and any `*` around one
+would have to travel inside the value — reaching the customer as literal
+asterisks rather than as formatting.
 
 ## Variable ↔ parameter mapping
 

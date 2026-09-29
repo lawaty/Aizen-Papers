@@ -23,9 +23,11 @@ A small, dependency-light Python command-line tool that:
 1. **Reads** an invoice from the Daftra REST API (v2),
 2. **Normalizes** it into a clean internal `Invoice` model,
 3. **Builds** a WhatsApp template payload whose 4 variables (`{{1}}`–`{{4}}`)
-   are filled with the customer name, invoice number, issue date, and total,
-   and attaches the invoice **PDF** — rendered here and uploaded to Meta, because
-   Daftra exposes no export and its own file URL is behind a login
+   are filled with the customer name, invoice number, issue date, and total.
+   The invoice **PDF** is attached when the active template has a **document
+   header** — rendered here and uploaded to Meta, because Daftra exposes no
+   export and its own file URL is behind a login; a **text-header** template
+   sends the details only, with nothing rendered or uploaded
    (builder auto-switches as the template is updated in WhatsApp Manager),
 4. **Sends** it through the Meta API to the customer's phone,
 5. **Polls** Daftra continuously (`poll`): each cycle lists recent invoices from

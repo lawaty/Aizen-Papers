@@ -151,9 +151,13 @@ and the fills-sit-behind-text order will tell you.
 
 Page 1 opens with a brand header: the committed logo
 (`sender/infrastructure/assets/logo.png`, a 360×360 RGBA PNG, black on a
-transparent background), the Arabic brand name **أوراق عايزن**, the invoice
+transparent background), the brand name **Aizen Paper**, the invoice
 title, and the status chip — with an accent rule closing the block. The logo is
 always included on page 1 (it is not repeated on continuation pages).
+
+The brand is a registered Latin wordmark and is set in Helvetica, never
+transliterated: it used to be drawn as `أوراق عايزن` in the Arabic face, which is
+now a pinned regression (`test_the_brand_wordmark_is_never_transliterated`).
 
 The PDF writer embeds it with the **standard library only** (no Pillow, keeping
 the two-dependency footprint): a pure-stdlib PNG decoder in

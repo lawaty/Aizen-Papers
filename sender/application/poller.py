@@ -170,6 +170,11 @@ class InvoicePoller:
         it is logged with its traceback and reported as a failed app for this
         cycle. ``KeyboardInterrupt`` is not an ``Exception``, so it still
         propagates to the run() handler.
+
+        This is the *outer* net only: ``_poll_app`` catches the same class of
+        error itself once its result exists, so it can keep the counts the cycle
+        accumulated; this handler is left for the failures that happen before
+        that, which have nothing to preserve.
         """
         results = []
         for app in self._apps:
@@ -229,53 +234,63 @@ class InvoicePoller:
         ids = [str(invoice.id) for invoice in listed]
         result["first_run"] = first_run
         result["dry_run"] = self._dry_run
-        with self._state.batch():
-            if first_run and not self._send_existing:
-                if self._dry_run:
+        # Anything unexpected from here on (a failed batch-exit state write, an
+        # OSError, a bug) is reported as a failed app, but the counts the cycle
+        # had already accumulated are kept: a send that already went out must not
+        # be reported as ``sent 0`` to the operator reading the summary.
+        try:
+            with self._state.batch():
+                if first_run and not self._send_existing:
+                    if self._dry_run:
+                        log.info(
+                            "app %s: first run; would seed %d existing invoice(s) without "
+                            "sending (dry-run; nothing was written)",
+                            app.name, len(ids),
+                        )
+                        result["seeded"] = len(ids)
+                        return result
+                    self._state.mark_many_seen(app.name, ids)
+                    result["seeded"] = len(ids)
                     log.info(
-                        "app %s: first run; would seed %d existing invoice(s) without "
-                        "sending (dry-run; nothing was written)",
+                        "app %s: first run; seeded %d existing invoice(s) without sending "
+                        "(pass --send-existing to send them on the first run)",
                         app.name, len(ids),
                     )
-                    result["seeded"] = len(ids)
+                    self._state.set_last_poll_at(app.name, self._clock.now())
                     return result
-                self._state.mark_many_seen(app.name, ids)
-                result["seeded"] = len(ids)
-                log.info(
-                    "app %s: first run; seeded %d existing invoice(s) without sending "
-                    "(pass --send-existing to send them on the first run)",
-                    app.name, len(ids),
-                )
-                self._state.set_last_poll_at(app.name, self._clock.now())
-                return result
-            for invoice in listed:
-                invoice_id = str(invoice.id)
-                if self._state.seen(app.name, invoice_id):
-                    continue
-                if self._is_deferred(app.name, invoice_id):
-                    result["pending"] += 1
-                    result["invoices"].append(
-                        {"number": invoice.number, "id": invoice_id, "status": "pending", "to": None}
-                    )
-                    continue
-                result["new"] += 1
-                outcome = self._handle_invoice(app, invoice_id, invoice)
-                result["invoices"].append(outcome)
-                if outcome["status"] == "sent":
-                    if outcome.get("dry_run"):
-                        result["would_send"] += 1
+                for invoice in listed:
+                    invoice_id = str(invoice.id)
+                    if self._state.seen(app.name, invoice_id):
+                        continue
+                    if self._is_deferred(app.name, invoice_id):
+                        result["pending"] += 1
+                        result["invoices"].append(
+                            {"number": invoice.number, "id": invoice_id, "status": "pending", "to": None}
+                        )
+                        continue
+                    result["new"] += 1
+                    outcome = self._handle_invoice(app, invoice_id, invoice)
+                    result["invoices"].append(outcome)
+                    if outcome["status"] == "sent":
+                        if outcome.get("dry_run"):
+                            result["would_send"] += 1
+                        else:
+                            result["sent"] += 1
+                        if outcome.get("fallback"):
+                            result["fallback_sends"] += 1
+                    elif outcome["status"] == "skipped_no_phone":
+                        result["skipped_no_phone"] += 1
+                    elif outcome["status"] == "abandoned":
+                        result["abandoned"] += 1
                     else:
-                        result["sent"] += 1
-                    if outcome.get("fallback"):
-                        result["fallback_sends"] += 1
-                elif outcome["status"] == "skipped_no_phone":
-                    result["skipped_no_phone"] += 1
-                elif outcome["status"] == "abandoned":
-                    result["abandoned"] += 1
-                else:
-                    result["failed"] += 1
-            if not self._dry_run:
-                self._state.set_last_poll_at(app.name, self._clock.now())
+                        result["failed"] += 1
+                if not self._dry_run:
+                    self._state.set_last_poll_at(app.name, self._clock.now())
+        except Exception as exc:  # noqa: BLE001 - one tenant must not stop the rest
+            log.exception("app %s: unexpected failure while polling", app.name)
+            result["ok"] = False
+            result["error"] = str(exc)
+            return result
         log.info(
             "app %s: listed %d, new %d, sent %d, skipped_no_phone %d, failed %d, "
             "pending %d, abandoned %d, %d via free-form fallback",
@@ -318,7 +333,13 @@ class InvoicePoller:
                     app.name, self._max_pages,
                 )
                 break
-        if len(candidates) >= self._limit:
+        # A full page only means the listing is saturated if it still holds rows
+        # this cycle has not handled: once every listed row is already seen, a
+        # full page 1 is the steady state of a busy tenant and warning on it
+        # every cycle buries the real saturation signal above.
+        if len(candidates) >= self._limit and any(
+            not self._state.seen(app.name, str(candidate.id)) for candidate in candidates
+        ):
             log.warning(
                 "app %s: the invoice listing came back full (%d rows); if invoices "
                 "are created faster than the poll interval, raise --limit",

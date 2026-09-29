@@ -216,13 +216,25 @@ class TemplateRegistry:
     ) -> InvoiceTemplateBuilder:
         """The builder matching the template's current status.
 
-        *attachment* is only relevant to the legacy builder (the clean template
+        *attachment* only has an effect on the legacy builder (the clean template
         has no header document), but it is accepted for both so callers do not
-        have to know which one they will get.
+        have to know which one they will get. The clean builder is still handed
+        it — unused by ``build()``, but retained so a caller that later swaps in
+        the legacy builder (``cli._other_builder``) can carry the provider across
+        instead of degrading to a session-gated ``link``.
         """
         snapshot = self.current()
         if snapshot.get("active_builder") == NEW:
-            return CleanTextTemplateBuilder(name, language, country_code)
+            if attachment is not None:
+                log.warning(
+                    "%s is approved with a text header, so it has no document header "
+                    "to attach to; the attachment provider is discarded and no PDF "
+                    "will be attached",
+                    name,
+                )
+            return CleanTextTemplateBuilder(
+                name, language, country_code, attachment=attachment
+            )
         return LegacyInvoiceTemplateBuilder(
             name, language, country_code, attachment=attachment
         )

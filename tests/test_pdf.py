@@ -52,15 +52,19 @@ META_Y = 639.0  # the meta rows' first baseline: below the header's closing rule
 
 #: Helvetica's advance widths per 1000 em, for the characters these fixtures can
 #: actually put in a string: digits, a decimal point, a thousands separator, and
-#: the letters of the currency code. From the standard Helvetica AFM. Deliberately
-#: not the writer's table — a character missing here makes a test fail, which is
-#: the right outcome for a fixture that has grown.
+#: the letters the brand name and currency code use. From the standard Helvetica
+#: AFM. Deliberately not the writer's table — a character missing here makes a test
+#: fail, which is the right outcome for a fixture that has grown. Upper and lower
+#: case are separate entries because they have separate widths.
 _HELVETICA_EM = {str(digit): 556 for digit in range(10)}
 _HELVETICA_EM.update({".": 278, ",": 278, " ": 278, "-": 333, "/": 278})
-_HELVETICA_EM.update(dict.fromkeys("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 0))
-# The letters, from the AFM: those of the currency code, and of the "INV" prefix
-# the invoice numbers here use.
+# The letters, from the AFM: those of the currency code, of the "INV" prefix the
+# invoice numbers here use, and of the "Aizen Paper" wordmark.
 for _letter, _width in zip("EGPINV", (667, 778, 667, 278, 722, 667)):
+    _HELVETICA_EM[_letter] = _width
+# "Aizen Paper": A 667, i 222, z 500, e 556, n 556, space 278, P 667, p 556,
+# a 556, e 556, r 333. From the same AFM, checked against the writer's own table.
+for _letter, _width in zip("AizenPaper", (667, 222, 500, 556, 556, 667, 556, 556, 556, 333)):
     _HELVETICA_EM[_letter] = _width
 
 
@@ -586,7 +590,6 @@ def test_every_arabic_label_is_drawn_from_the_arabic_font() -> None:
     pdf = render_invoice_pdf(arabic_invoice())
     drawn = {span["gids"] for span in spans(pdf) if span["font"] == "F2"}
     for label in (
-        "أوراق عايزن",
         "فاتورة",
         "رقم الفاتورة",
         "العميل",
@@ -945,16 +948,32 @@ def test_page_1_names_the_logo_in_its_resources() -> None:
 
 
 def test_the_brand_name_sits_against_the_logo_in_the_header() -> None:
-    """أوراق عايزن, right-aligned into the gap the logo leaves and inside its
-    vertical span — the brand block reads as one thing: a mark and its name."""
+    """Aizen Paper, right-aligned into the gap the logo leaves and inside its
+    vertical span — the brand block reads as one thing: a mark and its name.
+
+    The wordmark is English-only and is never transliterated, so it is drawn by
+    Helvetica (``F1``), not the Arabic face. This asserts the font explicitly: a
+    silent swap to ``F2`` would mean the brand had been transliterated.
+    """
     pdf = render_invoice_pdf(arabic_invoice())
-    brand = next(span for span in spans(pdf) if span["gids"] == shaped_gids("أوراق عايزن"))
-    assert brand["font"] == "F2"
+    brand = next(span for span in spans(pdf) if span["literal"] == "Aizen Paper")
+    assert brand["font"] == "F1"
     assert float(brand["size"]) == 22.0
-    end = float(brand["x"]) + arabic_width(brand["gids"], 22.0)
+    end = float(brand["x"]) + latin_width("Aizen Paper", 22.0)
     assert round(end, 2) == BRAND_END
     assert float(brand["x"]) >= LEFT_MARGIN
     assert LOGO_TOP - LOGO_SIZE < float(brand["y"]) < LOGO_TOP  # inside the logo's span
+
+
+def test_the_brand_wordmark_is_never_transliterated() -> None:
+    """No Arabic-script rendering of the brand reaches the page.
+
+    The name is a registered Latin wordmark; ``أوراق عايزن`` was a transliteration
+    of it and must not come back.
+    """
+    pdf = render_invoice_pdf(arabic_invoice())
+    assert b"Aizen Paper" in pdf
+    assert "أوراق عايزن" not in page_text(pdf)
 
 
 def test_the_rendered_pdf_is_deterministic_with_the_logo_embedded() -> None:

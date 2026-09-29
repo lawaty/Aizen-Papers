@@ -771,6 +771,41 @@ def test_saturated_listing_logs_a_warning(caplog):
     assert any("came back full" in record.message for record in caplog.records)
 
 
+def test_a_full_page_of_already_seen_invoices_does_not_warn_about_saturation(caplog):
+    """The saturation warning is about *unhandled* backlog, not about page size.
+
+    Once a busy tenant has more invoices than ``--limit``, page 1 is full on
+    every single cycle for ever, all of it already seen — warning each time
+    trains the operator to ignore the line and buries the real signal (the
+    ``max_pages`` warning, which fires only when unseen rows are actually being
+    dropped).
+    """
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    source = StubInvoiceSource(invoices)
+    state = InMemoryPollStateStore()
+    poller = _poller(
+        [PollApp("app1", source)], sender=CapturingSender(), state=state,
+        send_existing=True, limit=10,
+    )
+    poller.run_once()  # first cycle handles the 15 invoices
+    assert len(state.seen_ids("app1")) == 15
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        quiet = poller.run_once()
+
+    assert quiet["apps"][0]["listed"] == 10  # the page really did come back full
+    assert quiet["apps"][0]["sent"] == 0
+    assert not any("came back full" in record.message for record in caplog.records)
+
+    # A fresh invoice on the same full page brings the warning back.
+    source.add_new_invoice(customer_phone="01027693262")
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        poller.run_once()
+    assert any("came back full" in record.message for record in caplog.records)
+
+
 def test_paging_stops_at_seen_territory():
     invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
     source = StubInvoiceSource(invoices)

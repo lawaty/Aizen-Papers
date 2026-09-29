@@ -18,7 +18,8 @@ What it emits:
   drawn as an ``Identity-H`` ``CIDFontType2``.
 - Each page 1 opens with a letterhead brand header: the bundled logo — embedded
   as a Flate-compressed image XObject with a DeviceGray soft mask for its
-  transparent ground — with the brand name أوراق عايزن set into the gap it leaves,
+  transparent ground — with the brand name Aizen Paper (Latin, never
+  transliterated) set into the gap it leaves,
   the 26pt title and the payment-status chip in the title zone on the other side,
   and an accent rule closing the band. Under it, four meta rows (invoice number,
   issue date, customer, currency), the line items under بنود الفاتورة on a tinted
@@ -209,7 +210,10 @@ _LOGO_X = _RIGHT - _LOGO_SIZE
 #: The brand name, right-aligned into the gap the logo leaves and optically
 #: centred against it: the baseline sits 6pt under the logo's mid-line, which is
 #: where a word with descenders reads as level with a mark.
-_BRAND_TEXT = "أوراق عايزن"
+#: English only, and deliberately not transliterated: the brand is a registered
+#: Latin wordmark, so it is set in Helvetica (via `_font_of`) and never in the
+#: Arabic face, the way the WhatsApp template writes it as "Aizen Paper".
+_BRAND_TEXT = "Aizen Paper"
 _BRAND_GAP = 16.0
 _BRAND_END = _LOGO_X - _BRAND_GAP
 _BRAND_Y = _LOGO_TOP - _LOGO_SIZE / 2 - 6.0

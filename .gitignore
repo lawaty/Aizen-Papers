@@ -10,3 +10,5 @@ poll_state.json.lock
 stub_invoices.json
 webhook_events.jsonl
 *.bak
+# Rendered sample header PDF for Meta template review (regenerated on demand).
+meta_sample_invoice.pdf
