@@ -12,3 +12,6 @@ webhook_events.jsonl
 *.bak
 # Rendered sample header PDF for Meta template review (regenerated on demand).
 meta_sample_invoice.pdf
+# Vendored pure-Python dependencies for hosts without pip; regenerated with
+# tools/build_vendor.py, not source.
+vendor/
