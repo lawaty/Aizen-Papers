@@ -15,3 +15,11 @@ meta_sample_invoice.pdf
 # Vendored pure-Python dependencies for hosts without pip; regenerated with
 # tools/build_vendor.py, not source.
 vendor/
+# Local handoff notes; machine/credential context, never commit.
+HANDOFF-*.md
+# Per-day poll logs written by tools/run_poll.sh; they contain customer
+# invoice ids, never commit. The .gitkeep keeps the directory present.
+logs/*
+!logs/.gitkeep
+# Legacy unbounded cron log (pre-run_poll.sh); server-side only.
+poll.log
