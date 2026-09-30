@@ -32,12 +32,26 @@ def test_two_apps_parse_in_order():
             "DAFTRA2_BASE_URL": "https://other.daftra.com/api2",
             "DAFTRA2_API_KEY": "key2",
             "DAFTRA2_TIMEOUT": "20",
-            "DAFTRA_APP2_NAME": "other",
         }
     )
     assert [app.name for app in settings.apps] == ["acme", "other"]
     assert settings.apps[1].api_key == "key2"
     assert settings.apps[1].timeout == 20.0
+
+
+def test_daftra_app_name_override_is_ignored():
+    # DAFTRA_APP2_NAME is no longer read: the name always comes from the
+    # account subdomain, even when the override would conflict with it.
+    settings = Settings.from_env(
+        {
+            "DAFTRA_API_KEY": "key1",
+            "DAFTRA_BASE_URL": "https://acme.daftra.com/api2",
+            "DAFTRA2_BASE_URL": "https://second.daftra.com/api2",
+            "DAFTRA2_API_KEY": "key2",
+            "DAFTRA_APP2_NAME": "renamed",
+        }
+    )
+    assert [app.name for app in settings.apps] == ["acme", "second"]
 
 
 def test_app_name_defaults_to_the_subdomain():
@@ -107,12 +121,12 @@ def test_duplicate_app_names_warn_because_they_share_poll_state(caplog):
         )
     assert len(settings.apps) == 2
     assert any("duplicate Daftra app name" in record.message for record in caplog.records)
-    assert any("DAFTRA_APP2_NAME" in record.message for record in caplog.records)
+    assert any("subdomain" in record.message for record in caplog.records)
 
 
 def test_duplicate_name_warning_names_the_real_slots_across_a_gap(caplog):
     # The list position of the second app is 2, but its slot is 3: telling the
-    # operator to set DAFTRA_APP2_NAME would name a variable nothing reads.
+    # operator to change DAFTRA2_BASE_URL would name a slot nothing reads.
     with caplog.at_level("WARNING"):
         settings = Settings.from_env(
             {
@@ -130,8 +144,8 @@ def test_duplicate_name_warning_names_the_real_slots_across_a_gap(caplog):
     assert len(messages) == 1
     assert "slot 1" in messages[0]
     assert "slot 3" in messages[0]
-    assert "DAFTRA_APP3_NAME" in messages[0]
-    assert "DAFTRA_APP2_NAME" not in messages[0]
+    assert "DAFTRA3_BASE_URL" in messages[0]
+    assert "DAFTRA2_BASE_URL" not in messages[0]
 
 
 def test_bad_url_is_rejected():

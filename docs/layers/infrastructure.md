@@ -138,13 +138,13 @@ them when a command actually needs the sender. All knobs have sane defaults
 `Settings.apps` is a tuple of `DaftraApp` (frozen dataclass: `name`, `base_url`,
 `api_key`, `timeout`) — one per tenant. App 1 is built from the unprefixed
 `DAFTRA_API_KEY`/`DAFTRA_BASE_URL`/`DAFTRA_TIMEOUT`; extra apps come from
-numbered slots (`DAFTRA2_BASE_URL` + `DAFTRA2_API_KEY`, `DAFTRA3_*`, …) with an
-optional `DAFTRA_APP2_NAME`. Slots 2–9 are scanned; a slot missing either var is
-skipped (with a warning), and a gap (an empty slot before a configured one) is
-warned about instead of silently dropping the later app. Two apps that end up
-with the same name are warned about because they would share poll state. Every
-app's base URL passes the same `_validate_daftra_url` https +
-`.daftra.com`/`.daftara.com` check. The non-poll commands use
+numbered slots (`DAFTRA2_BASE_URL` + `DAFTRA2_API_KEY`, `DAFTRA3_*`, …). Each
+app's name is derived from its account subdomain. Slots 2–9 are scanned; a slot
+missing either var is skipped (with a warning), and a gap (an empty slot before
+a configured one) is warned about instead of silently dropping the later app.
+Two apps that end up with the same name are warned about because they would
+share poll state. Every app's base URL passes the same `_validate_daftra_url`
+https + `.daftra.com`/`.daftara.com` check. The non-poll commands use
 `Settings.primary_app` (the first/only app). `from_env` also accepts
 `require_apps=True` so `poll` demands at least one fully configured app.
 

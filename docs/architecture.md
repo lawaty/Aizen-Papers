@@ -186,7 +186,8 @@ authenticates with the API key sent as the `apikey` header — the simplest
 supported method. WhatsApp credentials are lazily required — only
 `send`/`preview`/`poll` demand them, so `show`/`list` work with just the Daftra
 key. `Settings.apps` holds one `DaftraApp` per tenant (app 1 from the unprefixed
-vars, extra apps from `DAFTRA2_*`/`DAFTRA3_*` slots); the non-poll commands use
+vars, extra apps from `DAFTRA2_*`/`DAFTRA3_*` slots); each app's name is
+derived from its account subdomain. The non-poll commands use
 `Settings.primary_app` (the first/only app). See the
 [getting-started](guide/getting-started.md) page.
 

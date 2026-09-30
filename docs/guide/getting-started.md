@@ -39,7 +39,6 @@ Copy `.env.example` to `.env` and fill in the values:
 | `DAFTRA2_BASE_URL` | no | App 2 API root (second tenant); needs `DAFTRA2_API_KEY` too |
 | `DAFTRA2_API_KEY` | no | App 2 Daftra API key |
 | `DAFTRA2_TIMEOUT` | no (default `15`) | App 2 HTTP timeout (s) |
-| `DAFTRA_APP2_NAME` | no | App 2 state/log name (default: derived from the subdomain) |
 | `POLL_INTERVAL` | no (default `60`) | seconds between poll cycles |
 | `POLL_STATE_PATH` | no (default `poll_state.json`) | poll state file (gitignored) |
 | `POLL_LIMIT` | no (default `10`) | list page size per cycle |
@@ -87,11 +86,12 @@ belong to your tenant.
 app uses the numbered slot `DAFTRA2_*`; a slot with no `*_BASE_URL` or no
 `*_API_KEY` is simply skipped, so a single-app deployment needs no extra vars.
 Slots 2–9 are scanned, so a gap (e.g. `DAFTRA2_*` unset but `DAFTRA3_*` set)
-does **not** drop the later app — it logs a warning about the gap. Two apps
-that end up with the same name are warned about, because they would share poll
-state. Each app's base URL must pass the same https +
-`.daftra.com`/`.daftara.com` validation. The non-`poll` commands always talk to
-app 1 (the first/only configured app).
+does **not** drop the later app — it logs a warning about the gap. Each app's
+name (used in logs and as the poll state-file key) is derived from its account
+subdomain, so two apps on the same subdomain end up with the same name and are
+warned about, because they would share poll state. Each app's base URL must
+pass the same https + `.daftra.com`/`.daftara.com` validation. The non-`poll`
+commands always talk to app 1 (the first/only configured app).
 
 ## Commands
 

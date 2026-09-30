@@ -80,23 +80,23 @@ def _app_name_from_url(base_url: str, fallback: str) -> str:
     return fallback
 
 
-def _name_override_hint(*slots: int) -> str:
-    """The ``DAFTRA_APP<n>_NAME`` advice for a duplicated app name.
+def _duplicate_name_hint(*slots: int) -> str:
+    """The advice for a duplicated app name.
 
-    Only numbered slots can be renamed — app 1 (the unprefixed vars) derives its
-    name from the subdomain and ``DAFTRA_APP1_NAME`` is never read — so the hint
-    names the slots that actually have a variable. Naming a *slot* rather than
-    the position in the app list is what keeps the advice actionable once the
-    numbering has a gap (``DAFTRA_APP2_NAME`` is read for nothing when only
-    ``DAFTRA3_*`` is configured).
+    Names are derived from the account subdomain and there is no override
+    variable, so a duplicate means two apps share a subdomain. The hint names
+    the DAFTRA<n>_BASE_URL the operator can change to give each account its own
+    subdomain. Naming a *slot* rather than the position in the app list is what
+    keeps the advice actionable once the numbering has a gap.
     """
-    named = sorted({slot for slot in slots if slot > 1})
-    if not named:
-        return (
-            "only the unprefixed app 1 vars are configured, so give the other "
-            "account its own DAFTRA<n>_BASE_URL + DAFTRA<n>_API_KEY slot"
+    return (
+        "app names come from the account subdomain, so give each account its "
+        "own subdomain via "
+        + " or ".join(
+            "DAFTRA_BASE_URL" if slot == 1 else f"DAFTRA{slot}_BASE_URL"
+            for slot in sorted(set(slots))
         )
-    return "set " + " or ".join(f"DAFTRA_APP{slot}_NAME" for slot in named) + " to distinguish them"
+    )
 
 
 def _env_float(source: Mapping[str, str], key: str, default: float) -> float:
@@ -295,14 +295,14 @@ class Settings:
         """App 1 uses the unprefixed vars; extra apps use numbered slots
         (DAFTRA2_*, DAFTRA3_*, ...). Slots 2..9 are scanned; an empty slot is
         skipped (with a warning if a later slot is configured) rather than
-        stopping the scan, so a gap cannot silently drop a later app. Apps that
-        end up with the same name are warned about because they would share
-        poll state."""
+        stopping the scan, so a gap cannot silently drop a later app. Every app
+        name is derived from its account subdomain; apps that end up with the
+        same name are warned about because they would share poll state."""
         apps: list[DaftraApp] = []
         # The slot each app came from, tracked alongside the list: the duplicate
-        # name warning has to name the DAFTRA<n> variables the operator can
-        # actually set, and the list position is not the slot once the numbering
-        # has a gap.
+        # name warning has to name the DAFTRA<n>_BASE_URL the operator can
+        # change, and the list position is not the slot once the numbering has
+        # a gap.
         slots: list[int] = []
         if daftra_api_key:
             apps.append(
@@ -321,10 +321,7 @@ class Settings:
                 continue
             if slot_base and slot_key:
                 _validate_daftra_url(slot_base, f"DAFTRA{slot}_BASE_URL")
-                name = (
-                    (source.get(f"DAFTRA_APP{slot}_NAME") or "").strip()
-                    or _app_name_from_url(slot_base, f"app{slot}")
-                )
+                name = _app_name_from_url(slot_base, f"app{slot}")
                 apps.append(
                     DaftraApp(
                         name=name,
@@ -362,7 +359,7 @@ class Settings:
                     "duplicate Daftra app name %r (slot %d %s and slot %d %s); apps "
                     "sharing a name share poll state — %s",
                     app.name, first_slot, first_base, slot, app.base_url,
-                    _name_override_hint(first_slot, slot),
+                    _duplicate_name_hint(first_slot, slot),
                 )
             else:
                 seen_names[app.name] = (slot, app.base_url)
