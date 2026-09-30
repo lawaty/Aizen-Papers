@@ -210,6 +210,31 @@ class Settings:
     stub_invoices_path: str = "stub_invoices.json"
     poll_stub_state_path: str = "poll_state.stub.json"
 
+    #: Hard ceiling on send attempts per poll cycle, across all apps. This is
+    #: deliberately separate from ``poll_limit`` (a listing page size): paging
+    #: can fetch up to ``limit * max_pages`` invoices, so the page size alone is
+    #: not a bound on how many messages one run can put in front of Meta. The
+    #: default is far below Meta's published throughput and exists mainly to
+    #: stop a pathological backlog or a runaway loop from blasting a number.
+    #: 0 disables the cap.
+    poll_max_sends_per_run: int = 10
+    #: Write human-readable HTML pages of sent messages under ``report_dir``.
+    report_enabled: bool = True
+    #: Where the browsable HTML lives. Relative paths resolve against the
+    #: working directory, so the cron wrapper owns the CWD; deployments under a
+    #: web root set an absolute path here.
+    report_dir: str = "reports"
+    #: Where the append-only JSONL source of truth lives. Kept separate from the
+    #: HTML so it can be moved off the web root while the pages stay browsable.
+    report_data_dir: str = "reports/data"
+    report_stub_dir: str = "reports.stub"
+    #: Days of history to keep. 0 disables pruning.
+    report_retention_days: int = 90
+    #: Mask the middle of recipient numbers in the pages. On by default because
+    #: these are served from a public web root and a full number is personal data
+    #: that lets a reader contact the customer.
+    report_obfuscate_phone: bool = True
+
     @property
     def primary_app(self) -> DaftraApp:
         """The first/only configured app, used by the non-poll commands."""
@@ -288,6 +313,13 @@ class Settings:
             poll_max_pages=_env_int(source, "POLL_MAX_PAGES", 5),
             stub_invoices_path=(source.get("STUB_INVOICES_PATH") or "stub_invoices.json").strip(),
             poll_stub_state_path=(source.get("POLL_STUB_STATE_PATH") or "poll_state.stub.json").strip(),
+            poll_max_sends_per_run=_env_int(source, "POLL_MAX_SENDS_PER_RUN", 10),
+            report_enabled=_env_flag(source, "REPORT_ENABLED", True),
+            report_dir=(source.get("REPORT_DIR") or "reports").strip(),
+            report_data_dir=(source.get("REPORT_DATA_DIR") or "reports/data").strip(),
+            report_stub_dir=(source.get("REPORT_STUB_DIR") or "reports.stub").strip(),
+            report_retention_days=_env_int(source, "REPORT_RETENTION_DAYS", 90),
+            report_obfuscate_phone=_env_flag(source, "REPORT_OBFUSCATE_PHONE", True),
         )
 
     @staticmethod

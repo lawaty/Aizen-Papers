@@ -48,7 +48,10 @@ there rather than restated.
   (enforced at `config.py:232-239`). Offline rehearsals should not require them;
   if you touch that line, fix it deliberately and note it here.
 - Reference for every variable: `docs/guide/getting-started.md` § Configure and
-  `.env.example`.
+  `.env.example`. The report knobs (`REPORT_ENABLED`, `REPORT_DIR`,
+  `REPORT_DATA_DIR`, `REPORT_STUB_DIR`, `REPORT_RETENTION_DAYS`,
+  `REPORT_OBFUSCE_PHONE`) and `POLL_MAX_SENDS_PER_RUN` exist in `config.py` but
+  are **not yet in `.env.example`** or `docs/`.
 
 ## Ports and adapters
 
@@ -88,5 +91,8 @@ there rather than restated.
 - `poll_state.json`, `template_state.json`, `.env`, `stub_invoices.json` are
   gitignored runtime artifacts. They are machine-specific: copying one onto
   another machine silently marks invoices as already handled.
+- `reports/` and `reports.stub/` hold **customer PII** (names, invoice totals,
+  recipient numbers) and belong on that list — but are **not in `.gitignore`
+  yet**, unlike every other artifact here. Treat them as machine-local.
 - Remote is SSH-only (`git@github.com:lawaty/Aizen-Papers.git`); HTTPS auth
   hangs. Branch `main`.

@@ -752,14 +752,104 @@ def test_dry_run_does_not_record_a_pending_backoff_for_a_retryable_failure(tmp_p
 
 
 def test_burst_of_new_invoices_is_caught_up_across_pages():
+    """Paging still lists the whole burst; the send cap only paces delivery.
+
+    The two limits answer different questions. ``limit``/``max_pages`` decide
+    what the poller can *see* — without them a burst would push the oldest
+    invoices off page 1 and lose them silently. ``max_sends_per_run`` decides how
+    many of the seen invoices are actually *sent* in one cycle. So the burst is
+    listed in full, the first cycle sends its budget, and the next cycle drains
+    the rest: nothing is skipped, it is only paced.
+    """
     invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     sender = CapturingSender()
-    poller = _poller([PollApp("app1", source)], sender=sender, send_existing=True, limit=10)
+    poller = _poller(
+        [PollApp("app1", source)], sender=sender, send_existing=True, limit=10,
+        max_sends_per_run=10,
+    )
     summary = poller.run_once()
     app = summary["apps"][0]
     assert app["listed"] == 15
-    assert app["sent"] == 15
+    assert app["sent"] == 10
+    assert app["deferred_by_cap"] == 5
+    # The listing is newest-first, so the cap defers the *oldest* rows (1..5) and
+    # they are left unseen: the next cycle picks them up rather than the cap
+    # silently retiring them.
+    assert poller._state.seen("app1", "15") is True
+    assert poller._state.seen("app1", "5") is False
+
+    second = poller.run_once()["apps"][0]
+    assert second["sent"] == 5
+    assert second["deferred_by_cap"] == 0
+    assert len(sender.payloads) == 15
+
+
+def test_send_cap_does_not_abandon_invoices_it_deferred():
+    """A capped run must leave the overflow pending, not marked seen.
+
+    If the cap marked the invoices seen, the throttle would silently convert
+    undelivered invoices into permanently skipped ones — the exact failure the
+    cap exists to make impossible.
+    """
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    source = StubInvoiceSource(invoices)
+    state = InMemoryPollStateStore()
+    poller = _poller(
+        [PollApp("app1", source)], sender=CapturingSender(), state=state,
+        send_existing=True, limit=10, max_sends_per_run=10,
+    )
+    poller.run_once()
+    # Newest-first listing => cycle 1 sends 15..6 and defers 5..1.
+    assert state.seen("app1", "6") is True
+    assert state.seen("app1", "5") is False
+    assert state.abandoned("app1") == {}
+
+
+def test_send_cap_applies_across_apps_not_per_app():
+    """The budget is for the whole cycle, so many small tenants cannot add up.
+
+    Per-app accounting would let N tenants each use the full budget and put N x
+    cap messages in front of Meta in one cycle, which is the thing the cap is
+    meant to prevent.
+    """
+    def _app(name):
+        return PollApp(
+            name,
+            StubInvoiceSource(
+                [make_stub_invoice(id=f"{name}-{i}", number=f"INV-{i}", customer_phone="01027693262") for i in range(1, 6)]
+            ),
+        )
+
+    sender = CapturingSender()
+    poller = _poller(
+        [_app("a"), _app("b")], sender=sender, send_existing=True, limit=10,
+        max_sends_per_run=3,
+    )
+    summary = poller.run_once()
+    assert summary["apps"][0]["sent"] == 3
+    assert summary["apps"][1]["sent"] == 0
+    assert len(sender.payloads) == 3
+
+
+def test_send_cap_zero_disables_the_limit():
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    poller = _poller(
+        [PollApp("app1", StubInvoiceSource(invoices))], sender=CapturingSender(),
+        send_existing=True, limit=10, max_sends_per_run=0,
+    )
+    assert poller.run_once()["apps"][0]["sent"] == 15
+
+
+def test_send_cap_is_refreshed_each_cycle():
+    """A long-running daemon gets a fresh allowance, or it stops after cycle 1."""
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    poller = _poller(
+        [PollApp("app1", StubInvoiceSource(invoices))], sender=CapturingSender(),
+        send_existing=True, limit=10, max_sends_per_run=10,
+    )
+    assert poller.run_once()["apps"][0]["sent"] == 10
+    assert poller.run_once()["apps"][0]["sent"] == 5
 
 
 def test_saturated_listing_logs_a_warning(caplog):
@@ -785,8 +875,11 @@ def test_a_full_page_of_already_seen_invoices_does_not_warn_about_saturation(cap
     state = InMemoryPollStateStore()
     poller = _poller(
         [PollApp("app1", source)], sender=CapturingSender(), state=state,
-        send_existing=True, limit=10,
+        send_existing=True, limit=10, max_sends_per_run=0,
     )
+    # Cap disabled: this test is about the saturation warning, and a cap would
+    # split the 15 invoices across cycles, changing the premise that page 1 is
+    # full and entirely seen from cycle 2 onward.
     poller.run_once()  # first cycle handles the 15 invoices
     assert len(state.seen_ids("app1")) == 15
 

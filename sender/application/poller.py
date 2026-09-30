@@ -32,14 +32,29 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from sender.domain.errors import ApiError, WhatsAppApiError, WhatsAppSelfSendError, is_template_error
-from sender.domain.models import Invoice
+from sender.domain.models import ABANDONED, FAILED, SENT, Invoice, SendOutcome
 from sender.domain.phones import normalize_phone
-from sender.domain.ports import Clock, InvoiceSource, MessageSender, PollStateStore
+from sender.domain.ports import (
+    Clock,
+    InvoiceSource,
+    MessageSender,
+    PollStateStore,
+    SendOutcomeRecorder,
+)
 from sender.domain.templates import InvoiceTemplateBuilder, build_fallback_document
 
 log = logging.getLogger(__name__)
 
 _HANDLED_ERRORS = (ApiError, ValueError, RuntimeError)
+
+# Meta error codes that are transient backpressure: retry with backoff. These
+# arrive as HTTP 400, so the HTTP status alone would call them permanent.
+_RETRYABLE_API_CODES = frozenset({4, 80007, 130429, 131056})
+
+# Meta error codes that reflect number/quality state rather than a bad request.
+# Retrying these actively worsens the metric Meta is enforcing, so they are
+# treated as permanent and recorded as abandoned for an operator to look at.
+_PERMANENT_API_CODES = frozenset({131047, 131048, 131049})
 
 
 def _error_code(exc: Exception) -> Any:
@@ -71,16 +86,51 @@ def _header_document(payload: dict) -> dict | None:
     return None
 
 
+def _wamid(response: dict | None) -> str | None:
+    """Meta's message id from a send response, or ``None``.
+
+    Recorded for the report so an operator can trace a specific row back to
+    Meta's own logs. Every layer is optional in the payload, so this stays
+    defensive rather than indexing directly.
+    """
+    messages = (response or {}).get("messages") or []
+    if not messages:
+        return None
+    identifier = (messages[0] or {}).get("id")
+    return str(identifier) if identifier else None
+
+
 def _is_retryable(exc: Exception) -> bool:
     """Classify a handled error as transient (retry) or permanent (give up).
 
     Network/timeout errors carry ``status=None``; HTTP 429 and 5xx are the
     transient classes. Everything else (4xx, validation, template rejection,
     self-send) can never succeed on retry.
+
+    Meta's payload-level throttle codes are classified too, because they arrive
+    as an HTTP 400 and the status alone would misread them as permanent. Which
+    side of the line a code falls on matters a lot:
+
+    - ``130429`` (throughput) and ``131056`` (too many messages to one
+      recipient) are pure backpressure: they clear on their own, so retrying
+      with backoff is exactly right.
+    - ``131048`` (number restricted, "too many previous messages were blocked
+      or flagged as spam"), ``131049`` (per-user marketing limit, adaptive and
+      unpublished) and ``131047`` (outside the 24h customer service window) are
+      *quality* signals. Retrying them feeds the very behaviour Meta is
+      penalising and escalates to a block, so they stay permanent — for
+      ``131047`` the correct fix is a template, which the template-fallback path
+      above already handles.
+
+    See docs/guide/rate-limits.md for the sources.
     """
     if isinstance(exc, WhatsAppSelfSendError):
         return False
     if isinstance(exc, ApiError):
+        if _error_code(exc) in _RETRYABLE_API_CODES:
+            return True
+        if _error_code(exc) in _PERMANENT_API_CODES:
+            return False
         status = exc.status
         if status is None:
             return True
@@ -115,6 +165,8 @@ class InvoicePoller:
         max_pages: int = 5,
         country_code: str = "20",
         freeform_fallback: bool = True,
+        max_sends_per_run: int | None = 10,
+        recorder: SendOutcomeRecorder | None = None,
     ) -> None:
         self._apps = list(apps)
         self._sender = sender
@@ -132,6 +184,13 @@ class InvoicePoller:
         self._max_pages = max_pages
         self._country_code = country_code
         self._freeform_fallback = freeform_fallback
+        self._max_sends_per_run = max_sends_per_run
+        self._recorder = recorder
+        # Sends actually attempted during the current cycle. This is the cap
+        # that bounds Meta's exposure, so it is incremented at the send site
+        # (and on a send that then fails) rather than inferred from a count of
+        # successes.
+        self._sends_this_cycle = 0
 
     def run(self) -> dict:
         """Run cycles until a bound is hit or a stop signal interrupts."""
@@ -177,6 +236,16 @@ class InvoicePoller:
         that, which have nothing to preserve.
         """
         results = []
+        # The budget is per cycle, not per process: a long-running daemon must
+        # get a fresh allowance each cycle, otherwise it would stop sending
+        # forever after the first cycle that used its budget.
+        self._sends_this_cycle = 0
+        # Apps whose last cycle deferred sends because of the cap. While an app
+        # is listed here, _list_candidates pages past an all-seen page so the
+        # older backlog the cap stranded stays reachable. Deliberately NOT
+        # cleared here: _poll_app reads it to decide how deep to page, and
+        # clearing it here would discard the previous cycle's signal before it
+        # could be read. _poll_app owns the per-app lifecycle instead.
         for app in self._apps:
             try:
                 results.append(self._poll_app(app))
@@ -203,6 +272,7 @@ class InvoicePoller:
             "failed": 0,
             "pending": 0,
             "abandoned": 0,
+            "deferred_by_cap": 0,
             "first_run": False,
             "seeded": 0,
             "invoices": [],
@@ -223,8 +293,17 @@ class InvoicePoller:
         # the seeding below, and then mass-send up to max_pages*limit historical
         # invoices.
         first_run = not self._state.has_app(app.name)
+        # This app's backlog is only still draining if *this* app deferred sends
+        # last cycle, so the flag is reset here rather than globally.
+        # Was *this* app still draining a capped backlog when the last cycle
+        # ended? Read from the state store, not memory: production runs one
+        # ``poll --once`` process per cron tick, so an in-memory flag is gone by
+        # the time the next cycle needs it. The clear is deliberately deferred
+        # until after a successful listing so a transient Daftra error does not
+        # discard the signal and strand the backlog.
+        draining = self._state.is_draining(app.name)
         try:
-            listed = self._list_candidates(app)
+            listed = self._list_candidates(app, draining=draining)
         except _HANDLED_ERRORS as exc:
             log.error("app %s: listing invoices failed: %s", app.name, exc)
             result["ok"] = False
@@ -262,6 +341,12 @@ class InvoicePoller:
                     invoice_id = str(invoice.id)
                     if self._state.seen(app.name, invoice_id):
                         continue
+                    if self._send_cap_reached():
+                        # Deliberately left unseen: the cap is a throttle, not a
+                        # decision about this invoice. A later cycle picks it up.
+                        result["deferred_by_cap"] += 1
+                        self._state.set_draining(app.name, True)
+                        continue
                     if self._is_deferred(app.name, invoice_id):
                         result["pending"] += 1
                         result["invoices"].append(
@@ -298,9 +383,24 @@ class InvoicePoller:
             result["skipped_no_phone"], result["failed"], result["pending"],
             result["abandoned"], result["fallback_sends"],
         )
+        if result["deferred_by_cap"]:
+            # Persist the draining signal for the next cycle. Written here, not
+            # right after the listing, so a listing failure keeps it set. Skipped
+            # on a dry run, which must not touch the state file at all.
+            if not self._dry_run:
+                self._state.set_draining(app.name, True)
+            log.warning(
+                "app %s: hit the per-run send cap of %s; %d invoice(s) were left "
+                "unseen for a later cycle (raise POLL_MAX_SENDS_PER_RUN to send more "
+                "per run)",
+                app.name, self._max_sends_per_run, result["deferred_by_cap"],
+            )
+        else:
+            if not self._dry_run:
+                self._state.set_draining(app.name, False)
         return result
 
-    def _list_candidates(self, app: PollApp) -> list[Invoice]:
+    def _list_candidates(self, app: PollApp, *, draining: bool = False) -> list[Invoice]:
         """List invoices, paging forward while the page is saturated and still
         contains unseen invoices.
 
@@ -319,7 +419,22 @@ class InvoicePoller:
             candidates.extend(listed)
             if len(listed) < self._limit:
                 break
-            if self._state.seen(app.name, str(listed[-1].id)):
+            # Stop when this page holds nothing new *and* nothing new can be
+            # waiting behind it.
+            #
+            # The listing is newest-first, so the usual steady-state signal is
+            # "this page is full but its oldest row is already seen": the rows
+            # behind it are older history that was handled in an earlier cycle.
+            # A full page of seen rows therefore stops the walk.
+            #
+            # That inference breaks while a send cap is draining a backlog. A
+            # capped cycle sends the *newest* invoices and leaves older ones
+            # unseen, so the next cycle can face a page that is entirely seen
+            # while deeper pages are not — and stopping there would strand the
+            # backlog forever: reachable, never paged to. That is the silent
+            # loss this method exists to prevent, so while the previous cycle
+            # deferred work we keep paging to reach it.
+            if self._state.seen(app.name, str(listed[-1].id)) and not draining:
                 # This read creates the app's state entry as a side effect, so
                 # _poll_app has to capture ``first_run`` before listing (see the
                 # note there): otherwise a saturated first page would make a
@@ -346,6 +461,28 @@ class InvoicePoller:
                 app.name, len(candidates),
             )
         return candidates
+
+    def _send_cap_reached(self) -> bool:
+        """Whether this cycle has already attempted its budget of sends.
+
+        ``max_sends_per_run <= 0`` disables the cap entirely, which is how an
+        operator opts out after tuning. It must not be read as a budget of zero,
+        or "disabled" would silently mean "never send".
+        """
+        return (
+            self._max_sends_per_run is not None
+            and self._max_sends_per_run > 0
+            and self._sends_this_cycle >= self._max_sends_per_run
+        )
+
+    def _budget_send(self) -> None:
+        """Claim one unit of the per-run send budget.
+
+        Called immediately before each send POST, so a send that fails still
+        consumes budget — the cap exists to bound requests to Meta, not to bound
+        successes.
+        """
+        self._sends_this_cycle += 1
 
     def _handle_invoice(self, app: PollApp, invoice_id: str, candidate: Invoice) -> dict:
         # The list row already carries everything the template builders need
@@ -391,10 +528,11 @@ class InvoicePoller:
         if self._sender is None:
             return self._fail(
                 app, invoice.number, invoice_id, recipient,
-                RuntimeError("WhatsApp credentials are not configured; cannot send."), "send",
+                RuntimeError("WhatsApp credentials are not configured; cannot send."), "send", invoice,
             )
         try:
-            self._sender.send(payload)
+            self._budget_send()
+            response = self._sender.send(payload)
         except _HANDLED_ERRORS as exc:
             if self._is_template_failure(exc):
                 if self._freeform_fallback:
@@ -406,10 +544,11 @@ class InvoicePoller:
                     "template is what makes the next attempt succeed",
                     app.name, invoice.number, _error_code(exc),
                 )
-                return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send")
-            return self._fail(app, invoice.number, invoice_id, recipient, exc, "send")
+                return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
+            return self._fail(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         self._state.mark_seen(app.name, invoice_id)
         log.info("app %s: sent invoice %s to %s", app.name, invoice.number, recipient)
+        self._record(app, invoice, invoice_id, SENT, recipient=recipient, wamid=_wamid(response))
         return {"number": invoice.number, "id": invoice_id, "status": "sent", "to": recipient}
 
     def _is_template_failure(self, exc: Exception) -> bool:
@@ -479,23 +618,40 @@ class InvoicePoller:
                 "has no build_text and the payload has no reusable header document)",
                 app.name, invoice.number,
             )
-            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send")
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         kind, message = fallback
+        # A template-contract failure has already spent one unit of budget on the
+        # rejected template POST, so the fallback would be the (cap+1)-th message
+        # in front of Meta unless it is checked. Skipping it keeps the cap hard
+        # and leaves the invoice pending on the template error, which is where
+        # it already sits on this path.
+        if self._send_cap_reached():
+            log.info(
+                "app %s: invoice %s reached the per-run send cap after its template "
+                "rejection; deferring the free-form fallback to a later cycle",
+                app.name, invoice.number,
+            )
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         try:
-            self._sender.send(message)
+            self._budget_send()
+            response = self._sender.send(message)
         except _HANDLED_ERRORS as fallback_exc:
             log.error(
                 "app %s: invoice %s free-form %s fallback also failed: %s (the template "
                 "error it replaces: %s); the invoice stays pending on the template error",
                 app.name, invoice.number, kind, fallback_exc, exc,
             )
-            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send")
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         self._state.mark_seen(app.name, invoice_id)
         log.warning(
             "app %s: delivered invoice %s to %s as a free-form %s message after the "
             "template send failed with [code %s]. Approve the template; free-form only "
             "reaches the customer inside the 24-hour customer service window",
             app.name, invoice.number, recipient, kind, code,
+        )
+        self._record(
+            app, invoice, invoice_id, SENT,
+            recipient=recipient, error=str(exc), fallback=True, wamid=_wamid(response),
         )
         return {
             "number": invoice.number,
@@ -507,12 +663,52 @@ class InvoicePoller:
             "error": str(exc),
         }
 
-    def _fail(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str) -> dict:
-        if _is_retryable(exc):
-            return self._fail_retryable(app, number, invoice_id, to, exc, action)
-        return self._fail_permanent(app, number, invoice_id, to, exc, action)
+    def _record(
+        self,
+        app: PollApp,
+        invoice: Invoice,
+        invoice_id: str,
+        status: str,
+        *,
+        recipient: str | None = None,
+        error: str | None = None,
+        fallback: bool = False,
+        wamid: str | None = None,
+    ) -> None:
+        """Log one send attempt to the HTML report, if a recorder is attached.
 
-    def _fail_retryable(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str) -> dict:
+        Only genuine attempts reach here: the dry-run branch returns before the
+        send, ``skipped_no_phone`` returns without a send, and listing/build
+        failures are filtered out by the ``action == "send"`` guard at the call
+        sites. A dry run never records, matching the non-mutating contract that
+        the state writes honour.
+        """
+        if self._recorder is None or self._dry_run:
+            return
+        self._recorder.record(
+            SendOutcome(
+                app=app.name,
+                invoice_id=invoice_id,
+                invoice_number=invoice.number,
+                customer_name=invoice.customer_name,
+                customer_phone=recipient,
+                currency=invoice.currency,
+                total=invoice.total,
+                issue_date=invoice.issue_date,
+                status=status,
+                attempted_at=self._clock.now(),
+                error=error,
+                fallback=fallback,
+                wamid=wamid,
+            )
+        )
+
+    def _fail(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
+        if _is_retryable(exc):
+            return self._fail_retryable(app, number, invoice_id, to, exc, action, invoice)
+        return self._fail_permanent(app, number, invoice_id, to, exc, action, invoice)
+
+    def _fail_retryable(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
         previous = self._state.pending(app.name).get(invoice_id, {})
         count = int(previous.get("count", 0)) + 1
         backoff = self._backoff_for(count)
@@ -530,9 +726,11 @@ class InvoicePoller:
             "app %s: invoice %s %s failed (retryable, attempt %d): %s; will retry in %gs",
             app.name, number, action, count, exc, backoff,
         )
+        if invoice is not None and action == "send":
+            self._record(app, invoice, invoice_id, FAILED, recipient=to, error=str(exc))
         return {"number": number, "id": invoice_id, "status": "failed", "to": to, "error": str(exc), "retryable": True}
 
-    def _fail_permanent(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str) -> dict:
+    def _fail_permanent(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
         previous = self._state.abandoned(app.name).get(invoice_id, {})
         count = int(previous.get("count", 0)) + 1
         # Guarded like the skipped_no_phone branches: a dry run reports the
@@ -548,6 +746,8 @@ class InvoicePoller:
             "app %s: invoice %s %s failed permanently (attempt %d): %s; giving up",
             app.name, number, action, count, exc,
         )
+        if invoice is not None and action == "send":
+            self._record(app, invoice, invoice_id, ABANDONED, recipient=to, error=str(exc))
         return {"number": number, "id": invoice_id, "status": "abandoned", "to": to, "error": str(exc)}
 
     def _backoff_for(self, count: int) -> float:

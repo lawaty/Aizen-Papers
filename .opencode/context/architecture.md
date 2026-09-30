@@ -33,7 +33,7 @@ presentation ──▶ application ──▶ domain
 - **`presentation` is the only composition root** — the single place allowed to
   import every layer and wire concrete adapters together.
 - `domain` is stdlib-only: models, the template contract, phone normalization,
-  and the ports.
+  the send-report rendering, and the ports.
 
 The rule is stated as a convention; there is **no automated import-lint test**
 enforcing it. > Confidence: high for the absence (searched the suite), and it is
@@ -49,7 +49,9 @@ the first thing to check manually when reviewing a new cross-layer import.
 
 Read `cli.py:build_service()` first for any wiring question — it constructs the
 `WhatsAppClient`, `DaftraClient`/`StubInvoiceSource`, attachment provider, and
-template builder, then hands them to `InvoiceNotificationService`.
+template builder, then hands them to `InvoiceNotificationService`. The poll path is
+wired separately, in `cli._run_poll`, which also attaches the send-outcome recorder
+(`REPORT_ENABLED`, off → `None`).
 
 ## Top-level layout
 
@@ -64,7 +66,7 @@ template builder, then hands them to `InvoiceNotificationService`.
 
 Untracked-but-present files that hold **machine-specific** state and must never be
 copied to another machine: `poll_state.json`, `template_state.json`, `.env`,
-`vendor/`, `logs/`. See `conventions.md`.
+`vendor/`, `logs/`, `reports/`. See `conventions.md`.
 
 ## Deployment reality
 

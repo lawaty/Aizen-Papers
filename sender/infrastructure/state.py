@@ -88,6 +88,23 @@ class _PollStateBase:
             entry["abandoned"].pop(sid, None)
         self._maybe_save()
 
+    def is_draining(self, app_name: str) -> bool:
+        """Whether this app's last cycle hit the send cap and deferred work.
+
+        Persisted because production runs one ``poll --once`` process per cron
+        tick, so an in-memory flag would be lost exactly when the next cycle
+        needs it: the deferred backlog sits behind an all-seen page and would
+        never be paged to again.
+        """
+        return bool(self._entry(app_name).get("draining"))
+
+    def set_draining(self, app_name: str, draining: bool) -> None:
+        if draining:
+            self._entry(app_name)["draining"] = True
+        else:
+            self._entry(app_name).pop("draining", None)
+        self._maybe_save()
+
     def last_poll_at(self, app_name: str) -> float | None:
         value = self._entry(app_name).get("last_poll_at")
         return value if isinstance(value, (int, float)) else None

@@ -6,7 +6,7 @@ import logging
 import sys
 import time
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Sequence
 
@@ -36,6 +36,7 @@ from sender.application.services import InvoiceNotificationService
 from sender.infrastructure.clock import SystemClock
 from sender.infrastructure.state import JsonPollStateStore, PollStateLock
 from sender.infrastructure.attachments import UploadedMediaProvider
+from sender.infrastructure.reporting import JsonlSendOutcomeRecorder, ReportStore
 from sender.presentation.stubs import StubInvoiceSource, default_stub_invoices
 
 
@@ -308,6 +309,7 @@ def _build_parser() -> argparse.ArgumentParser:
     poll.add_argument("--interval", type=float, default=None, help="Seconds between cycles (default: POLL_INTERVAL env, 60)")
     poll.add_argument("--limit", type=int, default=None, help="List page size (default: POLL_LIMIT env, 10)")
     poll.add_argument("--max-cycles", type=int, default=None, help="Stop after this many cycles")
+    poll.add_argument("--max-sends", type=int, default=None, help="Cap send attempts per cycle across all apps (default: POLL_MAX_SENDS_PER_RUN env, 10; 0 disables)")
     poll.add_argument("--timeout", type=float, default=None, help="Stop after this many seconds")
     poll.add_argument("--dry-run", action="store_true", help="Build payloads without sending and without touching the poll state")
     poll.add_argument("--send-existing", action="store_true", help="On the first run, send the currently existing invoices instead of seeding them as seen")
@@ -325,6 +327,10 @@ def _build_parser() -> argparse.ArgumentParser:
     poll_reset.add_argument("--stub", action="store_true", help="Reset the offline stub poll state instead of the real one")
 
     stub_add = sub.add_parser("stub-add", help="Add a new invoice to the offline stub fixture")
+
+    report = sub.add_parser("report", help="Regenerate the HTML pages of sent messages from the send log")
+    report.add_argument("--date", default=None, help="Regenerate only this YYYY-MM-DD page (default: every logged date)")
+    report.add_argument("--stub", action="store_true", help="Use the offline stub report directory instead of the real one")
 
     webhook = sub.add_parser("webhook-serve", help="Run the delivery-status webhook receiver")
     webhook.add_argument("--host", default="0.0.0.0", help="Bind host")
@@ -531,6 +537,8 @@ def _run_poll(args: argparse.Namespace, settings: Settings) -> int:
         ]
         state = JsonPollStateStore(settings.poll_state_path, max_seen=settings.poll_max_seen)
         lock = PollStateLock(settings.poll_state_path)
+    max_sends = args.max_sends if args.max_sends is not None else settings.poll_max_sends_per_run
+    recorder = _report_recorder(settings, stub=bool(getattr(args, "stub", False)))
     sender = WhatsAppClient(
         access_token=settings.wa_access_token,
         phone_number_id=settings.wa_phone_number_id,
@@ -557,6 +565,8 @@ def _run_poll(args: argparse.Namespace, settings: Settings) -> int:
         max_pages=settings.poll_max_pages,
         country_code=settings.default_country_code,
         freeform_fallback=settings.wa_freeform_fallback,
+        max_sends_per_run=max_sends,
+        recorder=recorder,
     )
 
     def _handle_signal(signum, frame):
@@ -584,6 +594,7 @@ def _run_poll(args: argparse.Namespace, settings: Settings) -> int:
         print(_format_poll_summary(summary))
     else:
         logging.info("poll finished: %s", _format_poll_summary(summary))
+    _refresh_report_pages(settings, recorder, stub=bool(getattr(args, "stub", False)))
     if summary.get("interrupted"):
         # An interrupt mid-cycle means the run did not finish what it set out to
         # do. In daemon mode that is the normal way to stop (exit 0), but a
@@ -591,6 +602,63 @@ def _run_poll(args: argparse.Namespace, settings: Settings) -> int:
         # scheduler and monitoring can tell "completed" from "killed".
         return 1 if args.once else 0
     return 1 if summary.get("all_failed") else 0
+
+
+def _report_paths(settings: Settings, *, stub: bool) -> tuple[str, str]:
+    """The (html dir, data dir) for the report, real or stub."""
+    if stub:
+        return settings.report_stub_dir, f"{settings.report_stub_dir}/data"
+    return settings.report_dir, settings.report_data_dir
+
+
+def _report_recorder(settings: Settings, *, stub: bool):
+    """The send-outcome recorder, or ``None`` when reporting is off."""
+    if not settings.report_enabled:
+        return None
+    _, data_dir = _report_paths(settings, stub=stub)
+    return JsonlSendOutcomeRecorder(data_dir)
+
+
+def _refresh_report_pages(settings: Settings, recorder, *, stub: bool) -> None:
+    """Rebuild the report pages touched by this run, then apply retention.
+
+    Done after the run rather than inside it: the poll-state lock is released
+    by then, and regeneration is a pure read of the log followed by atomic
+    writes, so it cannot interleave with a send. Best-effort — a report problem
+    must not turn a successful send cycle into a failed exit code.
+    """
+    if recorder is None or not getattr(recorder, "dates_written", None):
+        return
+    try:
+        report_dir, data_dir = _report_paths(settings, stub=stub)
+        store = ReportStore(report_dir, data_dir, obfuscate=settings.report_obfuscate_phone)
+        store.render(recorder.dates_written)
+        store.prune(settings.report_retention_days)
+    except Exception:  # noqa: BLE001 - reporting must never fail a poll
+        log.exception("could not refresh the HTML send report")
+
+
+def _run_report(args: argparse.Namespace, settings: Settings) -> int:
+    """Rebuild the HTML report pages from the send log."""
+    report_dir, data_dir = _report_paths(settings, stub=args.stub)
+    store = ReportStore(report_dir, data_dir, obfuscate=settings.report_obfuscate_phone)
+    available = store.available_dates()
+    if not available:
+        print(f"No send history yet in {data_dir}")
+        return 0
+    days = None
+    if args.date:
+        try:
+            days = [date.fromisoformat(args.date)]
+        except ValueError:
+            print(f"--date must be YYYY-MM-DD, got {args.date!r}", file=sys.stderr)
+            return 2
+    written = store.render(days)
+    pruned = store.prune(settings.report_retention_days)
+    print(f"Wrote {len(written)} file(s) to {report_dir}")
+    if pruned:
+        print(f"Pruned {len(pruned)} expired day(s): {', '.join(d.isoformat() for d in pruned)}")
+    return 0
 
 
 def _run_poll_status(args: argparse.Namespace, settings: Settings) -> int:
@@ -694,6 +762,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             source = StubInvoiceSource(path=settings.stub_invoices_path)
             invoice = source.add_new_invoice()
             print(f"added {invoice.number} (id {invoice.id}) to {settings.stub_invoices_path}")
+        elif args.command == "report":
+            return _run_report(args, settings)
         elif template_cmd:
             if not settings.wa_waba_id:
                 raise RuntimeError("WHATSAPP_WABA_ID must be set in the environment")

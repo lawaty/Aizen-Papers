@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
-from .models import Invoice
+from .models import Invoice, SendOutcome
 
 
 class InvoiceSource(Protocol):
@@ -77,6 +77,8 @@ class PollStateStore(Protocol):
     def mark_many_seen(self, app_name: str, invoice_ids: list[str]) -> None: ...
     def last_poll_at(self, app_name: str) -> float | None: ...
     def set_last_poll_at(self, app_name: str, timestamp: float) -> None: ...
+    def is_draining(self, app_name: str) -> bool: ...
+    def set_draining(self, app_name: str, draining: bool) -> None: ...
     def pending(self, app_name: str) -> dict: ...
     def abandoned(self, app_name: str) -> dict: ...
     def record_pending(
@@ -109,3 +111,20 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...
     def now(self) -> float: ...
     def sleep(self, seconds: float) -> None: ...
+
+
+@runtime_checkable
+class SendOutcomeRecorder(Protocol):
+    """Durable sink for the HTML send report.
+
+    Separate from :class:`PollStateStore` on purpose: the state file is
+    gitignored, machine-specific and bounded by ``poll_max_seen`` because it
+    exists to answer "what still needs sending". The report is an audit trail
+    with different retention, so it gets its own port and store rather than
+    overloading a well-tested one.
+
+    Implementations must be best-effort: a report that cannot be written must
+    never fail the send pipeline.
+    """
+
+    def record(self, outcome: SendOutcome) -> None: ...

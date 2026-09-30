@@ -44,6 +44,30 @@ def write_json_atomic(path, data) -> None:
             pass
 
 
+def write_text_atomic(path, text: str) -> None:
+    """Atomically write *text* to *path*, with the same durability as above.
+
+    Used for the generated HTML reports: a reader following a link must never
+    catch a half-written page, and a crash mid-regeneration must leave the
+    previous day's page intact rather than truncating it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _fsync_dir(directory: Path) -> None:
     """Make the rename durable by syncing the directory entry itself.
 

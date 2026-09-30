@@ -40,14 +40,25 @@ per app →
    nothing** (unless `--send-existing`).
 3. Per new invoice: if the list row has no phone, re-fetch the invoice for the
    authoritative one. No usable phone → mark seen, never retried.
-4. Build → send → **mark seen only after the send attempt**.
+4. Build → send → **mark seen only after the send attempt**. The send budget is
+   claimed at the send site, so a failed send still consumes it.
 5. Classify: network/429/5xx → `pending` with bounded exponential backoff
    (`min(interval * 2^(count-1), max_backoff)`), never given up. Everything else
    → `abandoned`, visible in `poll-status`, re-drivable via
-   `poll-reset --invoice-id`.
+   `poll-reset --invoice-id`. Payload-level Meta codes override the HTTP status
+   (`_RETRYABLE_API_CODES` / `_PERMANENT_API_CODES`).
 
 then `set_last_poll_at`. One app raising never skips the rest. Exit code is
 non-zero only if *every* app failed.
+
+After the run, and **outside the poll-state lock**, `cli._refresh_report_pages`
+regenerates the HTML report for the dates touched and applies retention — see
+§ 6. It is best-effort and cannot change the exit code.
+
+If the cycle hits `POLL_MAX_SENDS_PER_RUN` (default 10, across all apps), the
+overflow invoices are deliberately left **unseen** and counted as
+`deferred_by_cap`; the next cycle drains them, paging past all-seen pages while
+draining. A WARNING naming the env var is logged.
 
 In production the entry point sits one level up: cron calls the committed
 wrapper `tools/run_poll.sh --once --timeout 240`, which resolves the project
@@ -110,3 +121,28 @@ cron line is committed in the `tools/run_poll.sh` header comment; machine-local
 host details (SSH alias, interpreter, project path, upload rules) are in the
 gitignored `HANDOFF-deploy.md`, with the durable subset in
 [`decisions.md`](decisions.md).
+
+---
+
+## 6. Send report (`poll` side effect, plus `python -m sender report`)
+
+per send attempt → `JsonlSendOutcomeRecorder.record` appends one JSON object to
+`REPORT_DATA_DIR/<host-local-date>.jsonl` (`O_APPEND`, one write per line) → at
+end of run `ReportStore.render()` rewrites `<date>.html` + `index.html` for every
+date it touched, via `write_text_atomic`; then `ReportStore.prune()` deletes
+anything past `REPORT_RETENTION_DAYS` (`0` disables).
+
+The **JSONL is the record; the HTML is derived.** A renderer bug is therefore
+fixable by re-running `python -m sender report` (with `--date` for one day, or
+`--stub` for the offline directory) without losing history, and a failed
+regeneration cannot destroy yesterday's page.
+
+Dates are bucketed by **host-local** time, not UTC, matching how the poll summary
+prints timestamps.
+
+**Traps:** the report directory is meant to be browsable from a web root, so
+`REPORT_OBFUSCE_PHONE` defaults on and a generated `.htaccess` blocks `*.jsonl`
+and directory listing — that is not access control. The pages themselves still
+want `.htpasswd` or to live outside the docroot. `reports/` and `reports.stub/`
+are customer-PII artifacts and are **not yet in `.gitignore`** — see
+[`decisions.md`](decisions.md) drift list.

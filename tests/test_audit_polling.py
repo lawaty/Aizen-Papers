@@ -312,7 +312,7 @@ def test_burst_beyond_limit_times_max_pages_is_permanently_missed(tmp_path, capl
     caplog.clear()
     run2_sender = CapturingSender()
     with caplog.at_level("WARNING"):
-        second = _run(path, source, run2_sender, limit=10, max_pages=5, send_existing=True)["apps"][0]
+        second = _run(path, source, run2_sender, limit=10, max_pages=5, send_existing=True, max_sends_per_run=0)["apps"][0]
     assert second["listed"] == 50  # only the 50 newest of the burst
     assert second["sent"] == 50
     assert set(_sent_numbers(run2_sender)) == set(burst_newest)
