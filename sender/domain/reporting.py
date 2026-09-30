@@ -41,7 +41,11 @@ def obfuscate_phone(phone: str | None) -> str:
     if not phone:
         return ""
     text = str(phone).strip()
-    if len(text) <= 4:
+    # A number too short to mask with a prefix and a suffix must be hidden
+    # completely: keeping 4 of 5 characters would leave a dialable number
+    # behind, which is the one thing masking exists to prevent. Needs >= 7
+    # characters for 2 + at least 1 masked + 4 trailing digits to line up.
+    if len(text) <= 6:
         return "•" * len(text)
     return f"{text[:2]}{'•' * (len(text) - 6)}{text[-4:]}"
 
