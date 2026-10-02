@@ -68,8 +68,8 @@ def test_send_invoice_delivers_exactly_one_payload_to_the_sender():
     sender = CapturingSender()
     result = _service(sender).send_invoice("1")
     assert len(sender.calls) == 1
-    assert result["payload"] is sender.payloads[0]
-    assert result["response"] == {"messages": [{"id": "wamid.FAKE"}]}
+    assert result["payloads"][0] is sender.payloads[0]
+    assert result["responses"] == [{"messages": [{"id": "wamid.FAKE"}]}]
 
 
 def test_template_payload_declares_the_whatsapp_message_envelope():
@@ -120,8 +120,8 @@ def test_send_freeform_delivers_exactly_one_payload_to_the_sender():
     sender = CapturingSender()
     result = _service(sender).send_freeform("1")
     assert len(sender.payloads) == 1
-    assert result["payload"] is sender.payloads[0]
-    assert result["response"] == {"messages": [{"id": "wamid.FAKE"}]}
+    assert result["payloads"][0] is sender.payloads[0]
+    assert result["responses"] == [{"messages": [{"id": "wamid.FAKE"}]}]
 
 
 def test_freeform_payload_is_a_plain_whatsapp_text_message():
@@ -171,7 +171,7 @@ def test_freeform_values_appear_in_the_template_parameter_order():
 def test_missing_to_falls_back_to_the_invoice_customer_phone():
     sender = CapturingSender()
     result = _service(sender).send_invoice("1")
-    assert result["to"] == "01027693262"
+    assert result["recipients"] == ["01027693262"]
     assert sender.payloads[0]["to"] == "201027693262"
 
 
@@ -179,7 +179,7 @@ def test_explicit_to_overrides_the_invoice_customer_phone():
     sender = CapturingSender()
     result = _service(sender).send_invoice("1", to_phone="+201234567890")
     assert sender.payloads[0]["to"] == "201234567890"
-    assert result["to"] == "+201234567890"
+    assert result["recipients"] == ["+201234567890"]
 
 
 def test_local_format_to_is_normalized_with_the_default_country_code():
@@ -189,7 +189,7 @@ def test_local_format_to_is_normalized_with_the_default_country_code():
 
 
 def test_invoice_without_phone_and_no_to_is_rejected():
-    invoice = make_stub_invoice(customer_phone=None)
+    invoice = make_stub_invoice(customer_phones=())
     service = _service(CapturingSender(), invoices=[invoice])
     with pytest.raises(ValueError, match="no valid WhatsApp phone on file"):
         service.send_invoice("1")
@@ -200,7 +200,7 @@ def test_source_resolves_the_requested_invoice_by_id():
         id="2",
         number="INV-002",
         customer_name="Mona Farouk",
-        customer_phone="01234567890",
+        customer_phones=("01234567890",),
         issue_date=date(2026, 9, 5),
         total=Decimal("3200.50"),
     )
@@ -221,7 +221,7 @@ def test_stub_registry_resolves_by_id_and_number():
         id="2",
         number="INV-002",
         customer_name="Mona Farouk",
-        customer_phone="01234567890",
+        customer_phones=("01234567890",),
         issue_date=date(2026, 9, 5),
         total=Decimal("3200.50"),
     )
@@ -240,8 +240,8 @@ def test_dry_run_returns_the_template_payload_without_sending():
     sender = CapturingSender()
     result = _service(sender).send_invoice("1", dry_run=True)
     assert result["dry_run"] is True
-    assert result["payload"]["type"] == "template"
-    assert result["payload"]["to"] == "201027693262"
+    assert result["payloads"][0]["type"] == "template"
+    assert result["payloads"][0]["to"] == "201027693262"
     assert sender.payloads == []
     assert "response" not in result
 
@@ -250,8 +250,8 @@ def test_dry_run_returns_the_text_payload_without_sending():
     sender = CapturingSender()
     result = _service(sender).send_freeform("1", dry_run=True)
     assert result["dry_run"] is True
-    assert result["payload"]["type"] == "text"
-    assert "Ahmed Hassan" in result["payload"]["text"]["body"]
+    assert result["payloads"][0]["type"] == "text"
+    assert "Ahmed Hassan" in result["payloads"][0]["text"]["body"]
     assert sender.payloads == []
 
 

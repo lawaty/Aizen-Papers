@@ -169,7 +169,7 @@ def test_only_a_newly_added_customer_is_welcomed():
     sender = CapturingSender()
     poller = _poller([PollApp(name="app1", source=source)], sender=sender, state=state)
     poller.run_once()
-    source.add_new_customer(customer_name="New Co", customer_phone="01099887766")
+    source.add_new_customer(customer_name="New Co", customer_phones=("01099887766",))
     app = _app_result(poller.run_once())
     assert (app["new"], app["sent"]) == (1, 1)
     assert _greeted(sender) == {"New Co"}
@@ -187,17 +187,17 @@ def test_the_detail_rule_is_inherited_not_reimplemented():
 
 def test_a_listing_row_that_already_has_a_phone_needs_no_detail_fetch():
     poller = _poller([])
-    assert poller._needs_detail(make_stub_customer(customer_phone="01027693262")) is False
+    assert poller._needs_detail(make_stub_customer(customer_phones=("01027693262",))) is False
 
 
 def test_a_listing_row_without_a_phone_triggers_exactly_one_detail_fetch():
     poller = _poller([])
-    assert poller._needs_detail(make_stub_customer(customer_phone=None)) is True
+    assert poller._needs_detail(make_stub_customer(customer_phones=())) is True
 
 
 def test_a_normal_run_makes_no_detail_calls_at_all():
     """The contrast with payments, which always need a second hop to find the payer."""
-    source = CountingCustomerSource([make_stub_customer(id="1", customer_phone="01027693262")])
+    source = CountingCustomerSource([make_stub_customer(id="1", customer_phones=("01027693262",))])
     _poller([PollApp(name="app1", source=source)], sender=CapturingSender()).run_once()
     assert source.detail_calls == []
 

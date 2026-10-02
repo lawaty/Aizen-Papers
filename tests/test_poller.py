@@ -74,7 +74,7 @@ class ListRowWithoutAPhoneSource:
         self.error = error
 
     def list_invoices(self, limit: int = 10, page: int = 1):
-        return [make_stub_invoice(customer_phone=None)]
+        return [make_stub_invoice(customer_phones=())]
 
     def get_invoice(self, invoice_id):
         raise self.error
@@ -207,7 +207,7 @@ def test_stub_source_can_simulate_new_invoices_between_cycles():
     poller = _poller([PollApp("app1", source)], sender=sender, send_existing=True)
     poller.run_once()
     assert len(sender.payloads) == 2
-    source.add_new_invoice(customer_name="Sara Ali", customer_phone="01111111111")
+    source.add_new_invoice(customer_name="Sara Ali", customer_phones=("01111111111",))
     poller.run_once()
     assert len(sender.payloads) == 3
     assert sender.payloads[2]["to"] == "201111111111"
@@ -440,7 +440,7 @@ def test_invoice_without_phone_is_skipped_and_marked_seen(caplog):
 
 
 def test_invoice_with_an_unusable_phone_is_skipped_and_marked_seen():
-    source = StubInvoiceSource([make_stub_invoice(customer_phone="not-a-phone")])
+    source = StubInvoiceSource([make_stub_invoice(customer_phones=("not-a-phone",))])
     sender = CapturingSender()
     poller = _poller([PollApp("app1", source)], sender=sender, send_existing=True)
     summary = poller.run_once()
@@ -687,7 +687,7 @@ def test_a_list_row_that_already_carries_the_items_needs_no_detail_fetch():
     # is only worth paying when the fetch is the only way to get them.
     source = CountingSource(
         [make_stub_invoice()],
-        make_stub_invoice(customer_phone="01000000000"),
+        make_stub_invoice(customer_phones=("01000000000",)),
     )
     sender = CapturingSender()
     poller = _poller([PollApp("one", source)], sender=sender, send_existing=True)
@@ -759,8 +759,8 @@ def test_mapper_normalizes_with_the_configured_country_code():
     raw = _list_payload_with_phone("1", "INV-001", "0501234567")
     # The mapper used to hardcode 20, so a Saudi local number was read as an
     # Egyptian one and the poller then re-normalized the already-wrong digits.
-    assert DaftraInvoiceMapper(country_code="966").to_invoices(raw)[0].customer_phone == "966501234567"
-    assert DaftraInvoiceMapper().to_invoices(raw)[0].customer_phone == "20501234567"
+    assert DaftraInvoiceMapper(country_code="966").to_invoices(raw)[0].customer_phones == ("966501234567",)
+    assert DaftraInvoiceMapper().to_invoices(raw)[0].customer_phones == ("20501234567",)
 
 
 def test_daftra_client_hands_its_country_code_to_the_mapper():
@@ -772,7 +772,7 @@ def test_daftra_client_hands_its_country_code_to_the_mapper():
         api_key="key1", base_url="https://one.daftra.com/api2", timeout=5,
         session=session, country_code="966",
     )
-    assert client.get_invoice("1").customer_phone == "966501234567"
+    assert client.get_invoice("1").customer_phones == ("966501234567",)
 
 
 # --- dry run ---
@@ -855,7 +855,7 @@ def test_burst_of_new_invoices_is_caught_up_across_pages():
     listed in full, the first cycle sends its budget, and the next cycle drains
     the rest: nothing is skipped, it is only paced.
     """
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     sender = CapturingSender()
     poller = _poller(
@@ -886,7 +886,7 @@ def test_send_cap_does_not_abandon_invoices_it_deferred():
     undelivered invoices into permanently skipped ones — the exact failure the
     cap exists to make impossible.
     """
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     state = InMemoryPollStateStore()
     poller = _poller(
@@ -911,7 +911,7 @@ def test_send_cap_applies_across_apps_not_per_app():
         return PollApp(
             name,
             StubInvoiceSource(
-                [make_stub_invoice(id=f"{name}-{i}", number=f"INV-{i}", customer_phone="01027693262") for i in range(1, 6)]
+                [make_stub_invoice(id=f"{name}-{i}", number=f"INV-{i}", customer_phones=("01027693262",)) for i in range(1, 6)]
             ),
         )
 
@@ -927,7 +927,7 @@ def test_send_cap_applies_across_apps_not_per_app():
 
 
 def test_send_cap_zero_disables_the_limit():
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     poller = _poller(
         [PollApp("app1", StubInvoiceSource(invoices))], sender=CapturingSender(),
         send_existing=True, limit=10, max_sends_per_run=0,
@@ -937,7 +937,7 @@ def test_send_cap_zero_disables_the_limit():
 
 def test_send_cap_is_refreshed_each_cycle():
     """A long-running daemon gets a fresh allowance, or it stops after cycle 1."""
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     poller = _poller(
         [PollApp("app1", StubInvoiceSource(invoices))], sender=CapturingSender(),
         send_existing=True, limit=10, max_sends_per_run=10,
@@ -947,7 +947,7 @@ def test_send_cap_is_refreshed_each_cycle():
 
 
 def test_saturated_listing_logs_a_warning(caplog):
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     poller = _poller([PollApp("app1", source)], sender=CapturingSender(), send_existing=True, limit=10)
     with caplog.at_level("WARNING"):
@@ -964,7 +964,7 @@ def test_a_full_page_of_already_seen_invoices_does_not_warn_about_saturation(cap
     ``max_pages`` warning, which fires only when unseen rows are actually being
     dropped).
     """
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     state = InMemoryPollStateStore()
     poller = _poller(
@@ -986,7 +986,7 @@ def test_a_full_page_of_already_seen_invoices_does_not_warn_about_saturation(cap
     assert not any("came back full" in record.message for record in caplog.records)
 
     # A fresh invoice on the same full page brings the warning back.
-    source.add_new_invoice(customer_phone="01027693262")
+    source.add_new_invoice(customer_phones=("01027693262",))
     caplog.clear()
     with caplog.at_level("WARNING"):
         poller.run_once()
@@ -994,7 +994,7 @@ def test_a_full_page_of_already_seen_invoices_does_not_warn_about_saturation(cap
 
 
 def test_paging_stops_at_seen_territory():
-    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone="01027693262") for i in range(1, 16)]
+    invoices = [make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=("01027693262",)) for i in range(1, 16)]
     source = StubInvoiceSource(invoices)
     state = InMemoryPollStateStore()
     state.mark_many_seen("app1", [str(i) for i in range(1, 6)])  # oldest 5 already handled
@@ -1053,7 +1053,7 @@ def test_stub_source_persists_to_a_fixture_file(tmp_path):
     source = StubInvoiceSource(path=str(path))
     assert len(source.list_invoices(limit=10)) == 3
     assert path.exists()
-    source.add_new_invoice(customer_name="Sara Ali", customer_phone="01111111111")
+    source.add_new_invoice(customer_name="Sara Ali", customer_phones=("01111111111",))
     reloaded = StubInvoiceSource(path=str(path))
     assert len(reloaded.list_invoices(limit=10)) == 4
     assert reloaded.get_invoice("4").customer_name == "Sara Ali"

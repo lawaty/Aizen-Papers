@@ -611,3 +611,104 @@ def test_poll_customers_seeds_without_sending_on_the_first_run(
     # Seeded, so the state file exists — pinned into tmp_path, never the repo.
     assert (tmp_path / "poll_customers_state.stub.json").exists()
     assert not (tmp_path / "poll_customers_state.json").exists()
+
+
+def test_a_cap_deferral_is_not_reported_as_a_failure(capsys):
+    """Regression: ``deferred_by_cap`` had no branch in the summary formatter and
+    fell through to the ``else``, so a document that was merely throttled — never
+    attempted, never failed, queued for the next cycle — was printed to the
+    operator as "failed". That is the reading that sends someone hunting for a
+    delivery problem that does not exist, and it is indistinguishable from a real
+    send failure at a glance."""
+    from sender.presentation.cli import _format_poll_summary
+
+    summary = {
+        "apps": [
+            {
+                "app": "stub",
+                "ok": True,
+                "listed": 2,
+                "new": 2,
+                "sent": 1,
+                "skipped_no_phone": 0,
+                "failed": 0,
+                "pending": 0,
+                "abandoned": 0,
+                "kind": "customer",
+                "first_run": False,
+                "seeded": 0,
+                "invoices": [
+                    {"number": "000002", "status": "sent", "to": "201234567890"},
+                    {
+                        "number": "000001",
+                        "status": "deferred_by_cap",
+                        "to": "201027693262",
+                        "delivered": ["201027693262"],
+                        "remaining": ["2011155566677"],
+                    },
+                ],
+            }
+        ]
+    }
+    out = _format_poll_summary(summary)
+    assert "deferred (per-run send cap)" in out
+    assert "still to send 2011155566677" in out
+    # The per-row lines must not claim a failure; only the `failed 0` counter
+    # contains the word.
+    row_lines = [ln for ln in out.splitlines() if ln.startswith("  0000")]
+    assert all("failed" not in ln for ln in row_lines), out
+
+
+def test_a_cap_deferral_with_no_progress_still_renders(capsys):
+    """The deferral can land on the *first* recipient, when the cap was already
+    spent by earlier documents. Then nothing was delivered and there is nothing to
+    list, which must not crash the formatter."""
+    from sender.presentation.cli import _format_poll_summary
+
+    summary = {
+        "apps": [
+            {
+                "app": "stub", "ok": True, "listed": 1, "new": 1, "sent": 0,
+                "skipped_no_phone": 0, "failed": 0, "pending": 0, "abandoned": 0,
+                "kind": "invoice", "first_run": False, "seeded": 0,
+                "invoices": [{"number": "INV-001", "status": "deferred_by_cap"}],
+            }
+        ]
+    }
+    out = _format_poll_summary(summary)
+    assert "deferred (per-run send cap)" in out
+
+
+def test_a_partly_delivered_document_is_visible_in_poll_status(tmp_path, capsys, monkeypatch):
+    """Regression: a partly-delivered document sits in none of seen / pending /
+    abandoned, so ``poll-status`` showed nothing at all and an operator would
+    conclude nothing was in flight while a customer was still owed a message."""
+    from sender.infrastructure.state import JsonPollStateStore
+    from sender.presentation import cli as cli_module
+
+    state_path = tmp_path / "poll_customers_state.stub.json"
+    store = JsonPollStateStore(str(state_path))
+    store.record_delivered("app1", "7", ["201027693262"])
+
+    args = cli_parser().parse_args(["poll-status", "--customers", "--customer-stub"])
+    settings = _settings(customers_stub_state_path=str(state_path))
+    assert cli_module._run_poll_status(args, settings) == 0
+
+    out = capsys.readouterr().out
+    assert "partly delivered" in out
+    assert "customer 7" in out
+    assert "201027693262" in out
+
+
+def test_poll_status_is_quiet_when_nothing_is_partly_delivered(tmp_path, capsys):
+    """The new section must not add noise to the normal, healthy case."""
+    from sender.infrastructure.state import JsonPollStateStore
+    from sender.presentation import cli as cli_module
+
+    state_path = tmp_path / "poll_state.stub.json"
+    JsonPollStateStore(str(state_path)).mark_seen("app1", "2")
+
+    args = cli_parser().parse_args(["poll-status", "--invoice-stub"])
+    settings = _settings(poll_stub_state_path=str(state_path))
+    assert cli_module._run_poll_status(args, settings) == 0
+    assert "partly delivered" not in capsys.readouterr().out

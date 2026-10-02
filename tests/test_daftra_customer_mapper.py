@@ -111,7 +111,7 @@ def test_a_live_company_row_maps_onto_the_model(mapper):
     assert customer.id == "1"
     assert customer.number == "000001"
     assert customer.customer_name == "Print Home"
-    assert customer.customer_phone == "201022322634"
+    assert customer.customer_phones == ("201022322634",)
     assert customer.created == date(2026, 9, 24)
     assert customer.type == "3"
 
@@ -138,9 +138,9 @@ def test_an_individual_row_joins_first_and_last_name(mapper):
     customer = mapper.to_customer(REAL_INDIVIDUAL_ROW)
     assert customer.customer_name == "خالد الغرباو"
     # Empty-string phone must become None, not "" — "" would read as "has a phone"
-    # to the poller's `not doc.customer_phone` check only by luck, and would be
+    # to the poller's `not doc.customer_phones` check only by luck, and would be
     # normalized into a bogus recipient by anything that treated it as truthy.
-    assert customer.customer_phone is None
+    assert customer.customer_phones == ()
 
 
 def test_a_row_with_no_name_falls_back_to_a_neutral_greeting_name(mapper):
@@ -151,24 +151,57 @@ def test_a_row_with_no_name_falls_back_to_a_neutral_greeting_name(mapper):
 
 def test_a_local_phone_is_prefixed_with_the_country_code(mapper):
     row = {"Client": {"id": "1", "phone1": "01027693262"}}
-    assert mapper.to_customer(row).customer_phone == "201027693262"
+    assert mapper.to_customer(row).customer_phones == ("201027693262",)
 
 
 def test_an_already_e164_phone_is_left_alone(mapper):
     row = {"Client": {"id": "1", "phone1": "+201022322634"}}
-    assert mapper.to_customer(row).customer_phone == "201022322634"
+    assert mapper.to_customer(row).customer_phones == ("201022322634",)
 
 
 def test_a_missing_phone_becomes_none(mapper):
     row = {"Client": {"id": "1", "phone1": None, "phone2": ""}}
-    assert mapper.to_customer(row).customer_phone is None
+    assert mapper.to_customer(row).customer_phones == ()
 
 
-def test_phone2_is_preferred_over_phone1(mapper):
-    """Deliberate, and inherited from the invoice mapper's policy: on live rows
-    ``phone2`` is sometimes where the reachable number actually is."""
+def test_phone2_comes_first_and_phone1_is_also_a_recipient(mapper):
+    """``phone2`` still leads, and ``phone1`` is now reached as well.
+
+    The old contract was "first non-empty wins", because a document had exactly
+    one recipient. Both fields being collected means the ordering is no longer a
+    choice between the two — it only decides which one is *primary* — and both
+    numbers now receive the message. The order is kept anyway: it is what the
+    report and the summary show first, and on live rows ``phone2`` is sometimes
+    where the reachable number actually is.
+    """
     row = {"Client": {"id": "1", "phone1": "+201022322634", "phone2": "+201027693262"}}
-    assert mapper.to_customer(row).customer_phone == "201027693262"
+    assert mapper.to_customer(row).customer_phones == ("201027693262", "201022322634")
+
+
+def test_the_same_number_in_both_fields_is_one_recipient(mapper):
+    """Two fields holding one number must not become two messages.
+
+    Normalization is what makes this decidable: ``01027693262`` and
+    ``+201027693262`` are the same subscriber written two ways, and that is the
+    common shape of a record someone filled in by hand.
+    """
+    row = {"Client": {"id": "1", "phone1": "01027693262", "phone2": "+201027693262"}}
+    assert mapper.to_customer(row).customer_phones == ("201027693262",)
+
+
+def test_an_unusable_number_is_dropped_and_the_usable_one_still_goes_out(mapper, caplog):
+    """One bad field must not cost the customer the message entirely.
+
+    Filling both fields but mistyping one is the case this protects: the old
+    mapper would have taken the bad value, failed to normalize it, and dropped
+    the invoice. Now the good number still goes out and the operator is told
+    which field was ignored.
+    """
+    row = {"Client": {"id": "1", "phone1": "12345", "phone2": "+201027693262"}}
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        phones = mapper.to_customer(row).customer_phones
+    assert phones == ("201027693262",)
+    assert "phone1" in caplog.text
 
 
 def test_a_blank_client_number_falls_back_to_the_id(mapper):

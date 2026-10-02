@@ -107,14 +107,14 @@ def test_the_payer_is_absent_until_the_linked_invoice_is_read(mapper: DaftraPaym
     """The single most important fact about this source: the payment row names
     nobody, so an unresolved payment has no reachable customer."""
     payment = mapper.to_payment(REAL_PAYMENT_ROW)
-    assert payment.customer_phone is None
+    assert payment.customer_phones == ()
     assert payment.invoice_id == "39"
 
 
 def test_the_linked_invoice_supplies_the_payer(mapper: DaftraPaymentMapper):
     payment = mapper.to_payment(REAL_PAYMENT_ROW, REAL_INVOICE)
     assert payment.customer_name == "أ/ علي تويج"
-    assert payment.customer_phone == "201022322634"
+    assert payment.customer_phones == ("201022322634",)
 
 
 def test_a_payment_without_an_invoice_is_still_a_valid_payment(mapper: DaftraPaymentMapper):
@@ -122,7 +122,7 @@ def test_a_payment_without_an_invoice_is_still_a_valid_payment(mapper: DaftraPay
     payment = mapper.to_payment(row)
     assert payment.id == "7"
     assert payment.invoice_id is None
-    assert payment.customer_phone is None
+    assert payment.customer_phones == ()
 
 
 def test_the_code_falls_back_to_the_id_when_absent(mapper: DaftraPaymentMapper):
@@ -214,7 +214,7 @@ def test_the_client_resolves_the_payer_with_two_requests():
         api_key="k", session=session, country_code="20", payments_status="1"
     )
     payment = client.get_payment("116")
-    assert payment.customer_phone == "201022322634"
+    assert payment.customer_phones == ("201022322634",)
     assert [url.split("/api2/")[-1] for url in session.urls] == [
         "invoice_payments/116.json",
         "invoices/39.json",

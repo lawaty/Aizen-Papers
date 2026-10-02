@@ -81,7 +81,111 @@ def mapper() -> DaftraInvoiceMapper:
 
 def test_nested_client_supplies_the_phone(mapper):
     invoice = mapper.to_invoice(REAL_INVOICE_RESPONSE)
-    assert invoice.customer_phone == "201022322634"
+    assert invoice.customer_phones == ("201022322634",)
+
+
+def _detail_response(client_overrides: dict) -> dict:
+    """REAL_INVOICE_RESPONSE with its ``Client`` adjusted.
+
+    Built on the captured detail payload rather than written from scratch, so
+    these tests keep the real envelope, nesting and field names — the parts that
+    decide whether ``phone2`` is read at all.
+    """
+    import copy
+
+    payload = copy.deepcopy(REAL_INVOICE_RESPONSE)
+    payload["data"]["Invoice"]["Client"].update(client_overrides)
+    return payload
+
+
+def test_the_detail_endpoint_parses_both_phone_fields_as_two_recipients(mapper):
+    """The second phone on ``GET /invoices/{id}.json`` is a real recipient.
+
+    This is the test that makes ``phone2`` load-bearing. The captured payload
+    happens to carry the same number in both fields, so an implementation that
+    read only ``phone1`` would still satisfy
+    ``test_nested_client_supplies_the_phone`` — the gap this closes. Mutating the
+    mapper to ignore ``phone2`` must fail here.
+    """
+    invoice = mapper.to_invoice(_detail_response({"phone2": "+201155566677"}))
+
+    assert invoice.customer_phones == ("201155566677", "201022322634")
+    # phone2 leads: it is the field the ERP's own ordering prefers, and it decides
+    # which number the report lists first.
+    assert invoice.customer_phones[0] == "201155566677"
+
+
+def test_the_detail_endpoint_reads_the_second_phone_when_the_first_is_empty(mapper):
+    """Order of *reading* must not become order of *accepting*.
+
+    A customer who filled only ``phone2`` is the whole reason the field is
+    collected: an implementation that stopped at the first field present, or
+    preferred ``phone1``, would leave this customer unreachable.
+    """
+    invoice = mapper.to_invoice(_detail_response({"phone1": "", "phone2": "+201155566677"}))
+
+    assert invoice.customer_phones == ("201155566677",)
+
+
+def test_the_detail_endpoint_reads_the_first_phone_when_the_second_is_empty(mapper):
+    invoice = mapper.to_invoice(_detail_response({"phone1": "+201022322634", "phone2": ""}))
+
+    assert invoice.customer_phones == ("201022322634",)
+
+
+def test_the_real_capture_collapses_to_one_recipient_because_both_fields_agree(mapper):
+    """What the live account actually returns today: ``phone1 == phone2``.
+
+    Two fields holding one number must be one recipient, or every existing
+    customer would receive each invoice twice.
+    """
+    invoice = mapper.to_invoice(REAL_INVOICE_RESPONSE)
+
+    assert invoice.customer_phones == ("201022322634",)
+
+
+def test_two_written_forms_of_one_number_collapse_on_the_detail_endpoint(mapper):
+    """Deduplication happens after normalization, which is the only way to tell
+    two entries for the same subscriber apart."""
+    invoice = mapper.to_invoice(_detail_response({"phone1": "01027693262", "phone2": "+201027693262"}))
+
+    assert invoice.customer_phones == ("201027693262",)
+
+
+def test_an_unusable_second_phone_is_dropped_and_the_first_still_goes_out(mapper, caplog):
+    """One mistyped field must not cost the customer the invoice.
+
+    Filling both fields and mistyping one is exactly the case this protects; the
+    warning names the field so an operator can fix the record.
+    """
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        invoice = mapper.to_invoice(_detail_response({"phone2": "12345"}))
+
+    assert invoice.customer_phones == ("201022322634",)
+    assert "phone2" in caplog.text
+
+
+def test_the_flattened_client_phone_fields_are_both_read_too(mapper):
+    """Some payloads flatten the client onto the invoice.
+
+    The flattened spelling is a *fallback source* of the same fields, so it has
+    to yield the same two recipients — otherwise the fan-out silently depends on
+    which endpoint answered.
+    """
+    invoice = mapper.to_invoice(
+        {
+            "Invoice": {
+                "id": "1",
+                "no": "000001",
+                "client_business_name": "Acme",
+                "client_phone1": "01027693262",
+                "client_phone2": "01115556677",
+                "InvoiceItem": [],
+            }
+        }
+    )
+
+    assert invoice.customer_phones == ("201115556677", "201027693262")
 
 
 def test_nested_invoice_items_are_not_dropped(mapper):
@@ -117,7 +221,7 @@ def test_flat_payload_shape_is_still_accepted(mapper):
         }
     )
     assert invoice.customer_name == "Acme"
-    assert invoice.customer_phone == "201027693262"
+    assert invoice.customer_phones == ("201027693262",)
     assert [item.name for item in invoice.items] == ["Paper"]
 
 
@@ -135,7 +239,7 @@ def test_nested_client_wins_over_a_flat_duplicate(mapper):
         }
     )
     assert invoice.customer_name == "Nested"
-    assert invoice.customer_phone == "201027693262"
+    assert invoice.customer_phones == ("201027693262",)
     assert invoice.items == ()
 
 
@@ -154,7 +258,7 @@ def test_list_rows_map_each_nested_invoice(mapper):
         {"result": "successful", "data": [REAL_INVOICE_RESPONSE["data"], {"Invoice": {"id": "2", "no": "000002"}}]}
     )
     assert [invoice.id for invoice in invoices] == ["1", "2"]
-    assert invoices[0].customer_phone == "201022322634"
+    assert invoices[0].customer_phones == ("201022322634",)
     assert len(invoices[0].items) == 1
 
 
@@ -184,7 +288,7 @@ def test_offline_stub_payload_matches_the_real_shape(mapper):
 
     invoice = mapper.to_invoice(raw)
     assert invoice.customer_name == "Ahmed Hassan"
-    assert invoice.customer_phone == "201027693262"
+    assert invoice.customer_phones == ("201027693262",)
     assert [item.name for item in invoice.items] == ["A4 Paper Ream 80gsm"]
     assert invoice.items[0].total == Decimal("1500.00")
 

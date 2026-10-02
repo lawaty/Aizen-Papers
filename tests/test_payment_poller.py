@@ -288,7 +288,7 @@ def test_a_deleted_linked_invoice_abandons_the_payment():
 def test_a_payment_without_a_phone_is_skipped_and_marked_seen(caplog):
     state = InMemoryPollStateStore()
     poller = _poller(
-        [_app(payments=[make_stub_payment(customer_phone=None, number="000009")])],
+        [_app(payments=[make_stub_payment(customer_phones=(), number="000009")])],
         sender=CapturingSender(),
         state=state,
         send_existing=True,

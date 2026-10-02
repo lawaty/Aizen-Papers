@@ -16,7 +16,9 @@ What is pinned here, all against the current behaviour:
 - **Listing order is load-bearing and unprotected.** The live Daftra list is
   newest-first (read-only observation), which is the only order in which this
   design works at all; an oldest-first listing would make new invoices
-  invisible.
+  invisible. The customers pipeline is audited separately in
+  ``test_audit_polling_customers.py``, where this property is *live* rather than
+  historical: ``/clients.json`` does not order by creation on its own.
 - **The 0-byte ``<state>.lock`` file is an flock anchor, not a stale lock.**
 
 Fully offline and deterministic: fake source, fake sender, fake clock, real
@@ -124,7 +126,7 @@ def _sent_numbers(sender) -> list[str]:
 
 def _invoices(count: int, start: int = 1):
     return [
-        make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phone=PHONE)
+        make_stub_invoice(id=str(i), number=f"INV-{i:03d}", customer_phones=(PHONE,))
         for i in range(start, start + count)
     ]
 
@@ -173,7 +175,7 @@ def test_first_run_seeding_uses_a_single_snapshot__invoice_created_after_seeding
     assert first["sent"] == 0
     assert run1_sender.payloads == []
 
-    source.add_new_invoice(customer_phone=PHONE)  # C (id 3), created after the snapshot
+    source.add_new_invoice(customer_phones=(PHONE,))  # C (id 3), created after the snapshot
     run2_sender = CapturingSender()
     second = _run(path, source, run2_sender, send_existing=True)["apps"][0]
 
@@ -205,8 +207,8 @@ def test_invoice_created_during_the_send_phase_is_not_swallowed(tmp_path):
     run1_sender = CapturingSender()
     assert _run(path, source, run1_sender)["apps"][0]["seeded"] == 2
 
-    source.add_new_invoice(customer_phone=PHONE)  # D (id 3)
-    e = make_stub_invoice(id="4", number="INV-004", customer_phone=PHONE)
+    source.add_new_invoice(customer_phones=(PHONE,))  # D (id 3)
+    e = make_stub_invoice(id="4", number="INV-004", customer_phones=(PHONE,))
     run2_sender = SourceMutatingSender(source, trigger_number="INV-003", new_invoice=e)
 
     second = _run(path, source, run2_sender, send_existing=True)["apps"][0]
@@ -250,7 +252,7 @@ def test_crash_after_send_before_state_write_resends_on_next_run__duplicate_send
     run1_sender = CapturingSender()
     assert _run(path, source, run1_sender)["apps"][0]["seeded"] == 2
 
-    source.add_new_invoice(customer_phone=PHONE)  # D (id 3)
+    source.add_new_invoice(customer_phones=(PHONE,))  # D (id 3)
     run2_sender = CapturingSender()
     summary = _run(path, source, run2_sender, store_cls=ExplodingSaveStore, send_existing=True)
     app2 = summary["apps"][0]
@@ -365,7 +367,7 @@ def test_oldest_first_listing_silently_misses_new_invoices__ordering_assumption_
     seeded = JsonPollStateStore(str(path)).seen_ids("app1")
     assert sorted(int(i) for i in seeded) == list(range(1, 51))  # the 50 OLDEST
 
-    new = make_stub_invoice(id="N", number="INV-NEW", customer_phone=PHONE)
+    new = make_stub_invoice(id="N", number="INV-NEW", customer_phones=(PHONE,))
     source.add(new)  # appended last, i.e. newest -> last row of the listing
     pages_before = source.pages_served
     run2_sender = CapturingSender()
