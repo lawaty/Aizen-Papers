@@ -590,6 +590,11 @@ def _build_parser() -> argparse.ArgumentParser:
     poll_status.add_argument("--payments", action="store_true", help="Inspect the payments poll state instead of the invoice one")
     poll_status.add_argument("--customer-stub", action="store_true", help="Inspect the offline stub customer poll state instead of the real one")
     poll_status.add_argument("--customers", action="store_true", help="Inspect the customers poll state instead of the invoice one")
+    poll_status.add_argument(
+        "--all",
+        action="store_true",
+        help="Report all three pipelines (invoices, payments, customers) in one run",
+    )
 
     poll_reset = sub.add_parser("poll-reset", help="Reset poll state for an app (requires --yes)")
     poll_reset.add_argument("--app", required=True, help="App name to reset")
@@ -1157,6 +1162,19 @@ def _selected_pipeline(args: argparse.Namespace) -> str:
     return "invoice"
 
 
+def _state_path_for(settings: Settings, pipeline: str, stub: bool) -> str:
+    """The state file one named pipeline reads.
+
+    Each entry is (stub state path, real state path), so the stub flag picks
+    index 0 and the default picks index 1.
+    """
+    return {
+        "invoice": (settings.poll_stub_state_path, settings.poll_state_path),
+        "payment": (settings.payments_stub_state_path, settings.payments_state_path),
+        "customer": (settings.customers_stub_state_path, settings.customers_state_path),
+    }[pipeline][0 if stub else 1]
+
+
 def _poll_state_path(settings: Settings, args: argparse.Namespace) -> str:
     """Which state file a ``poll-status`` / ``poll-reset`` invocation is about.
 
@@ -1167,24 +1185,16 @@ def _poll_state_path(settings: Settings, args: argparse.Namespace) -> str:
     :func:`_selected_pipeline`.
     """
     pipeline = _selected_pipeline(args)
-    stub = bool(getattr(args, f"{pipeline}_stub", False))
-    # Each entry is (stub state path, real state path), so the stub flag picks
-    # index 0 and the default picks index 1.
-    return {
-        "invoice": (settings.poll_stub_state_path, settings.poll_state_path),
-        "payment": (settings.payments_stub_state_path, settings.payments_state_path),
-        "customer": (settings.customers_stub_state_path, settings.customers_state_path),
-    }[pipeline][0 if stub else 1]
+    return _state_path_for(settings, pipeline, bool(getattr(args, f"{pipeline}_stub", False)))
 
 
-def _run_poll_status(args: argparse.Namespace, settings: Settings) -> int:
-    path = _poll_state_path(settings, args)
-    noun = _selected_pipeline(args)
+def _print_pipeline_status(path: str, noun: str, settings: Settings) -> None:
+    """Print one pipeline's poll state. Shared by the single and ``--all`` forms."""
     state = JsonPollStateStore(path, max_seen=settings.poll_max_seen)
     names = state.app_names()
     if not names:
         print(f"no poll state recorded yet at {path}")
-        return 0
+        return
     for name in names:
         seen = state.seen_ids(name)
         pending = state.pending(name)
@@ -1220,6 +1230,35 @@ def _run_poll_status(args: argparse.Namespace, settings: Settings) -> int:
             for sid, reached in sorted(partial.items()):
                 print(f"    {noun} {sid}: already reached {', '.join(reached)}")
         print(f"  last_poll_at: {_format_timestamp(last)}")
+
+
+def _run_poll_status(args: argparse.Namespace, settings: Settings) -> int:
+    if getattr(args, "all", False):
+        # All three run every few minutes against three separate files, so
+        # reporting only one of them by default makes an idle pipeline
+        # indistinguishable from a dead one. --all answers the question an
+        # operator actually has: is every pipeline still cycling?
+        conflicting = [
+            flag
+            for flag in ("payments", "customers", "invoice_stub", "payment_stub", "customer_stub")
+            if getattr(args, flag, False)
+        ]
+        if conflicting:
+            raise RuntimeError(
+                "--all reports every pipeline and cannot be combined with "
+                + ", ".join("--" + c.replace("_", "-") for c in conflicting)
+            )
+        for pipeline, label in (
+            ("invoice", "invoices"),
+            ("payment", "payments"),
+            ("customer", "customers"),
+        ):
+            print(f"--- {label} ({_state_path_for(settings, pipeline, False)}) ---")
+            _print_pipeline_status(_state_path_for(settings, pipeline, False), pipeline, settings)
+        return 0
+    _print_pipeline_status(
+        _poll_state_path(settings, args), _selected_pipeline(args), settings
+    )
     return 0
 
 

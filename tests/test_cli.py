@@ -712,3 +712,115 @@ def test_poll_status_is_quiet_when_nothing_is_partly_delivered(tmp_path, capsys)
     settings = _settings(poll_stub_state_path=str(state_path))
     assert cli_module._run_poll_status(args, settings) == 0
     assert "partly delivered" not in capsys.readouterr().out
+
+
+class TestPollStatusAll:
+    """``--all`` answers "is every pipeline still cycling?" in one run.
+
+    Bare ``poll-status`` reports invoices only. All three pipelines run every
+    few minutes against three separate state files, so reporting one of them
+    makes an idle pipeline indistinguishable from a dead one.
+    """
+
+    def test_all_three_pipelines_are_reported(self, tmp_path, capsys):
+        from sender.infrastructure.state import JsonPollStateStore
+        from sender.presentation import cli as cli_module
+
+        invoice_state = tmp_path / "invoice.json"
+        payment_state = tmp_path / "payments.json"
+        customer_state = tmp_path / "customers.json"
+        JsonPollStateStore(str(invoice_state)).mark_seen("app1", "2")
+        JsonPollStateStore(str(payment_state)).mark_seen("app1", "116")
+        JsonPollStateStore(str(customer_state)).mark_seen("app1", "7")
+
+        settings = _settings(
+            poll_state_path=str(invoice_state),
+            payments_state_path=str(payment_state),
+            **{
+                "customers_state_path": str(customer_state),
+            },
+        )
+        args = cli_parser().parse_args(["poll-status", "--all"])
+        assert cli_module._run_poll_status(args, settings) == 0
+
+        out = capsys.readouterr().out
+        assert "seen: 1 invoice(s)" in out
+        assert "seen: 1 payment(s)" in out
+        assert "seen: 1 customer(s)" in out
+        for label in ("--- invoices", "--- payments", "--- customers"):
+            assert label in out
+
+    def test_each_heading_names_the_file_it_read(self, tmp_path, capsys):
+        from sender.infrastructure.state import JsonPollStateStore
+        from sender.presentation import cli as cli_module
+
+        invoice_state = tmp_path / "invoice.json"
+        JsonPollStateStore(str(invoice_state)).mark_seen("app1", "2")
+        args = cli_parser().parse_args(["poll-status", "--all"])
+        cli_module._run_poll_status(
+            args, _settings(poll_state_path=str(invoice_state))
+        )
+        out = capsys.readouterr().out
+        assert str(invoice_state) in out
+
+    def test_a_pipeline_with_no_state_says_so_rather_than_going_missing(
+        self, tmp_path, capsys
+    ):
+        from sender.infrastructure.state import JsonPollStateStore
+        from sender.presentation import cli as cli_module
+
+        invoice_state = tmp_path / "invoice.json"
+        JsonPollStateStore(str(invoice_state)).mark_seen("app1", "2")
+        args = cli_parser().parse_args(["poll-status", "--all"])
+        cli_module._run_poll_status(
+            args,
+            _settings(
+                poll_state_path=str(invoice_state),
+                payments_state_path=str(tmp_path / "absent-payments.json"),
+            ),
+        )
+        out = capsys.readouterr().out
+        assert "--- payments" in out
+        assert "no poll state recorded yet" in out
+
+    def test_partly_delivered_is_surfaced_under_all(self, tmp_path, capsys):
+        from sender.infrastructure.state import JsonPollStateStore
+        from sender.presentation import cli as cli_module
+
+        invoice_state = tmp_path / "invoice.json"
+        store = JsonPollStateStore(str(invoice_state))
+        store.mark_seen("app1", "2")
+        store.record_delivered("app1", "2", ["201022322634"])
+
+        args = cli_parser().parse_args(["poll-status", "--all"])
+        cli_module._run_poll_status(
+            args, _settings(poll_state_path=str(invoice_state))
+        )
+        out = capsys.readouterr().out
+        assert "partly delivered" in out
+        assert "already reached 201022322634" in out
+
+    def test_combining_all_with_a_pipeline_flag_is_refused(self):
+        import pytest
+
+        from sender.presentation import cli as cli_module
+
+        for flag in ("--payments", "--customers", "--invoice-stub"):
+            args = cli_parser().parse_args(["poll-status", "--all", flag])
+            with pytest.raises(RuntimeError, match="--all reports every pipeline"):
+                cli_module._run_poll_status(args, _settings())
+
+    def test_single_pipeline_flags_still_work_unchanged(self, tmp_path, capsys):
+        from sender.infrastructure.state import JsonPollStateStore
+        from sender.presentation import cli as cli_module
+
+        payment_state = tmp_path / "payments.json"
+        JsonPollStateStore(str(payment_state)).mark_seen("app1", "116")
+        args = cli_parser().parse_args(["poll-status", "--payments"])
+        cli_module._run_poll_status(
+            args, _settings(payments_state_path=str(payment_state))
+        )
+        out = capsys.readouterr().out
+        assert "seen: 1 payment(s)" in out
+        assert "invoice(s)" not in out
+        assert "customer(s)" not in out
