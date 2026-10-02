@@ -121,11 +121,6 @@ def _env_int(source: Mapping[str, str], key: str, default: int) -> int:
 
 _BUILDER_MODES = ("auto", "legacy", "new")
 
-#: Daftra's ``InvoicePayment.status`` values. Used only to reject a typo in
-#: ``POLL_PAYMENTS_STATUS`` early; the default (completed) is the only one the
-#: payments pipeline is expected to run with.
-PAYMENT_STATUSES = ("0", "1", "2", "3", "4", "5")
-
 #: The spellings accepted for an on/off environment flag, the same ones the
 #: live-test opt-in uses. Misreading a flag that changes what reaches a customer
 #: is the one direction not worth guessing in.
@@ -159,34 +154,6 @@ def _env_builder(source: Mapping[str, str]) -> str:
             f"Invalid WHATSAPP_TEMPLATE_BUILDER: {mode!r}; expected one of {', '.join(_BUILDER_MODES)}"
         )
     return mode
-
-
-def _env_payment_status(source: Mapping[str, str], key: str, default: str) -> str | None:
-    """Read the server-side payment-status filter, or ``None`` for no filter.
-
-    Three distinct cases, and conflating any two of them is how a payments
-    pipeline goes quiet:
-
-    - **the variable is absent** → *default* (completed), the safe narrowing;
-    - **the variable is present but blank** → ``None``, a real mode meaning
-      "announce every payment row". Blank is an instruction, not an absence;
-    - **the variable holds anything else** → it must be one of Daftra's status
-      values, or the run raises. A typo like ``completed`` would otherwise
-      narrow the listing server-side to a status that does not exist, and the
-      pipeline would find nothing and say nothing about it.
-    """
-    if key not in source:
-        return default
-    raw = (source.get(key) or "").strip()
-    if not raw:
-        return None
-    if raw not in PAYMENT_STATUSES:
-        raise RuntimeError(
-            f"Invalid {key}: {raw!r}; expected one of {', '.join(PAYMENT_STATUSES)} "
-            "(Daftra's payment statuses: 0 not completed, 1 completed, 2 pending, "
-            "3 failed, 4 overpaid, 5 draft), or blank for no filter"
-        )
-    return raw
 
 
 @dataclass(frozen=True)
@@ -242,76 +209,6 @@ class Settings:
     poll_max_pages: int = 5
     stub_invoices_path: str = "stub_invoices.json"
     poll_stub_state_path: str = "poll_state.stub.json"
-
-    # -- payments pipeline --------------------------------------------------
-    #
-    # A parallel pipeline with its own template, state file, lock and send cap.
-    # Deliberately separate from the invoice knobs above: the two pipelines must
-    # never be able to starve each other, and payment ids collide with invoice
-    # ids in both tenants' number spaces, so a shared state file would have one
-    # pipeline silently retiring the other's records. See docs/design.md § 11.
-
-    #: The Meta template that carries payment confirmations. Separate from
-    #: ``wa_template_name`` because it is a different approved template, in a
-    #: different language, with a different body.
-    wa_payment_template_name: str = "aizen_new_payment"
-    #: ``ar_EG`` — the only language the payment template is approved in. Asking
-    #: for anything else is a 132001 at send time.
-    wa_payment_template_lang: str = "ar_EG"
-    #: Where payments are marked handled. Gitignored and machine-specific for the
-    #: same reason ``poll_state_path`` is: uploading one marks real payments as
-    #: already announced.
-    payments_state_path: str = "poll_payments_state.json"
-    payments_stub_state_path: str = "poll_payments_state.stub.json"
-    stub_payments_path: str = "stub_payments.json"
-    #: Page size for the payment listing. Payments arrive in bursts of a different
-    #: shape to invoices, so it gets its own knob rather than sharing ``POLL_LIMIT``.
-    payments_limit: int = 10
-    #: Which payment statuses to announce. ``"1"`` (completed) by default,
-    #: because the template tells the customer their balance was updated and only
-    #: a completed payment does that. ``None`` = no filter.
-    payments_status_filter: str | None = "1"
-    #: Hard ceiling on send attempts per payment poll cycle. A third cap, separate
-    #: from the invoice one, so a payment backlog can never eat the invoice
-    #: pipeline's budget. 0 disables.
-    poll_payments_max_sends_per_run: int = 10
-
-    # -- customers pipeline -------------------------------------------------
-    #
-    # The third pipeline, with the same separation rationale as payments (see
-    # docs/design.md § 12): its own template, state file, lock and send cap, so a
-    # welcome backlog can never consume the invoice or payment budgets. Client ids
-    # collide with invoice and payment ids in the same account's number space, so
-    # a shared state file would let one pipeline silently retire another's
-    # records.
-
-    #: The Meta template that carries new-customer welcomes.
-    wa_customer_template_name: str = "aizen_new_customer"
-    #: ``ar_EG`` — the only language the welcome template is approved in. Anything
-    #: else is a 132001 at send time, so it is pinned by a test.
-    wa_customer_template_lang: str = "ar_EG"
-    customers_state_path: str = "poll_customers_state.json"
-    customers_stub_state_path: str = "poll_customers_state.stub.json"
-    stub_customers_path: str = "stub_customers.json"
-    #: Page size for the client listing. Daftra's client endpoint answers an
-    #: arbitrary order unless told otherwise, and the poller needs newest-first
-    #: to walk pages safely — see ``DaftraClient.list_customers``.
-    customers_limit: int = 10
-    #: Hard ceiling on send attempts per customer poll cycle, separate again so
-    #: none of the three pipelines can starve the others. 0 disables.
-    poll_customers_max_sends_per_run: int = 10
-    #: Whether a rejected welcome falls back to a free-form message. **Off by
-    #: default**, and this is the one place the customers pipeline deliberately
-    #: differs from the other two.
-    #:
-    #: A welcome goes to a brand-new number, which is by definition outside
-    #: WhatsApp's 24-hour customer-service window — and that window is the only
-    #: place free-form text is deliverable. So with fallback on, every template
-    #: error would burn a doomed extra request and log a confusing second error.
-    #: With it off, the engine's existing behaviour applies: the customer stays
-    #: **pending** on the template error and flows on once the template is fixed.
-    #: It also keeps marketing text off a channel with no opt-in evidence.
-    wa_customer_freeform_fallback: bool = False
 
     #: Hard ceiling on send attempts per poll cycle, across all apps. This is
     #: deliberately separate from ``poll_limit`` (a listing page size): paging
@@ -416,47 +313,6 @@ class Settings:
             poll_max_pages=_env_int(source, "POLL_MAX_PAGES", 5),
             stub_invoices_path=(source.get("STUB_INVOICES_PATH") or "stub_invoices.json").strip(),
             poll_stub_state_path=(source.get("POLL_STUB_STATE_PATH") or "poll_state.stub.json").strip(),
-            wa_payment_template_name=(
-                source.get("WHATSAPP_PAYMENT_TEMPLATE_NAME") or "aizen_new_payment"
-            ).strip(),
-            wa_payment_template_lang=(
-                source.get("WHATSAPP_PAYMENT_TEMPLATE_LANG") or "ar_EG"
-            ).strip(),
-            payments_state_path=(
-                source.get("POLL_PAYMENTS_STATE_PATH") or "poll_payments_state.json"
-            ).strip(),
-            payments_stub_state_path=(
-                source.get("POLL_PAYMENTS_STUB_STATE_PATH") or "poll_payments_state.stub.json"
-            ).strip(),
-            stub_payments_path=(source.get("STUB_PAYMENTS_PATH") or "stub_payments.json").strip(),
-            payments_limit=_env_int(source, "POLL_PAYMENTS_LIMIT", 10),
-            payments_status_filter=_env_payment_status(
-                source, "POLL_PAYMENTS_STATUS", "1"
-            ),
-            poll_payments_max_sends_per_run=_env_int(
-                source, "POLL_PAYMENTS_MAX_SENDS_PER_RUN", 10
-            ),
-            wa_customer_template_name=(
-                source.get("WHATSAPP_CUSTOMER_TEMPLATE_NAME") or "aizen_new_customer"
-            ).strip(),
-            wa_customer_template_lang=(
-                source.get("WHATSAPP_CUSTOMER_TEMPLATE_LANG") or "ar_EG"
-            ).strip(),
-            customers_state_path=(
-                source.get("POLL_CUSTOMERS_STATE_PATH") or "poll_customers_state.json"
-            ).strip(),
-            customers_stub_state_path=(
-                source.get("POLL_CUSTOMERS_STUB_STATE_PATH") or "poll_customers_state.stub.json"
-            ).strip(),
-            stub_customers_path=(source.get("STUB_CUSTOMERS_PATH") or "stub_customers.json").strip(),
-            customers_limit=_env_int(source, "POLL_CUSTOMERS_LIMIT", 10),
-            poll_customers_max_sends_per_run=_env_int(
-                source, "POLL_CUSTOMERS_MAX_SENDS_PER_RUN", 10
-            ),
-            # Default False, unlike wa_freeform_fallback: see the field comment.
-            wa_customer_freeform_fallback=_env_flag(
-                source, "WHATSAPP_CUSTOMER_FREEFORM_FALLBACK", False
-            ),
             poll_max_sends_per_run=_env_int(source, "POLL_MAX_SENDS_PER_RUN", 10),
             report_enabled=_env_flag(source, "REPORT_ENABLED", True),
             report_dir=(source.get("REPORT_DIR") or "reports").strip(),

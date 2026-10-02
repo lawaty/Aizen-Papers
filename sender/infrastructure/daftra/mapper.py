@@ -5,7 +5,7 @@ import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-from sender.domain.models import Customer, Invoice, InvoiceItem, Payment
+from sender.domain.models import Invoice, InvoiceItem
 from sender.domain.phones import normalize_phone
 
 log = logging.getLogger(__name__)
@@ -70,32 +70,16 @@ def _raise_money(value, cause: Exception | None = None) -> Decimal:
 def _row_label(row: dict) -> str:
     """A human-readable identity for an unnormalizable listing row.
 
-    Daftra nests the record inside the row (or the row *is* the record in the
-    flat shape), and the wrapper key says which kind it is — ``Invoice`` or
-    ``InvoicePayment``. The kind is named in the label so an operator reading a
-    warning knows which pipeline dropped the row and which state file it will be
-    re-attempted against. Falls back to a generic label so the warning is never
+    Daftra nests the Invoice object inside the row (or the row *is* the invoice
+    in the flat shape), so the number/id is pulled from whichever shape the row
+    actually carries. Falls back to a generic label so the warning is never
     empty.
     """
-    node = None
-    kind = None
-    for key, kind in (("Invoice", "invoice"), ("InvoicePayment", "payment"), ("Client", "customer")):
-        if isinstance(row.get(key), dict):
-            node = row[key]
-            break
-    if node is None:
-        node = row
-    # Payments are identified by their reference code, which is what an operator
-    # sees on the receipt; everything else falls back to a number then the id.
-    for field in ("no", "code", "id"):
-        ident = node.get(field) if isinstance(node, dict) else None
-        if ident:
-            return f"{kind or 'record'} {ident}"
-    if not kind:
-        return "an unidentifiable record"
-    # Both kinds start with a vowel, but this must not depend on that staying true.
-    article = "an" if kind[0] in "aeiou" else "a"
-    return f"{article} {kind}"
+    node = row.get("Invoice") if isinstance(row.get("Invoice"), dict) else row
+    ident = node.get("no") if isinstance(node, dict) else None
+    if not ident:
+        ident = node.get("id") if isinstance(node, dict) else None
+    return f"invoice {ident}" if ident else "an invoice"
 
 
 class DaftraInvoiceMapper:
@@ -348,206 +332,3 @@ class DaftraInvoiceMapper:
             return normalize_phone(value, self._country_code)
         except ValueError:
             return None
-
-
-class DaftraPaymentMapper(DaftraInvoiceMapper):
-    """Translate ``/invoice_payments`` rows into :class:`Payment`.
-
-    A subclass rather than a sibling so it reuses the parts of the invoice
-    mapping that are genuinely the same rules and not invoice-specific: parsing a
-    money string that may arrive localized or with a tax split, parsing Daftra's
-    several date spellings, picking the client name out of an ``Invoice`` node
-    with ``Client`` nested inside it, and normalizing a phone with the
-    deployment's country code. Duplicating any of those would be a second place
-    to get a customer's amount or number wrong.
-    """
-
-    def to_payment(self, raw: dict, invoice_raw: dict | None = None) -> Payment:
-        """Normalize one payment.
-
-        *invoice_raw* is the **linked invoice's** raw payload, when the caller has
-        one. It is not decoration: a payment record carries no payer — ``client_id``
-        is usually null and the contact fields are empty — so the invoice it settles
-        is the only place the customer exists. Without it the payment comes back
-        with no name and no phone and the poller skips it, which is the correct
-        outcome for a payment nobody can be reached about.
-        """
-        node = self._payment_node(raw)
-        if not isinstance(node, dict):
-            raise ValueError(f"Unexpected Daftra payment payload shape: {type(raw).__name__}")
-        if not node.get("id"):
-            raise ValueError(f"Malformed Daftra response: missing payment data in {list(node)[:6]}")
-        invoice = self._invoice_node(invoice_raw)
-        client = invoice.get("Client") if isinstance(invoice.get("Client"), dict) else {}
-        return Payment(
-            id=str(node.get("id")),
-            # ``code`` is the receipt reference the customer is quoted — the
-            # "operation number" the template prints. The id is the fallback for
-            # an account whose payments carry no code, so a payment is never sent
-            # with an empty identifier.
-            number=str(self._first(node, ("code",)) or node.get("id")),
-            customer_name=self._customer_name(invoice, client),
-            customer_phone=self._phone(self._customer_phone(invoice, client)),
-            status=str(self._first(node, ("status",), default="Unknown") or "Unknown"),
-            currency=str(self._first(node, CURRENCY_KEYS) or ""),
-            amount=self._money(self._first(node, ("amount",))),
-            payment_date=self._date(self._first(node, ("date", "created"))),
-            invoice_id=self._invoice_id(node),
-            payment_method=str(self._first(node, ("payment_method",), default="") or ""),
-        )
-
-    def to_payments(self, raw: dict) -> list[Payment]:
-        data = raw.get("data") if isinstance(raw, dict) else None
-        rows = data if isinstance(data, list) else []
-        payments: list[Payment] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                payments.append(self.to_payment(row))
-            except ValueError as exc:
-                # One payment that cannot be normalized must not take the whole
-                # tenant's cycle down: skip it so the rest of the listing flows,
-                # and warn with the payment's own identity so the operator can find
-                # it. It is never marked seen, so it is re-attempted on the next
-                # cycle and stays visible until the source data is fixed.
-                log.warning(
-                    "skipping %s, which could not be normalized (%s); it will "
-                    "be re-attempted on the next cycle",
-                    _row_label(row), exc,
-                )
-        return payments
-
-    @staticmethod
-    def _payment_node(raw: dict) -> dict:
-        """Unwrap the ``InvoicePayment`` node from a detail or listing payload.
-
-        Accepts both shapes Daftra uses: ``{"data": {"InvoicePayment": {...}}}``
-        for a single record and ``{"data": [{"InvoicePayment": {...}}]}`` for a
-        page. A payload that is already the flat record is passed through, which
-        is what the offline stub and hand-written test rows use.
-        """
-        if not isinstance(raw, dict):
-            return raw
-        data = raw.get("data")
-        if isinstance(data, dict):
-            candidate = data.get("InvoicePayment")
-            return candidate if isinstance(candidate, dict) else data
-        row = raw.get("InvoicePayment")
-        return row if isinstance(row, dict) else raw
-
-    @staticmethod
-    def _invoice_node(raw: dict | None) -> dict:
-        """Unwrap the ``Invoice`` node from a linked invoice's payload, or ``{}``.
-
-        The same two shapes as :meth:`_payment_node`, and for the same reason: the
-        two-hop fetch in the client may have been answered with either. An absent
-        or unreadable invoice yields ``{}``, which makes ``_customer_name`` fall
-        back to its generic "Customer" and the phone ``None`` — i.e. a payment with
-        no reachable customer, which the poller skips.
-        """
-        if not isinstance(raw, dict):
-            return {}
-        data = raw.get("data")
-        if isinstance(data, dict):
-            candidate = data.get("Invoice")
-            return candidate if isinstance(candidate, dict) else data
-        row = raw.get("Invoice")
-        return row if isinstance(row, dict) else raw
-
-    @staticmethod
-    def _invoice_id(payment_node: dict) -> str | None:
-        """The linked invoice id, or ``None`` when the payment has no invoice.
-
-        Payments that do not settle an invoice exist (``client_credit``,
-        opening-balance rows); Daftra excludes them from this endpoint by default,
-        but a null here must stay a real ``None`` rather than the string ``"None"``,
-        because the client uses it to decide whether the second hop is worth
-        making at all.
-        """
-        value = payment_node.get("invoice_id")
-        if value is None or value == "":
-            return None
-        return str(value)
-
-
-class DaftraCustomerMapper(DaftraInvoiceMapper):
-    """Translate ``/clients.json`` rows into :class:`Customer`.
-
-    A subclass, for the same reason :class:`DaftraPaymentMapper` is one: the name
-    and phone policies are *the same rules* as on the invoice path, so they are
-    reused rather than reimplemented — a third copy of "prefer the business name,
-    else first + last" is a third place to get a customer's name wrong.
-
-    The reuse is exact because the client row **is** the node those rules read:
-    ``_customer_name(node, node)`` looks for ``client_business_name`` on the
-    "invoice" side first, misses (a client row has no such key), and lands on
-    ``business_name``/``first_name``/``last_name`` on the client side. Same for
-    ``_customer_phone``. Nothing about the policy differs per pipeline; only the
-    shape the data arrives in does.
-    """
-
-    def to_customer(self, raw: dict) -> Customer:
-        node = self._customer_node(raw)
-        if not isinstance(node, dict):
-            raise ValueError(f"Unexpected Daftra client payload shape: {type(raw).__name__}")
-        if not node.get("id"):
-            raise ValueError(f"Malformed Daftra response: missing client data in {list(node)[:6]}")
-        return Customer(
-            id=str(node.get("id")),
-            # The client number is what an operator reads in the ERP and what the
-            # poller labels a row with; the id is the fallback so a blank
-            # ``client_number`` never yields an empty identifier.
-            number=str(self._first(node, ("client_number", "code", "no")) or node.get("id")),
-            customer_name=self._customer_name(node, node),
-            customer_phone=self._phone(self._customer_phone(node, node)),
-            created=self._date(self._first(node, ("created",))),
-            email=str(self._first(node, ("email",), default="") or ""),
-            # Carried, never acted on. See Customer.type for why.
-            type=str(self._first(node, ("type",), default="") or ""),
-            suspend=str(self._first(node, ("suspend",), default="") or ""),
-            is_offline=str(self._first(node, ("is_offline",), default="") or ""),
-        )
-
-    def to_customers(self, raw: dict) -> list[Customer]:
-        data = raw.get("data") if isinstance(raw, dict) else None
-        rows = data if isinstance(data, list) else []
-        customers: list[Customer] = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            try:
-                customers.append(self.to_customer(row))
-            except ValueError as exc:
-                # Same contract as the payment listing: one unnormalizable row
-                # must not take the cycle down. It is skipped, warned about by its
-                # own identity, and left unseen so the next cycle retries it.
-                log.warning(
-                    "skipping %s, which could not be normalized (%s); it will "
-                    "be re-attempted on the next cycle",
-                    _row_label(row), exc,
-                )
-        return customers
-
-    @staticmethod
-    def _customer_node(raw: dict) -> dict:
-        """Unwrap the ``Client`` node from a detail or listing payload.
-
-        ``/clients.json`` is the third envelope Daftra uses, and it differs from
-        the other two in a way that matters: each element of ``data`` is wrapped in
-        its own capitalized ``Client`` key — ``{"data": [{"Client": {...}}]}`` —
-        where invoices wrap as ``{"data": [{"Invoice": {...}}]}`` and a *single*
-        record wraps as ``{"data": {"InvoicePayment": {...}}}``.
-
-        All three shapes are accepted, plus a flat record, because the offline
-        stub and hand-written test rows use the flat one and a refactor must not be
-        able to break the mapper by changing a fixture's nesting.
-        """
-        if not isinstance(raw, dict):
-            return raw
-        data = raw.get("data")
-        if isinstance(data, dict):
-            candidate = data.get("Client")
-            return candidate if isinstance(candidate, dict) else data
-        row = raw.get("Client")
-        return row if isinstance(row, dict) else raw

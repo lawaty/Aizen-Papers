@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import time
 from typing import Mapping
 
@@ -11,13 +10,6 @@ from sender.domain.errors import WhatsAppApiError, WhatsAppSelfSendError
 from sender.domain.phones import normalize_phone
 from sender.infrastructure.util import json_or_none
 from sender.infrastructure.whatsapp.errors import to_api_error
-
-log = logging.getLogger(__name__)
-
-#: Stands in for "we asked Meta and could not find out", so a failed lookup is
-#: remembered instead of re-issued on every send. It is not a dialable string, so
-#: it can only ever *disable* the self-send guard and never trip it.
-_OWN_NUMBER_UNKNOWN = "\x00own-number-unknown"
 
 
 class WhatsAppClient:
@@ -83,48 +75,19 @@ class WhatsAppClient:
     def _assert_not_self_send(self, recipient: str) -> None:
         if self._own_number is None:
             self._own_number = self._fetch_own_number()
-        # A sentinel is never equal to a normalized recipient (it contains a NUL),
-        # so an unresolved lookup disables the guard and can never trip it.
         if self._own_number and recipient == self._own_number:
             raise WhatsAppSelfSendError(self._own_number)
 
     def _fetch_own_number(self) -> str | None:
         if self._own_number is not None:
-            # Either resolved on an earlier call, or already known to be
-            # unresolvable — either way, do not ask Meta again.
             return self._own_number
         url = f"{self._GRAPH_URL}/{self._api_version}/{self._phone_number_id}?fields=display_phone_number"
         try:
             response = self._session.get(url, timeout=self._timeout)
-            if not response.ok:
-                # Checked explicitly: ``json_or_none`` only guards the *parse*, so
-                # a 500 carrying a JSON error body would otherwise read as a
-                # successful answer that simply had no number in it.
-                raise WhatsAppApiError(
-                    response.status_code, f"could not read our own number: {response.text[:200]}"
-                )
             own = (json_or_none(response) or {}).get("display_phone_number", "")
-            if not own:
-                # We asked, and got no answer — the same consequence as an error,
-                # so it is reported the same way.
-                log.warning(
-                    "the Graph API returned no display_phone_number; the self-send "
-                    "guard is off for the rest of this run"
-                )
-                return _OWN_NUMBER_UNKNOWN
-            return normalize_phone(own, self._country_code)
-        except (ValueError, WhatsAppApiError, requests.RequestException) as exc:
-            # Returning None here silently disabled the guard: the caller cannot
-            # tell "we do not know our own number" from "we could not ask", and
-            # that difference is the guard's whole purpose. Say so — and return
-            # the sentinel, so a broken lookup costs one request per process
-            # rather than one per send.
-            log.warning(
-                "could not read our own WhatsApp number (%s); the self-send guard is "
-                "off for the rest of this run",
-                exc,
-            )
-            return _OWN_NUMBER_UNKNOWN
+            return normalize_phone(own, self._country_code) if own else None
+        except (ValueError, WhatsAppApiError, requests.RequestException):
+            return None
 
     def _sleep_after_429(self, response: requests.Response, attempt: int) -> None:
         raw = response.headers.get("Retry-After", "")

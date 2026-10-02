@@ -3,48 +3,13 @@ from __future__ import annotations
 from contextlib import AbstractContextManager
 from typing import Protocol, runtime_checkable
 
-from .models import Customer, Invoice, Payment, SendOutcome
+from .models import Invoice, SendOutcome
 
 
 class InvoiceSource(Protocol):
     def get_invoice(self, invoice_id: int | str) -> Invoice: ...
     def get_raw_invoice(self, invoice_id: int | str) -> dict: ...
     def list_invoices(self, limit: int = 10, page: int = 1) -> list[Invoice]: ...
-
-
-class PaymentSource(Protocol):
-    """The payments counterpart of :class:`InvoiceSource`.
-
-    ``get_payment`` is the poller's "give me the authoritative document for this
-    id" hook and returns a **fully resolved** payment — including the customer
-    name and phone, which Daftra does not put on the payment record itself. How
-    many requests that costs is the adapter's business, not the caller's: the
-    port states what the caller needs, and ``DaftraClient`` happens to satisfy it
-    by also reading the linked invoice.
-    """
-
-    def get_payment(self, payment_id: int | str) -> Payment: ...
-    def get_raw_payment(self, payment_id: int | str) -> dict: ...
-    def list_payments(self, limit: int = 10, page: int = 1) -> list[Payment]: ...
-
-
-class CustomerSource(Protocol):
-    """The customers counterpart of :class:`InvoiceSource`.
-
-    ``list_customers`` must return **newest first**, and that is a real
-    requirement rather than a nicety: the poller walks pages forward and stops as
-    soon as it reaches an already-seen record, so an arbitrary or oldest-first
-    order makes it stop early and silently miss new customers further back.
-    Daftra's ``/clients.json`` does not order by creation on its own, so the
-    adapter has to ask for it — see :meth:`DaftraClient.list_customers`.
-
-    ``get_customer`` returns a fully resolved customer including name and phone,
-    which here needs no second request: the client row carries both.
-    """
-
-    def get_customer(self, customer_id: int | str) -> Customer: ...
-    def get_raw_customer(self, customer_id: int | str) -> dict: ...
-    def list_customers(self, limit: int = 10, page: int = 1) -> list[Customer]: ...
 
 
 @runtime_checkable

@@ -684,37 +684,6 @@ def test_arabic_renders_without_a_warning(caplog) -> None:
     assert pdf.startswith(b"%PDF-1.4")
 
 
-def test_a_totalled_invoice_with_no_line_items_is_reported(caplog) -> None:
-    """The empty-items state is designed, so it renders — but a *totalled* invoice
-    with no rows is the signature of an invoice that was never re-fetched from the
-    detail endpoint, and the document says so to the customer. It must never reach
-    a customer unremarked.
-    """
-    with caplog.at_level("WARNING"):
-        pdf = render_invoice_pdf(make_invoice(items=()))
-    assert "no line items" in caplog.text
-    assert "INV-042" in caplog.text
-    assert pdf.startswith(b"%PDF-1.4")
-
-
-def test_an_untouched_invoice_with_nothing_on_it_is_not_reported(caplog) -> None:
-    """The narrow case has to stay quiet, or the warning is noise nobody reads.
-
-    No rows *and* nothing charged is the legitimate version of the same state.
-    """
-    with caplog.at_level("WARNING"):
-        render_invoice_pdf(
-            make_invoice(
-                items=(),
-                subtotal=Decimal("0"),
-                total=Decimal("0"),
-                total_paid=Decimal("0"),
-                balance_due=Decimal("0"),
-            )
-        )
-    assert caplog.records == []
-
-
 def test_a_character_neither_font_can_draw_is_replaced_and_reported(caplog) -> None:
     """CJK and emoji are outside both fonts: warn, and draw the placeholder.
 

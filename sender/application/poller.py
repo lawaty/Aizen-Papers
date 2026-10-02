@@ -1,21 +1,8 @@
-"""Polling use case: watch Daftra for new documents and notify customers.
+"""Polling use case: watch Daftra for new invoices and notify customers.
 
-Two pipelines share this module. :class:`InvoicePoller` announces new invoices
-under ``aizen_invoice``; :class:`PaymentPoller` announces recorded payments under
-``aizen_new_payment``. They differ in almost nothing that matters: both list a
-paged, newest-first source per tenant, diff it against a per-app state store,
-send what is new, and classify every failure the same way. All of that lives once
-in :class:`DocumentPoller`, and each pipeline is a thin subclass supplying only
-its source call, its template builder and its wording.
-
-That split is deliberate and is not a refactor for its own sake. The rules below
-are the reason a customer never silently misses a notification, and a second
-copy of them would be a second chance to get one of them wrong. When the payments
-pipeline was added, the invariants did not get re-implemented — they got a second
-caller.
-
-The poller is otherwise deliberately thin: it decides what is new and what to do
-about it, and all I/O (Daftra, WhatsApp, the state file, sleeping) arrives through
+The poller is deliberately thin: it lists invoices per app, decides what is new
+via the injected PollStateStore, and sends each new invoice to the customer's
+phone. All I/O (Daftra, WhatsApp, the state file, sleeping) arrives through
 ports so the whole loop is testable offline.
 
 Failure policy (see docs/design.md §8):
@@ -26,58 +13,37 @@ Failure policy (see docs/design.md §8):
   silent permanent loss.
 - **Permanent** failures (validation, missing ``public_url``, template
   rejection, self-send, any other non-transient error) are given up on the
-  first attempt: the document is marked seen and recorded in the state as
+  first attempt: the invoice is marked seen and recorded in the state as
   ``abandoned`` so an operator can see it and re-drive it.
 - **Template contract failures** (the ``132000``-series) are the one exception
   to that split, because they are fixable by an operator rather than by waiting:
-  a ``132001`` (no usable translation of the template in the requested language)
-  retried unchanged would fail identically forever, so the poller falls back to a
-  free-form message when ``freeform_fallback`` is on (see
-  :meth:`DocumentPoller._send_freeform_fallback`) and records the document as
-  ``pending`` with the *template* error when it is off or when the fallback send
-  fails too. It is never ``abandoned`` and never marked seen on that path — a
-  bridge must not consume documents.
+  a ``132001`` (no usable ``aizen_invoice`` translation) retried unchanged would
+  fail identically forever, so the poller falls back to a free-form message when
+  ``freeform_fallback`` is on (see :meth:`InvoicePoller._send_freeform_fallback`)
+  and records the invoice as ``pending`` with the *template* error when it is
+  off or when the fallback send fails too. It is never ``abandoned`` and never
+  marked seen on that path — a bridge must not consume invoices.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Generic, Sequence, TypeVar
+from typing import Any, Sequence
 
 from sender.domain.errors import ApiError, WhatsAppApiError, WhatsAppSelfSendError, is_template_error
-from sender.domain.models import (
-    ABANDONED,
-    FAILED,
-    KIND_CUSTOMER,
-    KIND_INVOICE,
-    KIND_PAYMENT,
-    SENT,
-    Customer,
-    Invoice,
-    Payment,
-    SendOutcome,
-)
+from sender.domain.models import ABANDONED, FAILED, SENT, Invoice, SendOutcome
 from sender.domain.phones import normalize_phone
 from sender.domain.ports import (
     Clock,
-    CustomerSource,
     InvoiceSource,
     MessageSender,
-    PaymentSource,
     PollStateStore,
     SendOutcomeRecorder,
 )
-from sender.domain.templates import TemplateBuilder, build_fallback_document
+from sender.domain.templates import InvoiceTemplateBuilder, build_fallback_document
 
 log = logging.getLogger(__name__)
-
-#: The document a pipeline announces (an :class:`Invoice` or a :class:`Payment`)
-#: and the source it reads them from. Both pipeline classes are generic in these
-#: so the engine below type-checks against either without casts, while running
-#: exactly the same code for both.
-TDoc = TypeVar("TDoc", Invoice, Payment)
-TSource = TypeVar("TSource", InvoiceSource, PaymentSource)
 
 _HANDLED_ERRORS = (ApiError, ValueError, RuntimeError)
 
@@ -174,42 +140,17 @@ def _is_retryable(exc: Exception) -> bool:
 
 
 @dataclass(frozen=True)
-class PollApp(Generic[TSource]):
-    """One tenant in a poll cycle: its name (which keys its state) and its source."""
-
+class PollApp:
     name: str
-    source: TSource
+    source: InvoiceSource
 
 
-class DocumentPoller(Generic[TDoc, TSource]):
-    """The shared engine: list, diff against state, send what is new, classify.
-
-    Subclasses supply only what is genuinely per-document — which source call
-    lists and which fetches a single record, whether a listing row is too thin to
-    send from, and how a send maps onto a report row. Everything else, including
-    every safety invariant, is inherited unchanged:
-
-    1. the first run per app **seeds without sending**;
-    2. a dry run **writes nothing** to the state;
-    3. a retryable failure is **never** abandoned.
-
-    A subclass that changed any of those would not be "a payment poller", it would
-    be a second, less-tested copy of the notification guarantee.
-    """
-
-    #: Document kind, also the noun used in log lines and the ``kind`` key of the
-    #: per-app summary. Overridden by every concrete pipeline.
-    KIND = KIND_INVOICE
-    #: The env var that raises the per-run send cap, named in the warning that
-    #: fires when the cap bites. Each pipeline has its own cap, so each has to
-    #: tell the operator which knob to turn.
-    CAP_ENV_VAR = "POLL_MAX_SENDS_PER_RUN"
-
+class InvoicePoller:
     def __init__(
         self,
         apps: Sequence[PollApp],
         sender: MessageSender | None,
-        builder: TemplateBuilder,
+        builder: InvoiceTemplateBuilder,
         state: PollStateStore,
         clock: Clock,
         *,
@@ -250,70 +191,6 @@ class DocumentPoller(Generic[TDoc, TSource]):
         # (and on a send that then fails) rather than inferred from a count of
         # successes.
         self._sends_this_cycle = 0
-
-    # -- per-document hooks -------------------------------------------------
-    #
-    # Everything below is what a subclass has to say to become a pipeline. Each
-    # one is a thin adapter over a source call or a model field; none of them may
-    # reimplement a policy decision.
-
-    @property
-    def _noun(self) -> str:
-        """Singular document noun, for log lines ("invoice 12", "payment 000116")."""
-        return self.KIND
-
-    @property
-    def _plural(self) -> str:
-        return f"{self.KIND}s"
-
-    def _list_documents(self, app: PollApp, *, limit: int, page: int) -> list[TDoc]:
-        """One page of documents, newest first."""
-        raise NotImplementedError("a pipeline must say how it lists its documents")
-
-    def _fetch_document(self, app: PollApp, document_id: str) -> TDoc:
-        """The authoritative record for *document_id*, customer details included."""
-        raise NotImplementedError("a pipeline must say how it fetches one document")
-
-    def _label(self, doc: TDoc) -> str:
-        """The human-facing identifier for a document, as the customer would see it.
-
-        The invoice number, the payment reference code. It is what log lines and
-        the summary rows print, so it must be something a person can look up in
-        the ERP — never an internal id.
-        """
-        return doc.number
-
-    def _needs_detail(self, doc: TDoc) -> bool:
-        """Whether this listing row is too thin to send from as-is.
-
-        The default is "no reachable phone", which every pipeline needs. Sources
-        that carry less than that in their listing rows override it; see
-        :meth:`InvoicePoller._needs_detail`.
-        """
-        return not doc.customer_phone
-
-    def _after_detail_fetch(self, app: PollApp, doc: TDoc) -> None:
-        """Warn about a document the detail fetch still could not complete.
-
-        A no-op by default: it exists so a pipeline whose detail is genuinely
-        incomplete can say so out loud rather than quietly shipping a message
-        that understates what happened.
-        """
-
-    def _make_outcome(
-        self,
-        app: PollApp,
-        doc: TDoc,
-        document_id: str,
-        status: str,
-        *,
-        recipient: str | None = None,
-        error: str | None = None,
-        fallback: bool = False,
-        wamid: str | None = None,
-    ) -> SendOutcome:
-        """Map a document onto the report row that records its send attempt."""
-        raise NotImplementedError("a pipeline must say how a document is reported")
 
     def run(self) -> dict:
         """Run cycles until a bound is hit or a stop signal interrupts."""
@@ -378,12 +255,12 @@ class DocumentPoller(Generic[TDoc, TSource]):
         all_failed = bool(results) and all(not result["ok"] for result in results)
         return {"apps": results, "all_failed": all_failed}
 
-    def _new_result(self, app: PollApp) -> dict:
+    @staticmethod
+    def _new_result(app: PollApp) -> dict:
         """The per-app summary skeleton, so a failed app reports the same keys
         as a healthy one (the CLI summary printer relies on them)."""
         return {
             "app": app.name,
-            "kind": self.KIND,
             "ok": True,
             "error": None,
             "listed": 0,
@@ -398,9 +275,6 @@ class DocumentPoller(Generic[TDoc, TSource]):
             "deferred_by_cap": 0,
             "first_run": False,
             "seeded": 0,
-            # Named for the invoice pipeline, which is the one that existed
-            # first; ``kind`` is what says what the rows hold. Renaming it would
-            # break every existing consumer for no gain.
             "invoices": [],
         }
 
@@ -417,7 +291,7 @@ class DocumentPoller(Generic[TDoc, TSource]):
         # that read as a side effect. Computed after the listing, an app whose
         # first page comes back full would look like it already had state, skip
         # the seeding below, and then mass-send up to max_pages*limit historical
-        # documents.
+        # invoices.
         first_run = not self._state.has_app(app.name)
         # This app's backlog is only still draining if *this* app deferred sends
         # last cycle, so the flag is reset here rather than globally.
@@ -431,12 +305,12 @@ class DocumentPoller(Generic[TDoc, TSource]):
         try:
             listed = self._list_candidates(app, draining=draining)
         except _HANDLED_ERRORS as exc:
-            log.error("app %s: listing %s failed: %s", app.name, self._plural, exc)
+            log.error("app %s: listing invoices failed: %s", app.name, exc)
             result["ok"] = False
             result["error"] = str(exc)
             return result
         result["listed"] = len(listed)
-        ids = [str(doc.id) for doc in listed]
+        ids = [str(invoice.id) for invoice in listed]
         result["first_run"] = first_run
         result["dry_run"] = self._dry_run
         # Anything unexpected from here on (a failed batch-exit state write, an
@@ -448,39 +322,39 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 if first_run and not self._send_existing:
                     if self._dry_run:
                         log.info(
-                            "app %s: first run; would seed %d existing %s(s) without "
+                            "app %s: first run; would seed %d existing invoice(s) without "
                             "sending (dry-run; nothing was written)",
-                            app.name, len(ids), self._noun,
+                            app.name, len(ids),
                         )
                         result["seeded"] = len(ids)
                         return result
                     self._state.mark_many_seen(app.name, ids)
                     result["seeded"] = len(ids)
                     log.info(
-                        "app %s: first run; seeded %d existing %s(s) without sending "
+                        "app %s: first run; seeded %d existing invoice(s) without sending "
                         "(pass --send-existing to send them on the first run)",
-                        app.name, len(ids), self._noun,
+                        app.name, len(ids),
                     )
                     self._state.set_last_poll_at(app.name, self._clock.now())
                     return result
-                for doc in listed:
-                    document_id = str(doc.id)
-                    if self._state.seen(app.name, document_id):
+                for invoice in listed:
+                    invoice_id = str(invoice.id)
+                    if self._state.seen(app.name, invoice_id):
                         continue
                     if self._send_cap_reached():
                         # Deliberately left unseen: the cap is a throttle, not a
-                        # decision about this document. A later cycle picks it up.
+                        # decision about this invoice. A later cycle picks it up.
                         result["deferred_by_cap"] += 1
                         self._state.set_draining(app.name, True)
                         continue
-                    if self._is_deferred(app.name, document_id):
+                    if self._is_deferred(app.name, invoice_id):
                         result["pending"] += 1
                         result["invoices"].append(
-                            {"number": self._label(doc), "id": document_id, "status": "pending", "to": None}
+                            {"number": invoice.number, "id": invoice_id, "status": "pending", "to": None}
                         )
                         continue
                     result["new"] += 1
-                    outcome = self._handle_document(app, document_id, doc)
+                    outcome = self._handle_invoice(app, invoice_id, invoice)
                     result["invoices"].append(outcome)
                     if outcome["status"] == "sent":
                         if outcome.get("dry_run"):
@@ -516,30 +390,30 @@ class DocumentPoller(Generic[TDoc, TSource]):
             if not self._dry_run:
                 self._state.set_draining(app.name, True)
             log.warning(
-                "app %s: hit the per-run send cap of %s; %d %s(s) were left "
-                "unseen for a later cycle (raise %s to send more per run)",
+                "app %s: hit the per-run send cap of %s; %d invoice(s) were left "
+                "unseen for a later cycle (raise POLL_MAX_SENDS_PER_RUN to send more "
+                "per run)",
                 app.name, self._max_sends_per_run, result["deferred_by_cap"],
-                self._noun, self.CAP_ENV_VAR,
             )
         else:
             if not self._dry_run:
                 self._state.set_draining(app.name, False)
         return result
 
-    def _list_candidates(self, app: PollApp, *, draining: bool = False) -> list[TDoc]:
-        """List documents, paging forward while the page is saturated and still
-        contains unseen documents.
+    def _list_candidates(self, app: PollApp, *, draining: bool = False) -> list[Invoice]:
+        """List invoices, paging forward while the page is saturated and still
+        contains unseen invoices.
 
-        A burst of new documents between two cycles can otherwise push the older
+        A burst of new invoices between two cycles can otherwise push the older
         ones off the first page, where they would be silently missed. Paging
         stops as soon as a page is not full or its oldest row is already seen,
         and is bounded by ``max_pages`` so a pathological backlog cannot turn
         one cycle into a full-table scan.
         """
-        candidates: list[TDoc] = []
+        candidates: list[Invoice] = []
         page = 1
         while True:
-            listed = self._list_documents(app, limit=self._limit, page=page)
+            listed = app.source.list_invoices(limit=self._limit, page=page)
             if not listed:
                 break
             candidates.extend(listed)
@@ -554,7 +428,7 @@ class DocumentPoller(Generic[TDoc, TSource]):
             # A full page of seen rows therefore stops the walk.
             #
             # That inference breaks while a send cap is draining a backlog. A
-            # capped cycle sends the *newest* documents and leaves older ones
+            # capped cycle sends the *newest* invoices and leaves older ones
             # unseen, so the next cycle can face a page that is entirely seen
             # while deeper pages are not — and stopping there would strand the
             # backlog forever: reachable, never paged to. That is the silent
@@ -569,9 +443,9 @@ class DocumentPoller(Generic[TDoc, TSource]):
             page += 1
             if page > self._max_pages:
                 log.warning(
-                    "app %s: more than %d pages of unseen %s; the listing is "
-                    "saturated and older %s may be missed — raise --limit",
-                    app.name, self._max_pages, self._plural, self._plural,
+                    "app %s: more than %d pages of unseen invoices; the listing is "
+                    "saturated and older invoices may be missed — raise --limit",
+                    app.name, self._max_pages,
                 )
                 break
         # A full page only means the listing is saturated if it still holds rows
@@ -582,9 +456,9 @@ class DocumentPoller(Generic[TDoc, TSource]):
             not self._state.seen(app.name, str(candidate.id)) for candidate in candidates
         ):
             log.warning(
-                "app %s: the %s listing came back full (%d rows); if %s "
+                "app %s: the invoice listing came back full (%d rows); if invoices "
                 "are created faster than the poll interval, raise --limit",
-                app.name, self._noun, len(candidates), self._plural,
+                app.name, len(candidates),
             )
         return candidates
 
@@ -610,67 +484,51 @@ class DocumentPoller(Generic[TDoc, TSource]):
         """
         self._sends_this_cycle += 1
 
-    def _handle_document(self, app: PollApp, document_id: str, candidate: TDoc) -> dict:
-        # A listing row is only used as-is when the pipeline says it can answer
-        # everything the message depends on; otherwise the detail fetch supplies
-        # the rest. The send cap gates this, so the extra source traffic is
-        # bounded by what is actually sent and never by the size of the listing.
-        doc = candidate
-        if self._needs_detail(doc):
+    def _handle_invoice(self, app: PollApp, invoice_id: str, candidate: Invoice) -> dict:
+        # The list row already carries everything the template builders need
+        # (number, date, totals, public_url, Client with phone1/phone2), so the
+        # only reason to fetch the detail is a missing phone. The template
+        # payload is identical either way; see docs/layers/application.md.
+        invoice = candidate
+        if not invoice.customer_phone:
             try:
-                doc = self._fetch_document(app, document_id)
+                invoice = app.source.get_invoice(invoice_id)
             except _HANDLED_ERRORS as exc:
-                # Classified like any other fetch error, so a transient one
-                # retries with backoff and a 4xx is abandoned for an operator.
-                log.error(
-                    "app %s: fetching %s %s failed: %s",
-                    app.name, self._noun, self._label(candidate), exc,
-                )
-                return self._fail(
-                    app, self._label(candidate), document_id, None, exc, "fetch"
-                )
-        self._after_detail_fetch(app, doc)
-        recipient = doc.customer_phone
+                log.error("app %s: fetching invoice %s failed: %s", app.name, invoice.number, exc)
+                return self._fail(app, invoice.number, invoice_id, None, exc, "fetch")
+        recipient = invoice.customer_phone
         if not recipient:
             log.warning(
-                "app %s: %s %s has no usable WhatsApp phone; skipping%s",
-                app.name, self._noun, self._label(doc),
+                "app %s: invoice %s has no usable WhatsApp phone; skipping%s",
+                app.name, invoice.number,
                 "" if self._dry_run else " and marking seen",
             )
             if not self._dry_run:
-                self._state.mark_seen(app.name, document_id)
-            return {"number": self._label(doc), "id": document_id, "status": "skipped_no_phone", "to": None}
+                self._state.mark_seen(app.name, invoice_id)
+            return {"number": invoice.number, "id": invoice_id, "status": "skipped_no_phone", "to": None}
         try:
             recipient = normalize_phone(recipient, self._country_code)
         except ValueError:
             log.warning(
-                "app %s: %s %s has an unusable WhatsApp phone (%r); skipping%s",
-                app.name, self._noun, self._label(doc), doc.customer_phone,
+                "app %s: invoice %s has an unusable WhatsApp phone (%r); skipping%s",
+                app.name, invoice.number, invoice.customer_phone,
                 "" if self._dry_run else " and marking seen",
             )
             if not self._dry_run:
-                self._state.mark_seen(app.name, document_id)
-            return {"number": self._label(doc), "id": document_id, "status": "skipped_no_phone", "to": None}
+                self._state.mark_seen(app.name, invoice_id)
+            return {"number": invoice.number, "id": invoice_id, "status": "skipped_no_phone", "to": None}
         try:
-            payload = self._builder.build(doc, recipient)
+            payload = self._builder.build(invoice, recipient)
         except _HANDLED_ERRORS as exc:
-            log.error(
-                "app %s: building the payload for %s %s failed: %s",
-                app.name, self._noun, self._label(doc), exc,
-            )
-            return self._fail(app, self._label(doc), document_id, recipient, exc, "build")
+            log.error("app %s: building the payload for invoice %s failed: %s", app.name, invoice.number, exc)
+            return self._fail(app, invoice.number, invoice_id, recipient, exc, "build")
         if self._dry_run:
-            log.info(
-                "app %s: dry-run %s %s to %s", app.name, self._noun, self._label(doc), recipient
-            )
-            return {
-                "number": self._label(doc), "id": document_id,
-                "status": "sent", "to": recipient, "dry_run": True,
-            }
+            log.info("app %s: dry-run invoice %s to %s", app.name, invoice.number, recipient)
+            return {"number": invoice.number, "id": invoice_id, "status": "sent", "to": recipient, "dry_run": True}
         if self._sender is None:
             return self._fail(
-                app, self._label(doc), document_id, recipient,
-                RuntimeError("WhatsApp credentials are not configured; cannot send."), "send", doc,
+                app, invoice.number, invoice_id, recipient,
+                RuntimeError("WhatsApp credentials are not configured; cannot send."), "send", invoice,
             )
         try:
             self._budget_send()
@@ -678,20 +536,20 @@ class DocumentPoller(Generic[TDoc, TSource]):
         except _HANDLED_ERRORS as exc:
             if self._is_template_failure(exc):
                 if self._freeform_fallback:
-                    return self._send_freeform_fallback(app, doc, document_id, recipient, payload, exc)
+                    return self._send_freeform_fallback(app, invoice, invoice_id, recipient, payload, exc)
                 log.error(
-                    "app %s: %s %s template send failed with [code %s] and the "
+                    "app %s: invoice %s template send failed with [code %s] and the "
                     "free-form fallback is disabled (WHATSAPP_FREEFORM_FALLBACK=off); the "
-                    "%s is kept pending on the template error, because approving the "
+                    "invoice is kept pending on the template error, because approving the "
                     "template is what makes the next attempt succeed",
-                    app.name, self._noun, self._label(doc), _error_code(exc), self._noun,
+                    app.name, invoice.number, _error_code(exc),
                 )
-                return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
-            return self._fail(app, self._label(doc), document_id, recipient, exc, "send", doc)
-        self._state.mark_seen(app.name, document_id)
-        log.info("app %s: sent %s %s to %s", app.name, self._noun, self._label(doc), recipient)
-        self._record(app, doc, document_id, SENT, recipient=recipient, wamid=_wamid(response))
-        return {"number": self._label(doc), "id": document_id, "status": "sent", "to": recipient}
+                return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
+            return self._fail(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
+        self._state.mark_seen(app.name, invoice_id)
+        log.info("app %s: sent invoice %s to %s", app.name, invoice.number, recipient)
+        self._record(app, invoice, invoice_id, SENT, recipient=recipient, wamid=_wamid(response))
+        return {"number": invoice.number, "id": invoice_id, "status": "sent", "to": recipient}
 
     def _is_template_failure(self, exc: Exception) -> bool:
         """Whether a failed send failed because the *template* is the problem.
@@ -703,7 +561,7 @@ class DocumentPoller(Generic[TDoc, TSource]):
         """
         return isinstance(exc, WhatsAppApiError) and is_template_error(exc)
 
-    def _fallback_payload(self, doc: TDoc, recipient: str, payload: dict) -> tuple[str, dict] | None:
+    def _fallback_payload(self, invoice: Invoice, recipient: str, payload: dict) -> tuple[str, dict] | None:
         """The free-form message to send for an unusable template, and its kind.
 
         The document case reuses the media id the *failed* template send already
@@ -719,86 +577,85 @@ class DocumentPoller(Generic[TDoc, TSource]):
         build_text = getattr(self._builder, "build_text", None)
         if build_text is None:
             return None
-        return "text", build_text(doc, recipient)
+        return "text", build_text(invoice, recipient)
 
     def _send_freeform_fallback(
         self,
         app: PollApp,
-        doc: TDoc,
-        document_id: str,
+        invoice: Invoice,
+        invoice_id: str,
         recipient: str,
         payload: dict,
         exc: Exception,
     ) -> dict:
-        """Deliver a template-rejected document as a free-form message.
+        """Deliver a template-rejected invoice as a free-form message.
 
         This is a *bridge*, not a normal path: the template is unusable because
-        the account has no approved translation of it in the language the sender
-        asks for, and the owner wants the pipeline exercised end to end until it
-        is approved. Two consequences are baked into the logging: the customer may
-        not even receive the message (Meta only delivers free-form messages inside
-        the 24-hour customer service window), and every send here is a message the
-        approved template would have sent better.
+        the account has no approved ``aizen_invoice`` translation in the language
+        the sender asks for, and the owner wants the pipeline exercised end to
+        end until it is approved. Two consequences are baked into the logging:
+        the customer may not even receive the message (Meta only delivers
+        free-form messages inside the 24-hour customer service window), and every
+        send here is a message the approved template would have sent better.
 
         Failures here are recorded as retryable with the *template* error, never
         the fallback's: the template error is the one an operator can act on, and
-        the document must come back once the template is fixed.
+        the invoice must come back once the template is fixed.
         """
         code = _error_code(exc)
         log.warning(
-            "app %s: %s %s template send failed with [code %s] — the template is "
+            "app %s: invoice %s template send failed with [code %s] — the template is "
             "not usable (no approved translation for the configured language); "
             "falling back to a free-form message. Approve the template to stop this; "
             "note Meta only delivers free-form messages inside the 24-hour customer "
             "service window (131047 outside it)",
-            app.name, self._noun, self._label(doc), code,
+            app.name, invoice.number, code,
         )
-        fallback = self._fallback_payload(doc, recipient, payload)
+        fallback = self._fallback_payload(invoice, recipient, payload)
         if fallback is None:
             log.warning(
-                "app %s: %s %s has no free-form fallback available (the builder "
+                "app %s: invoice %s has no free-form fallback available (the builder "
                 "has no build_text and the payload has no reusable header document)",
-                app.name, self._noun, self._label(doc),
+                app.name, invoice.number,
             )
-            return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         kind, message = fallback
         # A template-contract failure has already spent one unit of budget on the
         # rejected template POST, so the fallback would be the (cap+1)-th message
         # in front of Meta unless it is checked. Skipping it keeps the cap hard
-        # and leaves the document pending on the template error, which is where it
-        # already sits on this path.
+        # and leaves the invoice pending on the template error, which is where
+        # it already sits on this path.
         if self._send_cap_reached():
             log.info(
-                "app %s: %s %s reached the per-run send cap after its template "
+                "app %s: invoice %s reached the per-run send cap after its template "
                 "rejection; deferring the free-form fallback to a later cycle",
-                app.name, self._noun, self._label(doc),
+                app.name, invoice.number,
             )
-            return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
         try:
             self._budget_send()
             response = self._sender.send(message)
         except _HANDLED_ERRORS as fallback_exc:
             log.error(
-                "app %s: %s %s free-form %s fallback also failed: %s (the template "
-                "error it replaces: %s); the %s stays pending on the template error",
-                app.name, self._noun, self._label(doc), kind, fallback_exc, exc,
-                self._noun,
+                "app %s: invoice %s free-form %s fallback also failed: %s (the template "
+                "error it replaces: %s); the invoice stays pending on the template error",
+                app.name, invoice.number, kind, fallback_exc, exc,
             )
-            return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
-        self._state.mark_seen(app.name, document_id)
+            return self._fail_retryable(app, invoice.number, invoice_id, recipient, exc, "send", invoice)
+        self._state.mark_seen(app.name, invoice_id)
         log.warning(
-            "app %s: delivered %s %s to %s as a free-form %s message after the "
+            "app %s: delivered invoice %s to %s as a free-form %s message after the "
             "template send failed with [code %s]. Approve the template; free-form only "
             "reaches the customer inside the 24-hour customer service window",
-            app.name, self._noun, self._label(doc), recipient, kind, code,
+            app.name, invoice.number, recipient, kind, code,
         )
         self._record(
-            app, doc, document_id, SENT,
+            app, invoice, invoice_id, SENT,
             recipient=recipient, error=str(exc), fallback=True, wamid=_wamid(response),
         )
         return {
-            "number": self._label(doc),
-            "id": document_id,
+            "number": invoice.number,
+            "id": invoice_id,
             "status": "sent",
             "to": recipient,
             "fallback": True,
@@ -809,8 +666,8 @@ class DocumentPoller(Generic[TDoc, TSource]):
     def _record(
         self,
         app: PollApp,
-        doc: TDoc,
-        document_id: str,
+        invoice: Invoice,
+        invoice_id: str,
         status: str,
         *,
         recipient: str | None = None,
@@ -829,21 +686,29 @@ class DocumentPoller(Generic[TDoc, TSource]):
         if self._recorder is None or self._dry_run:
             return
         self._recorder.record(
-            self._make_outcome(
-                app, doc, document_id, status,
-                recipient=recipient,
+            SendOutcome(
+                app=app.name,
+                invoice_id=invoice_id,
+                invoice_number=invoice.number,
+                customer_name=invoice.customer_name,
+                customer_phone=recipient,
+                currency=invoice.currency,
+                total=invoice.total,
+                issue_date=invoice.issue_date,
+                status=status,
+                attempted_at=self._clock.now(),
                 error=error,
                 fallback=fallback,
                 wamid=wamid,
             )
         )
 
-    def _fail(self, app: PollApp, number: str, document_id: str, to: str | None, exc: Exception, action: str, doc: TDoc | None = None) -> dict:
+    def _fail(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
         if _is_retryable(exc):
-            return self._fail_retryable(app, number, document_id, to, exc, action, doc)
-        return self._fail_permanent(app, number, document_id, to, exc, action, doc)
+            return self._fail_retryable(app, number, invoice_id, to, exc, action, invoice)
+        return self._fail_permanent(app, number, invoice_id, to, exc, action, invoice)
 
-    def _fail_retryable(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, doc: TDoc | None = None) -> dict:
+    def _fail_retryable(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
         previous = self._state.pending(app.name).get(invoice_id, {})
         count = int(previous.get("count", 0)) + 1
         backoff = self._backoff_for(count)
@@ -858,19 +723,19 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 error=str(exc), action=action, count=count, next_attempt_at=next_attempt_at,
             )
         log.error(
-            "app %s: %s %s %s failed (retryable, attempt %d): %s; will retry in %gs",
-            app.name, self._noun, number, action, count, exc, backoff,
+            "app %s: invoice %s %s failed (retryable, attempt %d): %s; will retry in %gs",
+            app.name, number, action, count, exc, backoff,
         )
-        if doc is not None and action == "send":
-            self._record(app, doc, invoice_id, FAILED, recipient=to, error=str(exc))
+        if invoice is not None and action == "send":
+            self._record(app, invoice, invoice_id, FAILED, recipient=to, error=str(exc))
         return {"number": number, "id": invoice_id, "status": "failed", "to": to, "error": str(exc), "retryable": True}
 
-    def _fail_permanent(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, doc: TDoc | None = None) -> dict:
+    def _fail_permanent(self, app: PollApp, number: str, invoice_id: str, to: str | None, exc: Exception, action: str, invoice: Invoice | None = None) -> dict:
         previous = self._state.abandoned(app.name).get(invoice_id, {})
         count = int(previous.get("count", 0)) + 1
         # Guarded like the skipped_no_phone branches: a dry run reports the
-        # outcome but must not mark the document seen or write it to abandoned,
-        # or the rehearsal would silently retire it for real runs.
+        # outcome but must not mark the invoice seen or write it to abandoned,
+        # or the rehearsal would silently retire the invoice for real runs.
         if not self._dry_run:
             self._state.mark_seen(app.name, invoice_id)
             self._state.record_abandoned(
@@ -878,11 +743,11 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 error=str(exc), action=action, count=count,
             )
         log.error(
-            "app %s: %s %s %s failed permanently (attempt %d): %s; giving up",
-            app.name, self._noun, number, action, count, exc,
+            "app %s: invoice %s %s failed permanently (attempt %d): %s; giving up",
+            app.name, number, action, count, exc,
         )
-        if doc is not None and action == "send":
-            self._record(app, doc, invoice_id, ABANDONED, recipient=to, error=str(exc))
+        if invoice is not None and action == "send":
+            self._record(app, invoice, invoice_id, ABANDONED, recipient=to, error=str(exc))
         return {"number": number, "id": invoice_id, "status": "abandoned", "to": to, "error": str(exc)}
 
     def _backoff_for(self, count: int) -> float:
@@ -907,217 +772,3 @@ class DocumentPoller(Generic[TDoc, TSource]):
             remaining = min(remaining, max(0.0, deadline - self._clock.monotonic()))
         if remaining > 0:
             self._clock.sleep(remaining)
-
-
-class InvoicePoller(DocumentPoller[Invoice, InvoiceSource]):
-    """Announce new invoices under the ``aizen_invoice`` template.
-
-    The production pipeline, and the one whose behaviour every invariant in
-    :class:`DocumentPoller` was written for. It carries no policy of its own:
-    what follows is only how an invoice is listed, fetched and reported.
-    """
-
-    KIND = KIND_INVOICE
-
-    def _list_documents(self, app: PollApp, *, limit: int, page: int) -> list[Invoice]:
-        return app.source.list_invoices(limit=limit, page=page)
-
-    def _fetch_document(self, app: PollApp, document_id: str) -> Invoice:
-        return app.source.get_invoice(document_id)
-
-    def _needs_detail(self, invoice: Invoice) -> bool:
-        """Whether this listing row is too thin to build the message from.
-
-        Two things can be missing, and the second is the expensive one to discover
-        late:
-
-        - **No phone.** The row's ``Client`` may carry none, and nothing else knows
-          where the invoice is going.
-        - **No line items.** Daftra's ``/invoices.json`` does not embed
-          ``InvoiceItem`` at all — only ``/invoices/{id}.json`` does — so *every*
-          listed row comes back with an empty items tuple. That was harmless while
-          the message was text only, and it stopped being harmless the moment the
-          template grew a header document: the document is this sender's own
-          rendered PDF, so an item-less row renders a PDF whose items table says the
-          invoice has no products on it, and the customer is told their invoice is
-          empty. The detail fetch is the only way to get the rows, and one request
-          per *sent* invoice is a price worth paying for a document that is not a lie.
-        """
-        return not invoice.customer_phone or not invoice.items
-
-    def _after_detail_fetch(self, app: PollApp, invoice: Invoice) -> None:
-        if invoice.items:
-            return
-        # The detail says so too, so this is Daftra's own answer rather than a
-        # fetch we failed to make. Send it anyway — an operator has to be able to
-        # see the invoice — but say plainly what the customer will be told.
-        log.warning(
-            "app %s: invoice %s has no line items even on the detail fetch; the "
-            "PDF sent with it will state that it has none",
-            app.name, invoice.number,
-        )
-
-    def _make_outcome(
-        self,
-        app: PollApp,
-        invoice: Invoice,
-        document_id: str,
-        status: str,
-        *,
-        recipient: str | None = None,
-        error: str | None = None,
-        fallback: bool = False,
-        wamid: str | None = None,
-    ) -> SendOutcome:
-        return SendOutcome(
-            app=app.name,
-            invoice_id=document_id,
-            invoice_number=invoice.number,
-            customer_name=invoice.customer_name,
-            customer_phone=recipient,
-            currency=invoice.currency,
-            total=invoice.total,
-            issue_date=invoice.issue_date,
-            status=status,
-            attempted_at=self._clock.now(),
-            error=error,
-            fallback=fallback,
-            wamid=wamid,
-            kind=KIND_INVOICE,
-        )
-
-
-class PaymentPoller(DocumentPoller[Payment, PaymentSource]):
-    """Announce recorded payments under the ``aizen_new_payment`` template.
-
-    Structurally identical to the invoice pipeline — same state machine, same
-    invariants, same failure classification — and deliberately so. The only real
-    difference is in what has to be fetched: a Daftra payment record names no
-    client and carries no phone, so reaching the customer means reading the
-    linked invoice as well. That cost is paid here, in the adapter, and the
-    engine above neither knows nor cares.
-    """
-
-    KIND = KIND_PAYMENT
-    CAP_ENV_VAR = "POLL_PAYMENTS_MAX_SENDS_PER_RUN"
-
-    def _list_documents(self, app: PollApp, *, limit: int, page: int) -> list[Payment]:
-        return app.source.list_payments(limit=limit, page=page)
-
-    def _fetch_document(self, app: PollApp, document_id: str) -> Payment:
-        return app.source.get_payment(document_id)
-
-    def _needs_detail(self, payment: Payment) -> bool:
-        """Always: the listing row cannot address the customer at all.
-
-        ``/invoice_payments.json`` returns the amount, the date, the reference
-        code and the invoice id, but ``client_id`` is usually null and the payer
-        contact fields are empty — the payer is only identified through the
-        invoice it settles. A payment whose invoice cannot be read therefore
-        arrives with no phone and is skipped, never guessed at.
-
-        Asking the question anyway rather than hardcoding ``True`` keeps the
-        intent readable next to the invoice rule it mirrors, and leaves room for
-        a Daftra account whose payment rows do carry the payer.
-        """
-        return True
-
-    def _make_outcome(
-        self,
-        app: PollApp,
-        payment: Payment,
-        document_id: str,
-        status: str,
-        *,
-        recipient: str | None = None,
-        error: str | None = None,
-        fallback: bool = False,
-        wamid: str | None = None,
-    ) -> SendOutcome:
-        return SendOutcome(
-            app=app.name,
-            invoice_id=document_id,
-            invoice_number=payment.number,
-            customer_name=payment.customer_name,
-            customer_phone=recipient,
-            currency=payment.currency,
-            total=payment.amount,
-            issue_date=payment.payment_date,
-            status=status,
-            attempted_at=self._clock.now(),
-            error=error,
-            fallback=fallback,
-            wamid=wamid,
-            kind=KIND_PAYMENT,
-        )
-
-class CustomerPoller(DocumentPoller[Customer, CustomerSource]):
-    """Welcome newly created customers under the ``aizen_new_customer`` template.
-
-    The third pipeline, and the smallest subclass of the three: it overrides five
-    things and inherits everything that makes a notification pipeline safe. Every
-    invariant above — seed-without-send on first run, dry-run writing nothing,
-    retryable failures never abandoned, the send cap leaving work unseen rather
-    than dropped — applies here unchanged, because it lives in
-    :class:`DocumentPoller`, not in a per-document subclass.
-
-    What makes it smaller than :class:`PaymentPoller` is that it needs **no
-    detail-fetch policy of its own**. A Daftra client row carries the name and
-    phone itself, so the inherited ``_needs_detail`` default ("no reachable
-    phone") is exactly right: a normal listing row needs no second request, and
-    only a row with a missing phone triggers one. The two-hop join that defines
-    the payment pipeline has no analogue here.
-
-    ``_label`` and the nouns are likewise inherited: ``Customer.number`` is the
-    ``client_number`` an operator reads in the ERP, and the noun derives from
-    ``KIND``.
-
-    One requirement is pushed down into the adapter rather than enforced here:
-    ``CustomerSource.list_customers`` must answer newest-first, because this
-    engine walks pages forward and stops at the first seen record.
-    """
-
-    KIND = KIND_CUSTOMER
-    CAP_ENV_VAR = "POLL_CUSTOMERS_MAX_SENDS_PER_RUN"
-
-    def _list_documents(self, app: PollApp, *, limit: int, page: int) -> list[Customer]:
-        return app.source.list_customers(limit=limit, page=page)
-
-    def _fetch_document(self, app: PollApp, document_id: str) -> Customer:
-        return app.source.get_customer(document_id)
-
-    def _make_outcome(
-        self,
-        app: PollApp,
-        customer: Customer,
-        document_id: str,
-        status: str,
-        *,
-        recipient: str | None = None,
-        error: str | None = None,
-        fallback: bool = False,
-        wamid: str | None = None,
-    ) -> SendOutcome:
-        # ``invoice_id``/``invoice_number`` carry the customer id and client
-        # number: the report's columns are named for the first pipeline, and every
-        # field is optional on the model, so a customer row reuses them rather
-        # than the report growing a parallel set. ``kind`` is what tells the two
-        # apart when the page is read back.
-        #
-        # ``issue_date`` is the account creation date, not an invoice date — for a
-        # welcome that is the more useful date anyway, since it is what makes a
-        # "new customer" claim checkable after the fact.
-        return SendOutcome(
-            app=app.name,
-            invoice_id=document_id,
-            invoice_number=customer.number,
-            customer_name=customer.customer_name,
-            customer_phone=recipient,
-            issue_date=customer.created,
-            status=status,
-            attempted_at=self._clock.now(),
-            error=error,
-            fallback=fallback,
-            wamid=wamid,
-            kind=KIND_CUSTOMER,
-        )
