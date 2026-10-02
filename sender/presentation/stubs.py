@@ -14,12 +14,38 @@ from sender.infrastructure.util import write_json_atomic
 log = logging.getLogger(__name__)
 
 
+def _phones_to_dict(phones) -> list:
+    """The document's phones as a JSON-friendly list, empties dropped."""
+    return [str(phone) for phone in phones if phone]
+
+
+def _phones_from_dict(data: dict) -> tuple[str, ...]:
+    """The document's phones, accepting the old single-value spelling too.
+
+    ``stub_invoices.json`` and its siblings are gitignored runtime artifacts that
+    live on developer machines across this change, so a fixture written before
+    multi-recipient delivery carries ``customer_phone`` and nothing else. Reading
+    it here means those files keep working — and keep sending — instead of
+    silently turning every stubbed document into a "no phone" skip, which is the
+    failure mode an offline rehearsal would hide.
+    """
+    phones = data.get("customer_phones")
+    if isinstance(phones, list):
+        return tuple(str(phone) for phone in phones if phone)
+    single = data.get("customer_phone")
+    return (str(single),) if single else ()
+
+
 def make_stub_invoice(**overrides) -> Invoice:
     defaults = {
         "id": "1",
         "number": "INV-001",
         "customer_name": "Ahmed Hassan",
-        "customer_phone": "01027693262",
+        # One number by default, because that is most customers and it keeps every
+        # existing rehearsal reading as "one message". Pass customer_phones=(a, b)
+        # for the two-number case; the fan-out and its resume-on-retry path are
+        # pinned by the tests that do.
+        "customer_phones": ("01027693262",),
         "status": "Unpaid",
         "currency": "EGP",
         "subtotal": Decimal("1500.00"),
@@ -48,7 +74,7 @@ def default_stub_invoices() -> tuple[Invoice, ...]:
             id="2",
             number="INV-002",
             customer_name="Mona Farouk",
-            customer_phone="01234567890",
+            customer_phones=("01234567890",),
             status="Partially Paid",
             subtotal=Decimal("3200.50"),
             total=Decimal("3200.50"),
@@ -61,7 +87,7 @@ def default_stub_invoices() -> tuple[Invoice, ...]:
             id="3",
             number="INV-003",
             customer_name="Nour Adel",
-            customer_phone=None,
+            customer_phones=(),
             status="Paid",
             subtotal=Decimal("750.25"),
             total=Decimal("750.25"),
@@ -78,7 +104,7 @@ def _invoice_to_dict(invoice: Invoice) -> dict:
         "id": invoice.id,
         "number": invoice.number,
         "customer_name": invoice.customer_name,
-        "customer_phone": invoice.customer_phone,
+        "customer_phones": _phones_to_dict(invoice.customer_phones),
         "status": invoice.status,
         "currency": invoice.currency,
         "subtotal": str(invoice.subtotal),
@@ -114,7 +140,7 @@ def _invoice_from_dict(data: dict) -> Invoice:
         id=str(data.get("id", "")),
         number=str(data.get("number", "")),
         customer_name=str(data.get("customer_name", "")),
-        customer_phone=data.get("customer_phone"),
+        customer_phones=_phones_from_dict(data),
         status=str(data.get("status", "Unknown")),
         currency=str(data.get("currency", "")),
         subtotal=Decimal(str(data.get("subtotal", "0"))),
@@ -206,7 +232,13 @@ class StubInvoiceSource:
                     "invoice_html_url": invoice.public_url,
                     "Client": {
                         "business_name": invoice.customer_name,
-                        "phone1": invoice.customer_phone or "",
+                        # Mirrors the real wire order on purpose: Daftra's ``phone2``
+                        # is the preferred field (the mapper reads it first), so the
+                        # primary stub number goes there. Putting it in ``phone1``
+                        # would make every rehearsal report the recipients in the
+                        # reverse order.
+                        "phone2": invoice.customer_phones[0] if invoice.customer_phones else "",
+                        "phone1": invoice.customer_phones[1] if len(invoice.customer_phones) > 1 else "",
                     },
                     "InvoiceItem": [
                         {
@@ -239,7 +271,7 @@ def make_stub_payment(**overrides) -> Payment:
         "id": "1",
         "number": "000001",
         "customer_name": "Ahmed Hassan",
-        "customer_phone": "01027693262",
+        "customer_phones": ("01027693262",),
         "status": "1",
         "currency": "EGP",
         "amount": Decimal("1500.00"),
@@ -264,7 +296,7 @@ def default_stub_payments() -> tuple[Payment, ...]:
             id="2",
             number="000002",
             customer_name="Mona Farouk",
-            customer_phone="01234567890",
+            customer_phones=("01234567890",),
             amount=Decimal("3200.50"),
             payment_date=date(2026, 9, 5),
             invoice_id="2",
@@ -274,7 +306,7 @@ def default_stub_payments() -> tuple[Payment, ...]:
             id="3",
             number="000003",
             customer_name="Nour Adel",
-            customer_phone=None,
+            customer_phones=(),
             amount=Decimal("750.25"),
             payment_date=date(2026, 9, 10),
             invoice_id="3",
@@ -287,7 +319,7 @@ def _payment_to_dict(payment: Payment) -> dict:
         "id": payment.id,
         "number": payment.number,
         "customer_name": payment.customer_name,
-        "customer_phone": payment.customer_phone,
+        "customer_phones": _phones_to_dict(payment.customer_phones),
         "status": payment.status,
         "currency": payment.currency,
         "amount": str(payment.amount),
@@ -303,7 +335,7 @@ def _payment_from_dict(data: dict) -> Payment:
         id=str(data.get("id", "")),
         number=str(data.get("number", "")),
         customer_name=str(data.get("customer_name", "")),
-        customer_phone=data.get("customer_phone"),
+        customer_phones=_phones_from_dict(data),
         status=str(data.get("status", "Unknown")),
         currency=str(data.get("currency", "")),
         amount=Decimal(str(data.get("amount", "0"))),
@@ -512,7 +544,7 @@ def make_stub_customer(**overrides) -> Customer:
         "id": "1",
         "number": "000001",
         "customer_name": "Print Home",
-        "customer_phone": "01027693262",
+        "customer_phones": ("01027693262",),
         "created": date(2026, 9, 24),
         "email": "",
         "type": "3",
@@ -539,7 +571,7 @@ def default_stub_customers() -> tuple[Customer, ...]:
             id="2",
             number="000002",
             customer_name="Mona Farouk",
-            customer_phone="01234567890",
+            customer_phones=("01234567890",),
             created=date(2026, 9, 28),
             type="2",
         ),
@@ -547,7 +579,7 @@ def default_stub_customers() -> tuple[Customer, ...]:
             id="3",
             number="000003",
             customer_name="Nour Adel",
-            customer_phone=None,
+            customer_phones=(),
             created=date(2026, 10, 1),
             type="2",
         ),
@@ -559,7 +591,7 @@ def _customer_to_dict(customer: Customer) -> dict:
         "id": customer.id,
         "number": customer.number,
         "customer_name": customer.customer_name,
-        "customer_phone": customer.customer_phone,
+        "customer_phones": _phones_to_dict(customer.customer_phones),
         "created": customer.created.isoformat() if customer.created else None,
         "email": customer.email,
         "type": customer.type,
@@ -574,7 +606,7 @@ def _customer_from_dict(data: dict) -> Customer:
         id=str(data.get("id", "")),
         number=str(data.get("number", "")),
         customer_name=str(data.get("customer_name", "")),
-        customer_phone=data.get("customer_phone"),
+        customer_phones=_phones_from_dict(data),
         created=date.fromisoformat(created) if created else None,
         email=str(data.get("email", "")),
         type=str(data.get("type", "")),
@@ -677,8 +709,8 @@ class StubCustomerSource:
                     "first_name": "",
                     "last_name": "",
                     "email": customer.email,
-                    "phone1": customer.customer_phone or "",
-                    "phone2": "",
+                    "phone2": customer.customer_phones[0] if customer.customer_phones else "",
+                    "phone1": customer.customer_phones[1] if len(customer.customer_phones) > 1 else "",
                     "country_code": "EG",
                     "created": customer.created.strftime("%Y-%m-%d 00:00:00")
                     if customer.created

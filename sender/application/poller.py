@@ -290,7 +290,7 @@ class DocumentPoller(Generic[TDoc, TSource]):
         that carry less than that in their listing rows override it; see
         :meth:`InvoicePoller._needs_detail`.
         """
-        return not doc.customer_phone
+        return not doc.customer_phones
 
     def _after_detail_fetch(self, app: PollApp, doc: TDoc) -> None:
         """Warn about a document the detail fetch still could not complete.
@@ -493,6 +493,16 @@ class DocumentPoller(Generic[TDoc, TSource]):
                         result["skipped_no_phone"] += 1
                     elif outcome["status"] == "abandoned":
                         result["abandoned"] += 1
+                    elif outcome["status"] == "deferred_by_cap":
+                        # The cap bit *between* this document's recipients rather
+                        # than between documents, so it got here having already
+                        # counted as new. It is still unseen and a later cycle will
+                        # finish it, which is exactly what the other cap-deferred
+                        # path means — so it is counted there and taken back out of
+                        # "new", rather than falling through to "failed" and
+                        # implying a delivery problem that does not exist.
+                        result["new"] -= 1
+                        result["deferred_by_cap"] += 1
                     else:
                         result["failed"] += 1
                 if not self._dry_run:
@@ -610,6 +620,57 @@ class DocumentPoller(Generic[TDoc, TSource]):
         """
         self._sends_this_cycle += 1
 
+    def _recipients(self, app: PollApp, doc: TDoc) -> tuple[str, ...]:
+        """The normalized, de-duplicated numbers this document must be sent to.
+
+        A document is addressed to a *set* of numbers: Daftra keeps two phone
+        fields on a client and either may be filled, so an invoice with both
+        filled goes out twice and one with a single filled field goes out once.
+        Order is preserved, so the most-preferred number is the first.
+
+        Normalization is repeated here even though the adapters already do it,
+        because this engine is written against a *port*: a source may hand over a
+        raw ``010…`` value (the offline stub deliberately does) and Meta rejects
+        an un-normalized number per recipient. Deduplication is repeated for the
+        same reason — two fields holding the same number must not become two
+        messages to one person.
+        """
+        recipients: list[str] = []
+        seen: set[str] = set()
+        for raw in doc.customer_phones:
+            if not raw:
+                continue
+            try:
+                phone = normalize_phone(raw, self._country_code)
+            except ValueError:
+                log.warning(
+                    "app %s: %s %s has an unusable WhatsApp phone (%r); it is "
+                    "skipped, and every remaining number still goes out",
+                    app.name, self._noun, self._label(doc), raw,
+                )
+                continue
+            if phone in seen:
+                continue
+            seen.add(phone)
+            recipients.append(phone)
+        return tuple(recipients)
+
+    def _remember_delivered(self, app: PollApp, document_id: str, recipients: list[str]) -> None:
+        """Persist the recipients reached, so a retry finishes only the rest.
+
+        Written at the *first* thing that leaves work outstanding — a failed
+        send, or the send cap biting between two recipients — and never on the
+        happy path, where ``mark_seen`` retires the document and clears it. That
+        keeps the common case at exactly one state write, which matters because
+        this file is rewritten on every mark.
+
+        Skipped on a dry run, which must leave the state file exactly as it found
+        it (invariant 2).
+        """
+        if self._dry_run or not recipients:
+            return
+        self._state.record_delivered(app.name, document_id, recipients)
+
     def _handle_document(self, app: PollApp, document_id: str, candidate: TDoc) -> dict:
         # A listing row is only used as-is when the pipeline says it can answer
         # everything the message depends on; otherwise the detail fetch supplies
@@ -630,8 +691,8 @@ class DocumentPoller(Generic[TDoc, TSource]):
                     app, self._label(candidate), document_id, None, exc, "fetch"
                 )
         self._after_detail_fetch(app, doc)
-        recipient = doc.customer_phone
-        if not recipient:
+        recipients = self._recipients(app, doc)
+        if not recipients:
             log.warning(
                 "app %s: %s %s has no usable WhatsApp phone; skipping%s",
                 app.name, self._noun, self._label(doc),
@@ -640,45 +701,141 @@ class DocumentPoller(Generic[TDoc, TSource]):
             if not self._dry_run:
                 self._state.mark_seen(app.name, document_id)
             return {"number": self._label(doc), "id": document_id, "status": "skipped_no_phone", "to": None}
-        try:
-            recipient = normalize_phone(recipient, self._country_code)
-        except ValueError:
-            log.warning(
-                "app %s: %s %s has an unusable WhatsApp phone (%r); skipping%s",
-                app.name, self._noun, self._label(doc), doc.customer_phone,
-                "" if self._dry_run else " and marking seen",
+        label = self._label(doc)
+        # A document half-delivered by an earlier cycle (a send failed, or the cap
+        # ran out, after the first recipient had already been reached) resumes with
+        # only the numbers that never got it. Skipping the delivered ones is the
+        # whole point of tracking them: a customer must not be told about the same
+        # invoice twice because the second number was briefly undeliverable.
+        already = self._state.delivered(app.name, document_id)
+        outstanding = [phone for phone in recipients if phone not in set(already)]
+        if not outstanding:
+            # Every number was reached on an earlier cycle; the only thing left was
+            # to retire it. Marking seen here is what stops this running forever.
+            log.info(
+                "app %s: %s %s was already delivered to all of its numbers (%s); "
+                "retiring it",
+                app.name, self._noun, label, ", ".join(recipients),
             )
             if not self._dry_run:
                 self._state.mark_seen(app.name, document_id)
-            return {"number": self._label(doc), "id": document_id, "status": "skipped_no_phone", "to": None}
+            return {
+                "number": label, "id": document_id, "status": "sent",
+                "to": already[0] if already else None, "delivered": list(already),
+                "dry_run": self._dry_run,
+            }
+        delivered: list[str] = []
+        fallbacks: list[tuple[str, str]] = []
+        for index, recipient in enumerate(outstanding):
+            if self._send_cap_reached():
+                # The cap is a throttle, not a decision about this document, so it
+                # stays unseen and the numbers it did reach are remembered for the
+                # cycle that finishes it. This is the one place the cap can land
+                # *between* recipients rather than between documents.
+                self._remember_delivered(app, document_id, already + delivered)
+                log.info(
+                    "app %s: per-run send cap reached after %d of %d recipients for "
+                    "%s %s; deferring %s to a later cycle (raise %s)",
+                    app.name, len(delivered), len(outstanding),
+                    self._noun, label, ", ".join(outstanding[index:]), self.CAP_ENV_VAR,
+                )
+                return {
+                    "number": label, "id": document_id, "status": "deferred_by_cap",
+                    "to": delivered[0] if delivered else None,
+                    "delivered": delivered, "remaining": outstanding[index:],
+                }
+            failure = self._deliver(app, doc, document_id, recipient, fallbacks)
+            if failure is not None:
+                # Only a *retryable* failure leaves the document coming back, so
+                # only then is a delivered record worth keeping: it is what stops
+                # the retry messaging a number that already got the document. A
+                # permanent failure has already retired the document via
+                # mark_seen, and writing a record after that would leave stale
+                # state behind for a document nobody will send again.
+                if failure.get("retryable"):
+                    self._remember_delivered(app, document_id, already + delivered)
+                failure["delivered"] = delivered
+                return failure
+            delivered.append(recipient)
+        # Every number reached it, so the document is retired — which also clears
+        # the delivered record, leaving nothing behind in the state file.
+        if not self._dry_run:
+            self._state.mark_seen(app.name, document_id)
+        if len(delivered) > 1:
+            log.info(
+                "app %s: sent %s %s to %d numbers (%s)",
+                app.name, self._noun, label, len(delivered), ", ".join(delivered),
+            )
+        else:
+            log.info("app %s: sent %s %s to %s", app.name, self._noun, label, delivered[0])
+        outcome = {
+            "number": label, "id": document_id, "status": "sent",
+            "to": delivered[0], "delivered": delivered, "dry_run": self._dry_run,
+        }
+        if fallbacks:
+            # The summary counts *documents* delivered this way, not recipients.
+            # The kind is reported only when every fallback agreed on it, since a
+            # document half-served by the document bridge and half by plain text is
+            # neither kind on its own.
+            kinds = {kind for _, kind in fallbacks}
+            outcome["fallback"] = True
+            outcome["fallback_kind"] = kinds.pop() if len(kinds) == 1 else "mixed"
+            outcome["error"] = "template rejected; delivered as a free-form message"
+        return outcome
+
+    def _deliver(
+        self,
+        app: PollApp,
+        doc: TDoc,
+        document_id: str,
+        recipient: str,
+        fallbacks: list[tuple[str, str]],
+    ) -> dict | None:
+        """Send the document to one recipient.
+
+        Returns ``None`` when the message went out (or would have, on a dry run),
+        or the failure outcome dict when it did not. The caller owns the
+        document-level bookkeeping — the ``mark_seen`` that retires the document
+        and the ``delivered`` record of who was reached — because only the caller
+        can see whether *every* recipient was served.
+
+        ``fallbacks`` collects ``(recipient, kind)`` pairs delivered by the
+        free-form bridge, so the caller can label the document once it knows the
+        whole picture.
+
+        A failure for one number never cancels the others already reached: a
+        document that reached one of its two numbers is delivered as far as it
+        got, and the caller resumes the remainder on a later cycle.
+        """
         try:
             payload = self._builder.build(doc, recipient)
         except _HANDLED_ERRORS as exc:
             log.error(
-                "app %s: building the payload for %s %s failed: %s",
-                app.name, self._noun, self._label(doc), exc,
+                "app %s: building the payload for %s %s to %s failed: %s",
+                app.name, self._noun, self._label(doc), recipient, exc,
             )
             return self._fail(app, self._label(doc), document_id, recipient, exc, "build")
         if self._dry_run:
             log.info(
                 "app %s: dry-run %s %s to %s", app.name, self._noun, self._label(doc), recipient
             )
-            return {
-                "number": self._label(doc), "id": document_id,
-                "status": "sent", "to": recipient, "dry_run": True,
-            }
+            return None
         if self._sender is None:
             return self._fail(
                 app, self._label(doc), document_id, recipient,
                 RuntimeError("WhatsApp credentials are not configured; cannot send."), "send", doc,
             )
         try:
+            # One unit of budget per POST, so a two-number document costs two and
+            # the cap keeps bounding what actually reaches Meta.
             self._budget_send()
             response = self._sender.send(payload)
         except _HANDLED_ERRORS as exc:
             if self._is_template_failure(exc):
                 if self._freeform_fallback:
-                    return self._send_freeform_fallback(app, doc, document_id, recipient, payload, exc)
+                    return self._send_freeform_fallback(
+                        app, doc, document_id, recipient, payload, exc, fallbacks
+                    )
                 log.error(
                     "app %s: %s %s template send failed with [code %s] and the "
                     "free-form fallback is disabled (WHATSAPP_FREEFORM_FALLBACK=off); the "
@@ -688,10 +845,9 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 )
                 return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
             return self._fail(app, self._label(doc), document_id, recipient, exc, "send", doc)
-        self._state.mark_seen(app.name, document_id)
         log.info("app %s: sent %s %s to %s", app.name, self._noun, self._label(doc), recipient)
         self._record(app, doc, document_id, SENT, recipient=recipient, wamid=_wamid(response))
-        return {"number": self._label(doc), "id": document_id, "status": "sent", "to": recipient}
+        return None
 
     def _is_template_failure(self, exc: Exception) -> bool:
         """Whether a failed send failed because the *template* is the problem.
@@ -729,7 +885,8 @@ class DocumentPoller(Generic[TDoc, TSource]):
         recipient: str,
         payload: dict,
         exc: Exception,
-    ) -> dict:
+        fallbacks: list[tuple[str, str]],
+    ) -> dict | None:
         """Deliver a template-rejected document as a free-form message.
 
         This is a *bridge*, not a normal path: the template is unusable because
@@ -743,6 +900,15 @@ class DocumentPoller(Generic[TDoc, TSource]):
         Failures here are recorded as retryable with the *template* error, never
         the fallback's: the template error is the one an operator can act on, and
         the document must come back once the template is fixed.
+
+        Returns ``None`` when the fallback message went out — reaching this
+        recipient, not finishing the document — and the failure outcome otherwise.
+        The caller owns the ``mark_seen`` and the free-form flag, because with more
+        than one recipient only the caller knows when the last one is done.
+
+        ``fallbacks`` collects ``(recipient, kind)`` for each number that went out
+        this way, because the *kind* (``document``/``text``) is known only here and
+        the document-level outcome has to report it.
         """
         code = _error_code(exc)
         log.warning(
@@ -785,7 +951,9 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 self._noun,
             )
             return self._fail_retryable(app, self._label(doc), document_id, recipient, exc, "send", doc)
-        self._state.mark_seen(app.name, document_id)
+        # Deliberately no ``mark_seen`` here: the caller decides whether the
+        # document is finished, and a document with a second number is not finished
+        # because one of them got its message.
         log.warning(
             "app %s: delivered %s %s to %s as a free-form %s message after the "
             "template send failed with [code %s]. Approve the template; free-form only "
@@ -796,15 +964,8 @@ class DocumentPoller(Generic[TDoc, TSource]):
             app, doc, document_id, SENT,
             recipient=recipient, error=str(exc), fallback=True, wamid=_wamid(response),
         )
-        return {
-            "number": self._label(doc),
-            "id": document_id,
-            "status": "sent",
-            "to": recipient,
-            "fallback": True,
-            "fallback_kind": kind,
-            "error": str(exc),
-        }
+        fallbacks.append((recipient, kind))
+        return None
 
     def _record(
         self,
@@ -943,7 +1104,7 @@ class InvoicePoller(DocumentPoller[Invoice, InvoiceSource]):
           empty. The detail fetch is the only way to get the rows, and one request
           per *sent* invoice is a price worth paying for a document that is not a lie.
         """
-        return not invoice.customer_phone or not invoice.items
+        return not invoice.customer_phones or not invoice.items
 
     def _after_detail_fetch(self, app: PollApp, invoice: Invoice) -> None:
         if invoice.items:

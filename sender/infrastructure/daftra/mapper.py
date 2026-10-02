@@ -34,6 +34,14 @@ PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
 #: is session-gated (it redirects to the login page without a browser session),
 #: which is why the sender renders its own copy instead of linking to it.
 PDF_URL_KEYS = ("invoice_pdf_url",)
+#: The phone fields Daftra keeps on a client, in preference order. ``phone1``
+#: and ``phone2`` are the two the ERP actually exposes; ``mobile``/``phone`` are
+#: older shapes seen in the wild. Every key is read as a *source of another
+#: recipient*, not as an ordered preference to stop at, so an account with two
+#: different numbers filled in is reachable on both. The invoice-level
+#: ``client_<key>`` spelling is the fallback for payloads that flatten the
+#: client onto the invoice.
+_PHONE_KEYS = ("phone2", "phone1", "mobile", "phone")
 
 #: Money Daftra can charge that this sender deliberately does not model — see
 #: :meth:`DaftraInvoiceMapper._warn_unmapped_money`. Listed so the gap is a
@@ -169,7 +177,7 @@ class DaftraInvoiceMapper:
             id=str(invoice.get("id", "")),
             number=self._number(invoice),
             customer_name=self._customer_name(invoice, client),
-            customer_phone=self._phone(self._customer_phone(invoice, client)),
+            customer_phones=self._customer_phones(invoice, client),
             status=self._status(invoice),
             currency=str(self._first(invoice, CURRENCY_KEYS) or ""),
             subtotal=self._money(self._first(invoice, SUBTOTAL_KEYS)),
@@ -307,12 +315,49 @@ class DaftraInvoiceMapper:
         joined = " ".join(str(part) for part in (first, last) if part).strip()
         return joined or "Customer"
 
-    def _customer_phone(self, invoice: dict, client: dict) -> str | None:
-        for key in ("phone2", "phone1", "mobile", "phone"):
-            value = self._first(client, (key,)) or self._first(invoice, (f"client_{key}",))
-            if value:
-                return str(value)
-        return None
+    def _customer_phones(self, invoice: dict, client: dict) -> tuple[str, ...]:
+        """Every distinct usable phone on the client, most-preferred first.
+
+        Daftra keeps two phone fields on a client and either may be filled, so
+        this collects **all** of them instead of picking one. ``phone2`` stays
+        first because that is the order the single-recipient mapper always used,
+        which keeps the primary recipient of an account whose two fields held the
+        same number unchanged.
+
+        Deduplication is on the *normalized* value, the only comparison that can
+        tell two entries for the same subscriber apart: an account whose
+        ``phone1`` is ``01027693262`` and whose ``phone2`` is ``+201027693262`` is
+        one person, and sending them the same invoice twice is worse than sending
+        it once. Two genuinely different numbers are both returned.
+
+        Empty fields are skipped silently — "the second phone is blank" is the
+        ordinary case, not a problem. A field that is *filled but unusable* warns
+        and names itself: with two fields to read, a silently dropped number is
+        indistinguishable from an invoice that never had a second phone, which is
+        exactly the ambiguity this method exists to remove.
+        """
+        phones: list[str] = []
+        seen: set[str] = set()
+        for key in _PHONE_KEYS:
+            raw = self._first(client, (key,))
+            if raw is None or raw == "":
+                raw = self._first(invoice, (f"client_{key}",))
+            if raw is None or raw == "":
+                continue
+            try:
+                phone = normalize_phone(raw, self._country_code)
+            except ValueError:
+                log.warning(
+                    "dropping the unusable phone %r in %r; it cannot be normalized "
+                    "and Meta would reject the send per recipient",
+                    raw, key,
+                )
+                continue
+            if phone in seen:
+                continue
+            seen.add(phone)
+            phones.append(phone)
+        return tuple(phones)
 
     def _status(self, invoice: dict) -> str:
         draft = self._first(invoice, ("draft",), default=False)
@@ -448,14 +493,6 @@ class DaftraInvoiceMapper:
         log.warning("unparseable invoice date %r; the PDF will show it as N/A", value)
         return None
 
-    def _phone(self, value) -> str | None:
-        if value is None or value == "":
-            return None
-        try:
-            return normalize_phone(value, self._country_code)
-        except ValueError:
-            return None
-
 
 class DaftraPaymentMapper(DaftraInvoiceMapper):
     """Translate ``/invoice_payments`` rows into :class:`Payment`.
@@ -494,7 +531,7 @@ class DaftraPaymentMapper(DaftraInvoiceMapper):
             # with an empty identifier.
             number=str(self._first(node, ("code",)) or node.get("id")),
             customer_name=self._customer_name(invoice, client),
-            customer_phone=self._phone(self._customer_phone(invoice, client)),
+            customer_phones=self._customer_phones(invoice, client),
             status=str(self._first(node, ("status",), default="Unknown") or "Unknown"),
             currency=str(self._first(node, CURRENCY_KEYS) or ""),
             amount=self._money(self._first(node, ("amount",))),
@@ -590,7 +627,7 @@ class DaftraCustomerMapper(DaftraInvoiceMapper):
     ``_customer_name(node, node)`` looks for ``client_business_name`` on the
     "invoice" side first, misses (a client row has no such key), and lands on
     ``business_name``/``first_name``/``last_name`` on the client side. Same for
-    ``_customer_phone``. Nothing about the policy differs per pipeline; only the
+    ``_customer_phones``. Nothing about the policy differs per pipeline; only the
     shape the data arrives in does.
     """
 
@@ -607,7 +644,7 @@ class DaftraCustomerMapper(DaftraInvoiceMapper):
             # ``client_number`` never yields an empty identifier.
             number=str(self._first(node, ("client_number", "code", "no")) or node.get("id")),
             customer_name=self._customer_name(node, node),
-            customer_phone=self._phone(self._customer_phone(node, node)),
+            customer_phones=self._customer_phones(node, node),
             created=self._date(self._first(node, ("created",))),
             email=str(self._first(node, ("email",), default="") or ""),
             # Carried, never acted on. See Customer.type for why.

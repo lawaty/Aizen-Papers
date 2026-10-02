@@ -18,7 +18,18 @@ class Invoice:
     id: str
     number: str
     customer_name: str
-    customer_phone: str | None = None
+#: Every distinct, already-normalized WhatsApp number this document should be
+    #: sent to, most-preferred first. Daftra keeps **two** phone fields on a
+    #: client (``phone1``/``phone2``) and either may be filled, so a document is
+    #: addressed to a *set* of numbers: both when both are usable, the one that
+    #: is when only one is. A single-value tuple is the ordinary case — one field
+    #: empty, or both fields holding the same number once normalized — and an
+    #: empty tuple means there is nowhere to send. Never index ``[0]``
+    #: unconditionally: senders iterate, and display code must handle the empty
+    #: case. The order is the Daftra field preference, unchanged from when this
+    #: was a single value, so the primary recipient of a document that always had
+    #: two identical numbers is still the same one.
+    customer_phones: tuple[str, ...] = ()
     status: str = "Unknown"
     currency: str = ""
     subtotal: Decimal = Decimal("0")
@@ -56,9 +67,11 @@ class Payment:
 
     The customer fields are the awkward part and are deliberately *not* on the
     payment itself: a Daftra payment row names no client and carries no phone, so
-    ``customer_name`` and ``customer_phone`` are filled in by the adapter from the
-    **linked invoice**, which is the only place the client record lives. A payment
-    whose invoice no longer resolves therefore arrives with no phone and is
+    ``customer_name`` and ``customer_phones`` are filled in by the adapter from the
+    **linked invoice**, which is the only place the client record lives — and which
+    means a payment inherits *both* of that client's phone fields, so a payment
+    reaches a customer on as many numbers as their invoice does. A payment whose
+    invoice no longer resolves therefore arrives with no phone at all and is
     skipped rather than guessed at.
     """
 
@@ -67,7 +80,18 @@ class Payment:
     #: number" the template body prints. Falls back to ``id`` when absent.
     number: str
     customer_name: str = ""
-    customer_phone: str | None = None
+#: Every distinct, already-normalized WhatsApp number this document should be
+    #: sent to, most-preferred first. Daftra keeps **two** phone fields on a
+    #: client (``phone1``/``phone2``) and either may be filled, so a document is
+    #: addressed to a *set* of numbers: both when both are usable, the one that
+    #: is when only one is. A single-value tuple is the ordinary case — one field
+    #: empty, or both fields holding the same number once normalized — and an
+    #: empty tuple means there is nowhere to send. Never index ``[0]``
+    #: unconditionally: senders iterate, and display code must handle the empty
+    #: case. The order is the Daftra field preference, unchanged from when this
+    #: was a single value, so the primary recipient of a document that always had
+    #: two identical numbers is still the same one.
+    customer_phones: tuple[str, ...] = ()
     #: Daftra's raw payment status (``"1"`` = completed), kept for logging only.
     status: str = "Unknown"
     currency: str = ""
@@ -88,7 +112,7 @@ class Customer:
     name and phone, so reaching this customer costs **one** request — there is no
     join to follow.
 
-    ``customer_name`` and ``customer_phone`` reuse the invoice field names on
+    ``customer_name`` and ``customer_phones`` reuse the invoice field names on
     purpose: the poller, the report and the templates all address "a customer"
     the same way regardless of which document kind surfaced it, which is what lets
     one engine drive all three pipelines.
@@ -102,7 +126,18 @@ class Customer:
     #: the welcome template greets the customer by name, and skipping a nameless
     #: client would mark it seen and silently lose the welcome forever.
     customer_name: str = ""
-    customer_phone: str | None = None
+#: Every distinct, already-normalized WhatsApp number this document should be
+    #: sent to, most-preferred first. Daftra keeps **two** phone fields on a
+    #: client (``phone1``/``phone2``) and either may be filled, so a document is
+    #: addressed to a *set* of numbers: both when both are usable, the one that
+    #: is when only one is. A single-value tuple is the ordinary case — one field
+    #: empty, or both fields holding the same number once normalized — and an
+    #: empty tuple means there is nowhere to send. Never index ``[0]``
+    #: unconditionally: senders iterate, and display code must handle the empty
+    #: case. The order is the Daftra field preference, unchanged from when this
+    #: was a single value, so the primary recipient of a document that always had
+    #: two identical numbers is still the same one.
+    customer_phones: tuple[str, ...] = ()
     #: When the account was created. Not used to decide who is new — the seen-set
     #: does that — but it is what makes a "new customer" claim checkable after the
     #: fact, so it is carried through to the report.

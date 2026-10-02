@@ -19,6 +19,12 @@ Per app the state records:
 - ``abandoned``: invoice ids given up after a permanent failure (validation,
   missing public_url, template rejection, self-send); each entry carries the
   attempt count and the last error so an operator can see and re-drive them;
+- ``delivered``: for a document with **more than one recipient** that was only
+  partly delivered (the first send succeeded and the second failed, or the send
+  cap ran out between them), the recipients it has already reached. Such a
+  document is deliberately left unseen so a later cycle finishes it, and this is
+  what stops that retry from messaging the first recipient again. Removed by
+  ``mark_seen``, so a fully-delivered document leaves nothing behind;
 - ``last_poll_at``: wall-clock timestamp of the last completed cycle.
 
 Concurrency: the CLI wraps a poll run in :class:`PollStateLock` (an advisory
@@ -74,6 +80,7 @@ class _PollStateBase:
             self._trim(entry)
         entry["pending"].pop(sid, None)
         entry["abandoned"].pop(sid, None)
+        entry["delivered"].pop(sid, None)
         self._maybe_save()
 
     def mark_many_seen(self, app_name: str, invoice_ids: list[str]) -> None:
@@ -86,6 +93,7 @@ class _PollStateBase:
         for sid in fresh:
             entry["pending"].pop(sid, None)
             entry["abandoned"].pop(sid, None)
+            entry["delivered"].pop(sid, None)
         self._maybe_save()
 
     def is_draining(self, app_name: str) -> bool:
@@ -118,6 +126,51 @@ class _PollStateBase:
 
     def abandoned(self, app_name: str) -> dict:
         return self._entry(app_name)["abandoned"]
+
+    def partly_delivered(self, app_name: str) -> dict:
+        """Every document that reached *some* of its numbers but not all.
+
+        The whole map, for ``poll-status``. A partly-delivered document is
+        deliberately in none of the other three buckets — it is not ``seen``
+        (because a number is still owed), not ``pending`` (nothing is retrying
+        right now) and not ``abandoned`` (it is not given up) — so without this
+        it is invisible to an operator looking at ``poll-status``, who would see
+        an empty state and wrongly conclude nothing is in flight.
+        """
+        return dict(self._entry(app_name)["delivered"])
+
+    def delivered(self, app_name: str, document_id: str) -> list[str]:
+        """Recipients a partly-delivered document has *already* reached.
+
+        A document can have more than one recipient (Daftra keeps two phone fields
+        on a client), so it can be half-delivered: one send succeeded and the
+        next failed, or the send cap ran out between them. Such a document is
+        deliberately left **unseen** so a later cycle finishes it — but without
+        this record the retry would send to the successful recipient a second
+        time, which is the one outcome worse than a delay.
+        """
+        value = self._entry(app_name)["delivered"].get(str(document_id))
+        return list(value) if isinstance(value, list) else []
+
+    def record_delivered(self, app_name: str, document_id: str, recipients: list[str]) -> None:
+        """Remember the recipients a document has reached, so a retry skips them.
+
+        Merged rather than replaced, because the set grows within a cycle and the
+        stored value may predate this cycle. Cleared by :meth:`mark_seen`, the only
+        thing that retires a document, so a fully-delivered document leaves
+        nothing behind.
+        """
+        entry = self._entry(app_name)
+        sid = str(document_id)
+        current = entry["delivered"].get(sid)
+        merged = list(current) if isinstance(current, list) else []
+        for recipient in recipients:
+            if recipient not in merged:
+                merged.append(recipient)
+        if merged:
+            entry["delivered"][sid] = merged
+            self._trim_dict(entry["delivered"])
+            self._maybe_save()
 
     def record_pending(
         self,
@@ -178,6 +231,8 @@ class _PollStateBase:
             removed = True
         if entry["abandoned"].pop(sid, None) is not None:
             removed = True
+        if entry["delivered"].pop(sid, None) is not None:
+            removed = True
         if removed:
             self._maybe_save()
 
@@ -202,7 +257,7 @@ class _PollStateBase:
         apps = self._data.setdefault("apps", {})
         entry = apps.get(app_name)
         if entry is None:
-            entry = {"seen": [], "pending": {}, "abandoned": {}, "last_poll_at": None}
+            entry = {"seen": [], "pending": {}, "abandoned": {}, "delivered": {}, "last_poll_at": None}
             apps[app_name] = entry
         if not isinstance(entry.get("seen"), list):
             entry["seen"] = []
@@ -210,6 +265,11 @@ class _PollStateBase:
             entry["pending"] = {}
         if not isinstance(entry.get("abandoned"), dict):
             entry["abandoned"] = {}
+        # A state file written before multi-recipient delivery has no "delivered"
+        # key at all; every document in it was single-recipient, so an absent map
+        # legitimately means "nothing partly delivered" rather than "lost".
+        if not isinstance(entry.get("delivered"), dict):
+            entry["delivered"] = {}
         entry.pop("failed", None)  # legacy field from the pre-classification state
         return entry
 

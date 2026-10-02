@@ -1,8 +1,72 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sender.domain.models import Customer, Invoice, Payment
 from sender.domain.ports import CustomerSource, InvoiceSource, MessageSender, PaymentSource
 from sender.domain.templates import InvoiceTemplateBuilder, TemplateBuilder
+
+
+def _recipients_for(doc, to_phone: str | None, *, noun: str, number: str) -> tuple[str, ...]:
+    """The numbers a manual send should go to, in order.
+
+    An explicit ``--to`` is a single recipient and stays exactly that: it is the
+    operator overriding the customer record, so honouring it literally is the
+    whole point. Otherwise the document's own phones are used — every one of
+    them, because Daftra keeps two fields on a client and either may be filled,
+    and a customer who gave the business two numbers asked to be reachable on
+    both.
+
+    Duplicates are collapsed here as well as in the adapter and the poller,
+    because two fields holding the same number must not become two messages to
+    one person.
+    """
+    if to_phone:
+        return (to_phone,)
+    recipients: list[str] = []
+    for phone in doc.customer_phones:
+        if phone and phone not in recipients:
+            recipients.append(phone)
+    if not recipients:
+        raise ValueError(
+            f"{noun} {number} has no valid WhatsApp phone on file "
+            "(missing or failed normalization); pass --to explicitly."
+        )
+    return tuple(recipients)
+
+
+def _fan_out(
+    sender: MessageSender,
+    recipients: Sequence[str],
+    payloads: Sequence[dict],
+    delivered: list[str],
+    *,
+    exclude: Sequence[str] = (),
+) -> tuple[list[str], list[dict], list[dict]]:
+    """POST one payload per recipient, returning what went out.
+
+    ``delivered`` accumulates the recipients Meta accepted and is what the
+    caller's ``delivered_recipients`` exposes. Each recipient is appended *after*
+    its own POST succeeds, so a failure part-way through leaves an accurate
+    record: the caller retries with those numbers excluded, which is the only way
+    a re-sent template cannot land twice on a customer who already got it.
+
+    The failing recipient is deliberately not appended — its message did not go
+    out, so the retry must include it.
+    """
+    skip = set(exclude)
+    sent: list[str] = []
+    sent_payloads: list[dict] = []
+    responses: list[dict] = []
+    for recipient, payload in zip(recipients, payloads):
+        if recipient in skip:
+            continue
+        response = sender.send(payload)
+        delivered.append(recipient)
+        sent.append(recipient)
+        sent_payloads.append(payload)
+        responses.append(response)
+    return sent, sent_payloads, responses
 
 
 class InvoiceNotificationService:
@@ -15,6 +79,21 @@ class InvoiceNotificationService:
         self._source = source
         self._sender = sender
         self._builder = builder
+        self._delivered: list[str] = []
+
+    @property
+    def builder(self):
+        return self._builder
+
+    @property
+    def delivered_recipients(self) -> tuple[str, ...]:
+        """The numbers the last send actually delivered to.
+
+        Read this in the ``except`` branch of a retry: it is how many of the
+        customer-facing sends already went out, so the retry excludes them rather
+        than messaging those customers a second time.
+        """
+        return tuple(self._delivered)
 
     @property
     def builder(self) -> InvoiceTemplateBuilder:
@@ -38,33 +117,66 @@ class InvoiceNotificationService:
         return self._builder.build(invoice, to_phone)
 
     def preview_invoice(self, invoice_id: int | str, to_phone: str | None = None, freeform: bool = False):
+        """The invoice, the numbers it goes to, and one payload per number.
+
+        Returns tuples rather than single values because the recipient count is a
+        property of the customer's record, not of the caller: an invoice whose
+        client has two filled phone fields has two payloads, and the builder runs
+        once per recipient because each payload carries that recipient's number.
+        """
         invoice = self.get_invoice(invoice_id)
-        recipient = to_phone or invoice.customer_phone
-        if not recipient:
-            raise ValueError(
-                f"Invoice {invoice.number} has no valid WhatsApp phone on file "
-                "(missing or failed normalization); pass --to explicitly."
-            )
+        recipients = _recipients_for(
+            invoice, to_phone, noun="Invoice", number=invoice.number
+        )
         builder_method = self._builder.build_text if freeform else self._builder.build
-        return invoice, recipient, builder_method(invoice, recipient)
+        return invoice, recipients, [builder_method(invoice, r) for r in recipients]
 
-    def send_invoice(self, invoice_id: int | str, to_phone: str | None = None, dry_run: bool = False) -> dict:
+    def send_invoice(
+        self,
+        invoice_id: int | str,
+        to_phone: str | None = None,
+        dry_run: bool = False,
+        *,
+        exclude: Sequence[str] = (),
+    ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        invoice, recipient, payload = self.preview_invoice(invoice_id, to_phone)
+        invoice, recipients, payloads = self.preview_invoice(invoice_id, to_phone)
         if dry_run:
-            return {"dry_run": True, "invoice": invoice, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"invoice": invoice, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "invoice": invoice,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered, exclude=exclude
+        )
+        return {
+            "invoice": invoice, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }
 
-    def send_freeform(self, invoice_id: int | str, to_phone: str | None = None, dry_run: bool = False) -> dict:
+    def send_freeform(
+        self, invoice_id: int | str, to_phone: str | None = None, dry_run: bool = False
+    ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        invoice, recipient, payload = self.preview_invoice(invoice_id, to_phone, freeform=True)
+        invoice, recipients, payloads = self.preview_invoice(
+            invoice_id, to_phone, freeform=True
+        )
         if dry_run:
-            return {"dry_run": True, "invoice": invoice, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"invoice": invoice, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "invoice": invoice,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered
+        )
+        return {
+            "invoice": invoice, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }
 
 
 class PaymentNotificationService:
@@ -86,6 +198,16 @@ class PaymentNotificationService:
         self._source = source
         self._sender = sender
         self._builder = builder
+        self._delivered: list[str] = []
+
+    @property
+    def builder(self):
+        return self._builder
+
+    @property
+    def delivered_recipients(self) -> tuple[str, ...]:
+        """The numbers the last send actually delivered to (see the invoice service)."""
+        return tuple(self._delivered)
 
     @property
     def builder(self) -> TemplateBuilder:
@@ -107,37 +229,51 @@ class PaymentNotificationService:
         self, payment_id: int | str, to_phone: str | None = None, freeform: bool = False
     ):
         payment = self.get_payment(payment_id)
-        recipient = to_phone or payment.customer_phone
-        if not recipient:
-            raise ValueError(
-                f"Payment {payment.number} has no valid WhatsApp phone on file "
-                "(the payer is read from the linked invoice, which may have no "
-                "number); pass --to explicitly."
-            )
+        # A payment's phones come from the *linked invoice's* client, so it carries
+        # both of that client's numbers exactly as the invoice does.
+        recipients = _recipients_for(payment, to_phone, noun="Payment", number=payment.number)
         builder_method = self._builder.build_text if freeform else self._builder.build
-        return payment, recipient, builder_method(payment, recipient)
+        return payment, recipients, [builder_method(payment, r) for r in recipients]
 
     def send_payment(
         self, payment_id: int | str, to_phone: str | None = None, dry_run: bool = False
     ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        payment, recipient, payload = self.preview_payment(payment_id, to_phone)
+        payment, recipients, payloads = self.preview_payment(payment_id, to_phone)
         if dry_run:
-            return {"dry_run": True, "payment": payment, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"payment": payment, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "payment": payment,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered
+        )
+        return {
+            "payment": payment, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }
 
     def send_freeform(
         self, payment_id: int | str, to_phone: str | None = None, dry_run: bool = False
     ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        payment, recipient, payload = self.preview_payment(payment_id, to_phone, freeform=True)
+        payment, recipients, payloads = self.preview_payment(payment_id, to_phone, freeform=True)
         if dry_run:
-            return {"dry_run": True, "payment": payment, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"payment": payment, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "payment": payment,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered
+        )
+        return {
+            "payment": payment, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }
 
 
 class CustomerNotificationService:
@@ -162,6 +298,16 @@ class CustomerNotificationService:
         self._source = source
         self._sender = sender
         self._builder = builder
+        self._delivered: list[str] = []
+
+    @property
+    def builder(self):
+        return self._builder
+
+    @property
+    def delivered_recipients(self) -> tuple[str, ...]:
+        """The numbers the last send actually delivered to (see the invoice service)."""
+        return tuple(self._delivered)
 
     @property
     def builder(self) -> TemplateBuilder:
@@ -183,33 +329,48 @@ class CustomerNotificationService:
         self, customer_id: int | str, to_phone: str | None = None, freeform: bool = False
     ):
         customer = self.get_customer(customer_id)
-        recipient = to_phone or customer.customer_phone
-        if not recipient:
-            raise ValueError(
-                f"Customer {customer.number} has no valid WhatsApp phone on file; "
-                "pass --to explicitly."
-            )
+        # A client row carries both of its own phone fields, so a welcome can go
+        # to both numbers without the customer record being consulted twice.
+        recipients = _recipients_for(customer, to_phone, noun="Customer", number=customer.number)
         builder_method = self._builder.build_text if freeform else self._builder.build
-        return customer, recipient, builder_method(customer, recipient)
+        return customer, recipients, [builder_method(customer, r) for r in recipients]
 
     def send_customer(
         self, customer_id: int | str, to_phone: str | None = None, dry_run: bool = False
     ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        customer, recipient, payload = self.preview_customer(customer_id, to_phone)
+        customer, recipients, payloads = self.preview_customer(customer_id, to_phone)
         if dry_run:
-            return {"dry_run": True, "customer": customer, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"customer": customer, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "customer": customer,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered
+        )
+        return {
+            "customer": customer, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }
 
     def send_freeform(
         self, customer_id: int | str, to_phone: str | None = None, dry_run: bool = False
     ) -> dict:
         if self._sender is None:
             raise RuntimeError("WhatsApp credentials are not configured; cannot send.")
-        customer, recipient, payload = self.preview_customer(customer_id, to_phone, freeform=True)
+        customer, recipients, payloads = self.preview_customer(customer_id, to_phone, freeform=True)
         if dry_run:
-            return {"dry_run": True, "customer": customer, "payload": payload, "to": recipient}
-        response = self._sender.send(payload)
-        return {"customer": customer, "payload": payload, "response": response, "to": recipient}
+            return {
+                "dry_run": True, "customer": customer,
+                "recipients": list(recipients), "payloads": payloads,
+            }
+        self._delivered = []
+        sent, sent_payloads, responses = _fan_out(
+            self._sender, recipients, payloads, self._delivered
+        )
+        return {
+            "customer": customer, "recipients": sent,
+            "payloads": sent_payloads, "responses": responses,
+        }

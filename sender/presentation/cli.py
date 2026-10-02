@@ -386,6 +386,29 @@ def _is_auto_builder(args: argparse.Namespace, settings: Settings) -> bool:
     return mode == "auto"
 
 
+def _print_fan_out(result: dict, *, doc_key: str, label: str) -> None:
+    """Print one line per recipient a send actually reached.
+
+    How many numbers a document goes to is a property of the customer's record,
+    not of the command: an invoice whose client has two filled phone fields
+    produces two lines. Printing a single "sent" would under-report what reached
+    customers, which is the one thing an operator running ``send`` by hand is
+    checking.
+    """
+    recipients = result.get("recipients") or []
+    payloads = result.get("payloads") or []
+    responses = result.get("responses") or []
+    if result.get("dry_run"):
+        for payload in payloads:
+            print(json.dumps(payload, indent=2))
+        return
+    number = getattr(result.get(doc_key), "number", "?")
+    for index, recipient in enumerate(recipients):
+        response = responses[index] if index < len(responses) else None
+        wamid = ((response or {}).get("messages") or [{}])[0].get("id", "?")
+        print(f"Sent {label} {number} to {recipient} (wamid: {wamid})")
+
+
 def _send_template_with_retry(
     service: InvoiceNotificationService, args: argparse.Namespace, settings: Settings
 ) -> dict:
@@ -408,7 +431,12 @@ def _send_template_with_retry(
         if isinstance(alternate, current.__class__):
             raise
         service.swap_builder(alternate)
-        return service.send_invoice(args.invoice_id, to_phone=args.to)
+        # Whatever the first attempt already delivered to is excluded. A template
+        # rejection on the *second* number must not cost the first customer a
+        # duplicate invoice, which is what retrying a fan-out without this does.
+        return service.send_invoice(
+            args.invoice_id, to_phone=args.to, exclude=service.delivered_recipients
+        )
 
 
 def _add_attachment_argument(parser: argparse.ArgumentParser, note: str = "") -> None:
@@ -434,7 +462,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     send = sub.add_parser("send", help="Fetch an invoice and send it on WhatsApp")
     send.add_argument("--invoice-id", required=True, help="Daftra invoice id")
-    send.add_argument("--to", help="Recipient phone number (defaults to the customer phone on the invoice)")
+    send.add_argument(
+        "--to",
+        help=(
+            "Send to this number only. By default the message goes to *every* number "
+            "on the invoice's client — Daftra keeps two phone fields and either may be filled."
+        ),
+    )
     send.add_argument("--dry-run", action="store_true", help="Print the payload without calling Meta")
     send.add_argument("--freeform", action="store_true", help="Send as plain text instead of template (for layout testing)")
     send.add_argument("--invoice-stub", action="store_true", help="Use the offline stub invoice source instead of Daftra")
@@ -444,7 +478,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     preview = sub.add_parser("preview", help="Print the WhatsApp payload without sending")
     preview.add_argument("--invoice-id", required=True, help="Daftra invoice id")
-    preview.add_argument("--to", help="Recipient phone number (defaults to the customer phone on the invoice)")
+    preview.add_argument(
+        "--to",
+        help=(
+            "Preview for this number only. By default every number on the invoice's "
+            "client is previewed, one payload each."
+        ),
+    )
     preview.add_argument("--freeform", action="store_true", help="Preview as plain text instead of template")
     preview.add_argument("--invoice-stub", action="store_true", help="Use the offline stub invoice source instead of Daftra")
     preview.add_argument("--meta-stub", action="store_true", help="Do not call Meta at all: capture the payloads instead of sending them. Needed for a fully offline rehearsal")
@@ -485,7 +525,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     send_payment = sub.add_parser("send-payment", help="Fetch a payment and send its confirmation on WhatsApp")
     send_payment.add_argument("--payment-id", required=True, help="Daftra payment id")
-    send_payment.add_argument("--to", help="Recipient phone number (defaults to the payer on the linked invoice)")
+    send_payment.add_argument(
+        "--to",
+        help=(
+            "Send to this number only. By default the message goes to every number on "
+            "the payer's client, read from the linked invoice."
+        ),
+    )
     send_payment.add_argument("--dry-run", action="store_true", help="Print the payload without calling Meta")
     send_payment.add_argument("--freeform", action="store_true", help="Send as plain text instead of template (for layout testing)")
     send_payment.add_argument("--payment-stub", action="store_true", help="Use the offline stub payment source instead of Daftra")
@@ -514,7 +560,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     send_customer = sub.add_parser("send-customer", help="Fetch a customer and send its welcome on WhatsApp")
     send_customer.add_argument("--customer-id", required=True, help="Daftra client id")
-    send_customer.add_argument("--to", help="Recipient phone number (defaults to the client on file)")
+    send_customer.add_argument(
+        "--to",
+        help=(
+            "Send to this number only. By default the welcome goes to every number "
+            "on the client record."
+        ),
+    )
     send_customer.add_argument("--dry-run", action="store_true", help="Print the payload without calling Meta")
     send_customer.add_argument("--freeform", action="store_true", help="Send as plain text instead of template (for layout testing)")
     send_customer.add_argument("--customer-stub", action="store_true", help="Use the offline stub customer source instead of Daftra")
@@ -687,6 +739,23 @@ def _format_poll_summary(summary: dict) -> str:
                 lines.append(f"  {invoice['number']} skipped (no usable phone)")
             elif invoice["status"] == "pending":
                 lines.append(f"  {invoice['number']} deferred (retryable failure, backoff)")
+            elif invoice["status"] == "deferred_by_cap":
+                # Not a failure and must not read as one: nothing went wrong, the
+                # per-run send cap simply ran out. Reporting it as "failed" would
+                # tell an operator a message was lost when it is queued for the
+                # next cycle, which is the reading that sends someone hunting for
+                # a delivery problem that does not exist.
+                reached = invoice.get("delivered") or []
+                remaining = invoice.get("remaining") or []
+                detail = ""
+                if reached or remaining:
+                    detail = (
+                        f" (reached {','.join(reached) or '-'};"
+                        f" still to send {','.join(remaining) or '-'})"
+                    )
+                lines.append(
+                    f"  {invoice['number']} deferred (per-run send cap){detail}"
+                )
             elif invoice["status"] == "abandoned":
                 lines.append(f"  {invoice['number']} abandoned (permanent failure)")
             else:
@@ -1138,6 +1207,18 @@ def _run_poll_status(args: argparse.Namespace, settings: Settings) -> int:
                     f"    {noun} {sid} ({rec.get('action')}): {rec.get('error')} "
                     f"(attempt {rec.get('count')})"
                 )
+        # A partly-delivered document is in none of the three buckets above, so
+        # without this an operator would see an empty state and conclude nothing
+        # is in flight, while a customer is still owed a message on a second
+        # number.
+        partial = state.partly_delivered(name)
+        if partial:
+            print(
+                f"  partly delivered (some numbers reached, finishing on a later "
+                f"cycle): {len(partial)}"
+            )
+            for sid, reached in sorted(partial.items()):
+                print(f"    {noun} {sid}: already reached {', '.join(reached)}")
         print(f"  last_poll_at: {_format_timestamp(last)}")
     return 0
 
@@ -1324,17 +1405,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 else:
                     result = _send_template_with_retry(service, args, settings)
-                if result.get("dry_run"):
-                    print(json.dumps(result["payload"], indent=2))
-                else:
-                    wamid = ((result.get("response") or {}).get("messages") or [{}])[0].get("id", "?")
-                    print(
-                        f"Sent invoice {result['invoice'].number} to {result['to']} "
-                        f"(wamid: {wamid})"
-                    )
+                _print_fan_out(result, doc_key="invoice", label="invoice")
             elif args.command == "preview":
-                _, recipient, payload = service.preview_invoice(args.invoice_id, args.to, freeform=args.freeform)
-                print(json.dumps(payload, indent=2))
+                _, recipients, payloads = service.preview_invoice(
+                    args.invoice_id, args.to, freeform=args.freeform
+                )
+                for payload in payloads:
+                    print(json.dumps(payload, indent=2))
             elif args.command == "show":
                 if args.raw:
                     print(json.dumps(service.get_raw_invoice(args.invoice_id), indent=2))
@@ -1368,16 +1445,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             args.payment_id, to_phone=args.to, dry_run=dry_run
                         )
                     )
-                    if result.get("dry_run"):
-                        print(json.dumps(result["payload"], indent=2))
-                    else:
-                        wamid = (
-                            (result.get("response") or {}).get("messages") or [{}]
-                        )[0].get("id", "?")
-                        print(
-                            f"Sent payment {result['payment'].number} to {result['to']} "
-                            f"(wamid: {wamid})"
-                        )
+                    _print_fan_out(result, doc_key="payment", label="payment")
                 elif args.command == "show-payment":
                     if args.raw:
                         print(
@@ -1419,16 +1487,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             args.customer_id, to_phone=args.to, dry_run=dry_run
                         )
                     )
-                    if result.get("dry_run"):
-                        print(json.dumps(result["payload"], indent=2))
-                    else:
-                        wamid = (
-                            (result.get("response") or {}).get("messages") or [{}]
-                        )[0].get("id", "?")
-                        print(
-                            f"Sent customer {result['customer'].number} to {result['to']} "
-                            f"(wamid: {wamid})"
-                        )
+                    _print_fan_out(result, doc_key="customer", label="customer")
                 elif args.command == "show-customer":
                     if args.raw:
                         print(
@@ -1446,7 +1505,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         # pretending the row is deliverable.
                         print(
                             f"{customer.number:<10} {customer.customer_name:<28} "
-                            f"{customer.customer_phone or '-':<16} "
+                            f"{','.join(customer.customer_phones) or '-':<16} "
                             f"since {customer.created or '-'}"
                         )
     except (ApiError, ValueError, RuntimeError, OSError) as exc:
