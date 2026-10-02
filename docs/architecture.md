@@ -135,10 +135,11 @@ sequenceDiagram
                 P->>S: mark_many_seen(ids)  # seed, send nothing
             else
                 loop for each new invoice
-                    alt list row has no phone
+                    alt row is missing the phone or the items
+                        note the listing never carries InvoiceItem
                         P->>D: get_invoice(id)
                         D->>ERP: GET /invoices/{id}.json
-                        ERP-->>D: Invoice + Client (authoritative phone)
+                        ERP-->>D: Invoice + Client + InvoiceItem[]
                     end
                     alt no usable phone
                         P->>S: mark_seen(id)  # skip, never retried

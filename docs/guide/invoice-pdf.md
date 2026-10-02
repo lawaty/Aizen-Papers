@@ -190,6 +190,29 @@ customer name: U+4E2D U+6587 U+1F600; the PDF shows the text without them
 Arabic itself never warns: every Arabic letter in the invoice is drawn, shaped
 and joined.
 
+### An invoice with a total and no products
+
+The empty items table is a designed state, so it renders (`لا توجد بنود في هذه
+الفاتورة`) rather than fails. But an invoice that has a **non-zero total** and
+no rows is never what was meant, and the document is a statement of what the
+customer is being billed for — so it warns:
+
+```
+WARNING invoice PDF: invoice 000002 totals 105,000.00 but carries no line
+items; the document will state that the invoice has no products. This is what a
+Daftra list row (GET /invoices.json) produces on its own — it carries no
+InvoiceItem, so the invoice must be re-fetched from GET /invoices/{id}.json
+before rendering.
+```
+
+The most common cause is rendering an invoice that came from the **listing**
+endpoint rather than the detail endpoint. `GET /invoices.json` embeds no
+`InvoiceItem`, so a row from it has nothing to draw. The poller re-fetches the
+detail before it sends, so this warning appearing in production means that path
+was bypassed — check `sender/application/poller.py::_needs_detail` before
+suspecting the mapper. The check is deliberately narrow (a zero total stays
+quiet), so a genuinely empty invoice does not cry wolf on every send.
+
 ## Checking a PDF by hand
 
 The writer is hand-rolled, so the output is worth inspecting rather than

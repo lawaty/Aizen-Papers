@@ -65,7 +65,10 @@ docs/
 │   ├── getting-started.md       ← install, configure, run
 │   ├── template-contract.md     ← the aizen_invoice template & variable mapping
 │   ├── invoice-pdf.md           ← how the invoice PDF is attached
-│   └── delivery-status.md       ← webhook setup, 200-wamid trap, error codes
+│   ├── payments.md              ← the payments pipeline (aizen_new_payment)
+│   ├── customers.md             ← the welcome pipeline (aizen_new_customer)
+│   ├── delivery-status.md       ← webhook setup, 200-wamid trap, error codes
+│   └── reporting.md             ← the HTML send report & how to serve it safely
 └── layers/
     ├── domain.md                ← domain layer (pure, no dependencies)
     ├── application.md           ← application/use-case layer
@@ -80,7 +83,10 @@ docs/
 - [Guides — getting started](guide/getting-started.md)
 - [Guides — WhatsApp template contract](guide/template-contract.md)
 - [Guides — invoice PDF attachment](guide/invoice-pdf.md)
+- [Guides — payments pipeline](guide/payments.md)
+- [Guides — customers pipeline](guide/customers.md)
 - [Guides — delivery status & webhook](guide/delivery-status.md)
+- [Guides — send reports](guide/reporting.md)
 - [Layers — domain](layers/domain.md)
 - [Layers — application](layers/application.md)
 - [Layers — infrastructure](layers/infrastructure.md)

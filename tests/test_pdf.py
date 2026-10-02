@@ -496,6 +496,23 @@ def test_item_names_are_truncated_to_their_column() -> None:
     assert "..." in text
 
 
+def test_an_over_wide_quantity_is_drawn_in_full_rather_than_truncated() -> None:
+    """A quantity is a figure, so it gets money's policy: overflow, never ellipsis.
+
+    It used to be the one numeric field routed through ``_fit``, so a quantity
+    too wide for its 46pt column was silently shortened — ``99999999999`` reached
+    the customer as ``9999999...``. Money has never been treated that way, because
+    a truncated amount is a wrong amount.
+    """
+    quantity = Decimal("99999999999")
+    pdf = render_invoice_pdf(
+        make_invoice(items=(InvoiceItem(name="Roll", quantity=quantity, unit_price=Decimal("1"), total=quantity),))
+    )
+    text = stream_text(pdf)
+    assert "99999999999" in text
+    assert "..." not in text
+
+
 def test_parentheses_and_backslashes_are_escaped() -> None:
     """``(``/``)``/``\\`` are structural inside a PDF string literal.
 
@@ -682,6 +699,37 @@ def test_arabic_renders_without_a_warning(caplog) -> None:
         pdf = render_invoice_pdf(arabic_invoice())
     assert caplog.records == []
     assert pdf.startswith(b"%PDF-1.4")
+
+
+def test_a_totalled_invoice_with_no_line_items_is_reported(caplog) -> None:
+    """The empty-items state is designed, so it renders — but a *totalled* invoice
+    with no rows is the signature of an invoice that was never re-fetched from the
+    detail endpoint, and the document says so to the customer. It must never reach
+    a customer unremarked.
+    """
+    with caplog.at_level("WARNING"):
+        pdf = render_invoice_pdf(make_invoice(items=()))
+    assert "no line items" in caplog.text
+    assert "INV-042" in caplog.text
+    assert pdf.startswith(b"%PDF-1.4")
+
+
+def test_an_untouched_invoice_with_nothing_on_it_is_not_reported(caplog) -> None:
+    """The narrow case has to stay quiet, or the warning is noise nobody reads.
+
+    No rows *and* nothing charged is the legitimate version of the same state.
+    """
+    with caplog.at_level("WARNING"):
+        render_invoice_pdf(
+            make_invoice(
+                items=(),
+                subtotal=Decimal("0"),
+                total=Decimal("0"),
+                total_paid=Decimal("0"),
+                balance_due=Decimal("0"),
+            )
+        )
+    assert caplog.records == []
 
 
 def test_a_character_neither_font_can_draw_is_replaced_and_reported(caplog) -> None:

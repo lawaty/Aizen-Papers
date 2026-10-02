@@ -1,11 +1,11 @@
 # Decisions
 
 **The canonical decision log for this project is
-[`docs/design.md`](../../docs/design.md)** — 10 numbered rationales (layered DDD,
+[`docs/design.md`](../../docs/design.md)** — 11 numbered rationales (layered DDD,
 external truth stays external, template builder, phone normalization, safe by
 default, Meta constraints, minimalism, hand-rolled PDF, attachment-as-port, the
-poller). Read it before proposing an architectural change, and add to it rather
-than duplicating here.
+poller, the second payments pipeline). Read it before proposing an architectural
+change, and add to it rather than duplicating here.
 
 This file records only decisions **not** already in `docs/design.md`.
 
@@ -140,9 +140,90 @@ regeneration is idempotent so a manual run racing a cycle is harmless. The
 generated `.htaccess` blocks `*.jsonl` and listings — that is not access control;
 the pages still belong behind `.htpasswd` or outside the docroot.
 
+The second consequence of *one* audit trail is that the renderer must stay
+**kind-neutral**: every pipeline lands in the same day pages, so a column header
+cannot claim "Invoice #" and each row says which kind it is (`SendOutcome.kind`
+badge). Adding a pipeline therefore obliges no schema change — but reverting the
+neutral headers to invoice wording is what would make a mixed day lie.
+
 ---
 
-## Known documentation drift (found 2026-09-30 and 2026-10-01, not yet fixed)
+## 8. A customer-facing document is never built from a partially-populated row
+
+Daftra's listing endpoint returns no `InvoiceItem` (see `contexts.md` § 7). The
+poller re-fetches the invoice detail whenever a candidate row cannot answer both
+"where is this going" and "what is on the invoice", and **a failed detail fetch
+fails the send** rather than proceeding with what it has. The PDF writer
+independently warns on a totalled invoice with no rows.
+
+*Why:* this was a deliberate change, not a bug fix. The poller originally treated
+the list row as authoritative because the message was text only and the two
+payloads were identical. That equivalence broke the moment the template grew a
+header document — the document is this sender's *own rendered PDF* — so the same
+data gap that produced an identical text message began producing a PDF whose
+items table tells the customer their invoice is empty. It generalizes: a source
+row's completeness requirement is a function of what the payload does with it, so
+adding a document to the template obliges the poller to fetch more.
+
+*Consequence:* do not relax `_needs_detail` back to a phone check, and do not
+"optimize" it into an origin check ("did this come from a listing?"). Skipping
+the fetch is the one change that makes the sender state something false. The cost
+is bounded: the fetch sits inside `_handle_document`, which the send cap already
+gated, so Daftra read traffic scales with invoices sent, not with the page size.
+Note this decision is **not** in `docs/design.md` — the layer walkthroughs
+describe the rule but the log records no rationale.
+
+---
+
+## 9. Stubbing the source and stubbing the sender are different flags
+
+`--invoice-stub` / `--payment-stub` replace the **Daftra source** with a fixture.
+`--meta-stub` replaces the **Meta sender** with `StubMessageSender`, which captures
+payloads instead of sending them. They are independent, and only the second one
+makes a rehearsal safe.
+
+*Why:* a stubbed source says nothing about the sender, so `--payment-stub` (or
+the older `--stub`) alone reads fixture data and then **really messages whoever
+the fixture names**. The obvious single `--stub` flag makes "offline" mean two
+different things depending on which half you look at, and the failure mode is a
+real customer receiving a fixture's message. Splitting the flags makes the safe
+rehearsal an explicit, visible choice: `--payment-stub --meta-stub --dry-run`.
+
+*Consequence:* do not fold the sender stub back into a source stub, and do not
+treat `--meta-stub` as implying the others. It is also what makes a rehearsal run
+on a machine with no credentials at all — `cli.py` gates `need_whatsapp` on
+`not meta_stub`. The rationale is stated only in
+[`docs/guide/payments.md`](../../docs/guide/payments.md) § *Rehearsing offline*,
+not in `docs/design.md`.
+
+---
+
+## 10. The Daftra mapper warns far more than it raises, and leaves tax unmapped on purpose
+
+Tax, discount and deposit are **deliberately not modelled** — `Invoice` has no
+field for them and the PDF totals block has no row — but their presence is
+**warned** about (`_warn_unmapped_money`). Everywhere else the rule has the same
+shape: an **absent** value warns and renders a default; a **present but
+unparseable** money value still raises.
+
+*Why:* a `ValueError` escaping the mapper reaches the poller, which classifies it
+**permanent** and would retire a real invoice the first time a tenant sends a shape
+it has never seen — over a field that does not even reach the customer's document.
+Daftra also uses `null` for "not applicable" money, so raising on absence would fire
+on ordinary invoices. Silence is not acceptable either: the mapper is the only
+layer that ever sees the raw payload, so money present in it and absent from the
+PDF with nobody told is unrecoverable. The warning is a tripwire that fires the day
+a tenant enables VAT.
+
+*Consequence:* do not map tax/discount/deposit "while you're there" — that is a
+feature built against a schema no account currently sends. Do not silence
+`_warn_unmapped_money`, and do not replace `_is_money_present` with a truthiness
+test (Daftra sends `deposit: "0"`, so a bare test warns on the whole ledger and
+trains the operator to ignore it). Pinned by `tests/test_daftra_mapper.py`.
+
+---
+
+## Known documentation drift (found 2026-09-30, rechecked 2026-10-01, 2026-10-02 and 2026-10-03)
 
 These contradict current production state; source and `HANDOFF-deploy.md` win.
 
@@ -162,11 +243,13 @@ These contradict current production state; source and `HANDOFF-deploy.md` win.
   payload codes `4`/`80007`/`130429`/`131056`, which arrive as HTTP 400, and
   treats `131047`/`131048`/`131049` as permanently non-retryable quality signals.
   The decision log needs a clause; the source is authoritative.
-- `docs/guide/rate-limits.md` and `docs/guide/reporting.md` are cited from
-  `poller.py` and `infrastructure/reporting.py` **but do not exist**.
-- The 7 new env knobs (`POLL_MAX_SENDS_PER_RUN`, `REPORT_*`) are absent from
-  `.env.example` and `docs/guide/getting-started.md`.
-- `reports/` and `reports.stub/` are untracked but **not** in `.gitignore`, unlike
-  every other runtime artifact; they hold customer PII.
-- The send-report subsystem has no `tests/test_reporting.py`; rendering,
-  retention and the `.htaccess` are unverified.
+- `poller.py:159` still cites `docs/guide/rate-limits.md`, which **does not
+  exist**. (`docs/guide/reporting.md`, cited the same way from
+  `infrastructure/reporting.py`, now does exist.)
+- `docs/layers/infrastructure.md` § mapper still describes only the **invoice**
+  path: `DaftraPaymentMapper` / `DaftraCustomerMapper` and every tripwire
+  (`_warn_unmapped_money`, the absent-item and unparseable-date warnings, the
+  exponent guard) are undocumented there. Read the mapper source and
+  `contexts.md` § 7, not that section. See § 10.
+- The `POLL_MAX_SENDS_PER_RUN` and `REPORT_*` knobs are now in `.env.example`
+  but still absent from `docs/guide/getting-started.md` § *Configure*.

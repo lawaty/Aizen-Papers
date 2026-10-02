@@ -86,13 +86,26 @@ InvoicePoller(apps, sender, builder, state, clock, *, interval, limit, dry_run, 
 The poller owns the poll-specific rules:
 
 - **New = not in the per-app state store.** The list response is used only to
-  detect candidate ids; if a candidate row already carries a usable phone it is
-  used directly, otherwise `get_invoice(id)` fetches the authoritative detail.
-  The list-vs-detail choice is purely about the phone: the template payload is
-  identical either way (the list row already carries `no`, `date`,
-  `currency_code`, the summary totals, `invoice_html_url`/`invoice_pdf_url`,
-  and `Client`), so a list row can never produce a payload missing a field the
-  active builder requires.
+  detect candidate ids; the row is then used as-is only if it can answer both
+  questions the message depends on — where it is going and what is on the
+  invoice. A missing phone is one reason to re-fetch; the other is the line
+  items, because **Daftra's `/invoices.json` embeds no `InvoiceItem` at all**,
+  so every listed row arrives with an empty `items`. That was harmless while the
+  message was text only. It stopped being harmless when the template grew a
+  header document: the document is this sender's own rendered PDF, so a row used
+  as-is renders a PDF whose items table tells the customer their invoice has no
+  products. `get_invoice(id)` is therefore the normal path — it costs one
+  request per *sent* invoice and is the only way to get the rows. The guard is
+  "is anything missing" (`_needs_detail`), not "did this come from a listing", so
+  a source that does supply the items is still used without the extra request.
+- **A failed detail fetch fails the send** and is classified like any other
+  fetch error: nothing was sent, so the invoice stays `pending` (transient) or
+  `abandoned` (a 4xx). A PDF that cannot be built is not a reason to deliver a
+  wrong one.
+- **An invoice with no items even after the detail fetch is still sent**, with a
+  WARNING naming it. At that point it is Daftra's own answer rather than a
+  fetch we failed to make, and stranding a real invoice on a defect the operator
+  has to be able to see is the worse of the two failures.
 - **Recorded as seen only after the send attempt**, so a crash or failure never
   silently drops an invoice.
 - **Failure classification** (see `_is_retryable`): retryable failures

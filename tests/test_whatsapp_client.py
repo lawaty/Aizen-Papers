@@ -97,6 +97,43 @@ def test_retry_after_sleep_is_capped_so_a_cron_run_does_not_hang(monkeypatch) ->
     assert sleeps == [5.0]
 
 
+def test_a_failed_own_number_lookup_is_reported_and_not_retried_per_send(caplog) -> None:
+    """The self-send guard must not be disabled without a word.
+
+    ``_fetch_own_number`` used to return ``None`` on any failure, which the caller
+    cannot distinguish from "we have no own number" — so a transient Graph API
+    error silently switched off the guard that exists to stop the sender texting
+    its own business line. It also re-issued the request on every send. Both are
+    fixed: the failure is logged, and it is remembered.
+    """
+    session = FakeSession(responses={"get": FakeResponse(500, {"error": {"message": "boom"}})})
+    client = _client(session, own_number=None)
+    with caplog.at_level("WARNING", logger="sender.infrastructure.whatsapp.client"):
+        client.send({"to": "01027693262", "type": "text", "text": {"body": "hi"}})
+        client.send({"to": "01027693263", "type": "text", "text": {"body": "hi"}})
+    assert "self-send guard is off" in caplog.text
+    # One lookup for the whole run, not one per send.
+    assert len([call for call in session.calls if call[0] == "get"]) == 1
+
+
+def test_a_missing_display_phone_number_is_also_reported(caplog) -> None:
+    """A 200 with no number is the same failure wearing a different hat: we asked
+    and got no answer, so the guard is off and the operator must know."""
+    session = FakeSession(responses={"get": FakeResponse(200, {})})
+    client = _client(session, own_number=None)
+    with caplog.at_level("WARNING", logger="sender.infrastructure.whatsapp.client"):
+        client.send({"to": "01027693262", "type": "text", "text": {"body": "hi"}})
+    assert "no display_phone_number" in caplog.text
+
+
+def test_a_resolved_own_number_does_not_warn(caplog) -> None:
+    session = FakeSession(responses={"get": FakeResponse(200, {"display_phone_number": "01280805534"})})
+    client = _client(session, own_number=None)
+    with caplog.at_level("WARNING", logger="sender.infrastructure.whatsapp.client"):
+        client.send({"to": "01027693262", "type": "text", "text": {"body": "hi"}})
+    assert caplog.records == []
+
+
 def test_error_collects_meta_fields_and_fbtrace() -> None:
     session = FakeSession(
         responses={

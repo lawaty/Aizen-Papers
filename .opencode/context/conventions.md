@@ -41,17 +41,19 @@ there rather than restated.
   subdomain**, so the name is stable and owns its state.
 - WhatsApp credentials are **lazily required** — only `send`/`preview`/`poll`
   demand them, so `show`/`list` work with just the Daftra key. Preserve this.
-- **Known bug (flagged 2026-10-01, do not fix in passing):** `poll --stub` still
-  demands live credentials. `cli.py:661` (`need_whatsapp`) lacks the
-  `not args.stub` guard that lines 662-663 carry, so an offline stub rehearsal
-  needs `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` in the environment
-  (enforced at `config.py:232-239`). Offline rehearsals should not require them;
-  if you touch that line, fix it deliberately and note it here.
+- **An offline rehearsal needs `--meta-stub`, not just a stub source**
+  (`--invoice-stub` / `--payment-stub`). `cli.py` gates `need_whatsapp` on
+  `not meta_stub`, so `--meta-stub` alone makes a run work with no token at all.
+  Rationale in [`decisions.md`](decisions.md) § 9. *(An earlier note here claimed
+  `poll --stub` still demanded live credentials; that was fixed with the flag.)*
+- The payments pipeline reads its own knobs (`POLL_PAYMENTS_*`,
+  `WHATSAPP_PAYMENT_TEMPLATE_*`) through the same `Settings` and deliberately
+  shares `POLL_INTERVAL`/`POLL_MAX_PAGES`/`POLL_MAX_BACKOFF`/`POLL_MAX_SEEN`/
+  `WHATSAPP_FREEFORM_FALLBACK`/`REPORT_*` with the invoice one. Full table:
+  [`docs/guide/payments.md`](../../docs/guide/payments.md) § Configuration.
 - Reference for every variable: `docs/guide/getting-started.md` § Configure and
-  `.env.example`. The report knobs (`REPORT_ENABLED`, `REPORT_DIR`,
-  `REPORT_DATA_DIR`, `REPORT_STUB_DIR`, `REPORT_RETENTION_DAYS`,
-  `REPORT_OBFUSCE_PHONE`) and `POLL_MAX_SENDS_PER_RUN` exist in `config.py` but
-  are **not yet in `.env.example`** or `docs/`.
+  `.env.example` (which now carries the poll-cap, `REPORT_*` and `POLL_PAYMENTS_*`
+  knobs).
 
 ## Ports and adapters
 
@@ -75,6 +77,18 @@ there rather than restated.
   credentials would otherwise message real customers on every `pytest` run.
 - Tests assert against ports with fakes; they may import `infrastructure`
   directly for adapter-level tests.
+- `InvoicePoller`'s send cap defaults to `10`, so a poller test that expects
+  more than 10 sends — or that asserts paging/saturation across two cycles —
+  must pass `max_sends_per_run=0` explicitly. A burst split across cycles is the
+  usual false failure. The default lives on `DocumentPoller`, so `PaymentPoller`
+  inherits it identically.
+- Each pipeline's behaviour is pinned by a parallel set of test modules —
+  `test_poller.py`/`test_payment_poller.py`, `test_reporting.py`/`test_payment_reporting.py`,
+  `test_daftra_payment_mapper.py` for the payments wire mapping, and
+  `test_payment_payload_contract.py` / `test_payment_freeform_fallback.py` for
+  what Meta would actually receive. **A change to one pipeline should be checked
+  against its twin's suite too** — the shared engine means a behaviour change
+  usually lands on both.
 - Run with `.venv/bin/python -m pytest -q`.
 
 ## Files and docs
@@ -88,11 +102,12 @@ there rather than restated.
   carry customer invoice ids, so the placeholder keeps the directory in a fresh
   clone without shipping content. `poll.log` is gitignored as the legacy
   pre-`run_poll.sh` log.
-- `poll_state.json`, `template_state.json`, `.env`, `stub_invoices.json` are
-  gitignored runtime artifacts. They are machine-specific: copying one onto
-  another machine silently marks invoices as already handled.
-- `reports/` and `reports.stub/` hold **customer PII** (names, invoice totals,
-  recipient numbers) and belong on that list — but are **not in `.gitignore`
-  yet**, unlike every other artifact here. Treat them as machine-local.
+- `poll_state.json`, `poll_payments_state.json`, `template_state.json`, `.env`,
+  `stub_invoices.json`, `stub_payments.json` are gitignored runtime artifacts.
+  They are machine-specific: copying one onto another machine silently marks
+  documents as already handled.
+- `reports/` and `reports.stub/` hold **customer PII** (names, amounts,
+  recipient numbers) and are now gitignored too, like every other runtime
+  artifact here. Treat them as machine-local regardless.
 - Remote is SSH-only (`git@github.com:lawaty/Aizen-Papers.git`); HTTPS auth
   hangs. Branch `main`.

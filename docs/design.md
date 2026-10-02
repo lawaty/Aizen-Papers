@@ -247,9 +247,206 @@ delivers the missed invoices, and logs a WARNING when the listing comes back
 full so the operator can raise `--limit`. A watermark alone would only turn a
 silent loss into a detected loss; paging turns it into a delivered one.
 
+## 11. Why a second pipeline for payments?
+
+Payments are announced under a second approved Meta template,
+`aizen_new_payment`, from `python -m sender poll-payments`. Five decisions shape
+it, and every one of them is a case where the obvious thing was the wrong thing.
+
+### Why a separate pipeline rather than one poller for both documents?
+
+Separate state file, separate `flock`, separate send cap, separate cron line.
+`InvoicePoller` and `PaymentPoller` are two processes that never coordinate.
+
+The forcing reason is the id space: payment ids and invoice ids overlap in the
+same account, so one shared "seen" set would have a payment confirmation retire an
+invoice notification with the same number — or the reverse — and neither would
+ever be retried. The second reason is starvation: with one shared
+`POLL_MAX_SENDS_PER_RUN`, a payment backlog would eat the invoice pipeline's
+budget on every tick, and the invoice message is the one the business is run on.
+One cron line per pipeline is the cost, and `tools/run_poll.sh` takes
+`POLL_SUBCOMMAND` so both share one wrapper and one log format.
+
+### Why extract a shared engine instead of writing a second poller?
+
+The invariants in §10 — the first run seeds without sending, a dry run writes
+nothing, a retryable failure is never abandoned — are the reason a customer never
+silently misses a notification. A second poller would have been a second
+implementation of all three, and therefore a second chance to get one wrong.
+
+So the cycle lives once in `DocumentPoller`, and a pipeline supplies only what is
+genuinely per-document: which source call lists and fetches, whether a listing
+row is too thin to send from, how a document maps onto a report row, and its
+wording. `InvoicePoller`'s public constructor is inherited unchanged, so its
+entire existing test suite passes without modification — which is the evidence
+that the refactor changed no behaviour. When the payments pipeline was added, the
+invariants did not get re-implemented; they got a second caller.
+
+### Why does every new payment cost two Daftra requests?
+
+A payment record names no payer: `client_id` is usually null and the contact
+fields are empty, because in Daftra the payer exists only on the invoice the
+payment settles. Reaching the customer therefore means reading that invoice too.
+
+That join is done in the adapter (`DaftraClient.get_payment`), not in the
+poller. The port states what a caller needs — a payment whose customer is
+resolved — and the application layer never learns Daftra's join order. It is
+bounded by the send cap, exactly like the invoice pipeline's detail fetch: the
+cap is checked before the send site, so a backlog costs listing pages, not one
+detail call per row on the page.
+
+A payment whose invoice has been deleted raises a 404, which is permanent, so it
+is abandoned once and left visible in `poll-status --payments` rather than
+retried forever against a record that will never resolve.
+
+### Why completed payments only?
+
+The template says the customer's balance was updated, and only a completed
+payment does that; announcing a pending or failed one would be a lie to a
+customer. `POLL_PAYMENTS_STATUS` defaults to `1` and is applied **server-side**,
+so a page of the listing is never spent on payments that will not be announced —
+which matters because a page is the unit the poller's paging walk reasons about.
+
+Blank is a real, deliberate value meaning "no filter", and it is distinct from
+the variable being absent. A typo raises instead of defaulting, because the
+silent failure here is the worst kind: narrowing to a status Daftra does not have
+would make the pipeline find nothing and report nothing.
+
+### Why no template registry on the payments path?
+
+`TemplateRegistry` exists to choose between the two *invoice* builders, by looking
+at whether the live `aizen_invoice` revision has a DOCUMENT header. The payment
+template has one approved shape — BODY and FOOTER, no header — so there is one
+legal payload, no builder to choose, and no reason to spend a Graph API round-trip
+per run learning something already known. There is consequently no document to
+attach either, so the payments pipeline never renders or uploads a PDF.
+
+If the template is unusable, Meta rejects the send with a `132000`-series code and
+the poller's existing handling applies unchanged: the free-form text fallback if
+it is enabled, otherwise the payment stays **pending** on the template error and
+comes back once the template is fixed. Never abandoned, never consumed.
+
+## 12. Why a third pipeline for new customers?
+
+New customers are announced under `aizen_new_customer`, from
+`python -m sender poll-customers`. Everything in §11 still holds — separate state,
+separate `flock`, separate cap, separate cron line — and the reason the pipeline
+exists at all is different enough to be worth stating separately.
+
+### Why is this the *smallest* pipeline, not the biggest?
+
+It is the smallest of the three subclasses by a wide margin: `CustomerPoller`
+overrides five things and inherits everything else. `InvoicePoller` and
+`PaymentPoller` each had to answer a question the engine could not answer for
+them — invoices need their line items fetched, payments need a second request to
+find the payer at all. A Daftra client row carries its own name and phone, so the
+engine's inherited "no reachable phone" rule is already exactly right: a normal
+listing row costs zero extra requests, and only a row missing a phone triggers a
+detail fetch.
+
+That is the argument for the shared engine restated in its strongest form. The
+third pipeline did not need one new behaviour in `DocumentPoller` — not a hook, not
+a flag, not a branch. What it needed was for the pipeline-specific differences to
+have been pushed into the subclasses where they belong, so a pipeline with *no*
+difference needed no engine at all.
+
+### Why does the client listing ask for an explicit sort?
+
+Daftra's `/clients.json` does not come back newest-first. Its default order is
+stable but arbitrary — a live account returned ids `[5,1,2,6,4,3]` — and only
+`sort=created&direction=desc` yields true newest-first. (`sort=created` alone
+gives *oldest* first; `order=desc` is silently ignored; every date-filter spelling
+except `created_from` is silently ignored too, answering `200` with the unfiltered
+set.)
+
+This is the single highest-risk line in the pipeline, and it is a silent failure.
+The engine walks pages forward and stops at the first record it has already seen,
+which is only correct if newer records come first. Under an arbitrary order the
+walk stops early on a saturated page and never announces a new customer sitting
+further back — no exception, no warning, a pipeline that looks perfectly healthy
+and has quietly stopped working. There is no way to detect this from the output.
+
+So the parameters are pinned by a test that asserts the exact request dict, and
+`list_customers` carries a comment explaining why each one is load-bearing. The
+general lesson is worth more than the endpoint: **an API that ignores what you ask
+it for is more dangerous than one that rejects it**, because a typo becomes a silent
+wrong answer instead of a loud failure.
+
+### Why is there no `created_from` watermark?
+
+The endpoint accepts one, so the obvious design is "remember the newest `created`
+and ask for everything after it". It was rejected for four reasons:
+
+- the boundary is **date-granular and inclusive** — `created_from=2026-05-02 12:25:31`
+  still returns a client created at `12:25:30`, because the time component is
+  truncated. A timestamp watermark cannot be expressed, only a date, so every run
+  re-scans a day;
+- the accounts hold **one to six clients**. There is nothing to save;
+- a watermark would mean extending the shared `PollStateStore` protocol and its
+  JSON format — a behaviour change to infrastructure shared by three pipelines, for
+  no gain;
+- and the misspelling risk above applies to the filter as much as to the sort. One
+  more silent-wrong-answer surface, in exchange for nothing.
+
+The seen-set *is* the watermark, and it is exact rather than approximate. "New
+customer" therefore means "never seen by this pipeline", which is what the first-run
+seeding already makes correct: existing customers are recorded as handled without
+being messaged, and only genuinely new ones get a welcome.
+
+### Why is the free-form fallback off here, when it is on everywhere else?
+
+`WHATSAPP_FREEFORM_FALLBACK` defaults to `true` for invoices and payments, and this
+pipeline overrides it to `false` with its own `WHATSAPP_CUSTOMER_FREEFORM_FALLBACK`.
+
+The reason is that a welcome goes to a **brand-new number**, which is by definition
+outside WhatsApp's 24-hour customer-service window — and that window is the only
+place free-form text is deliverable at all. A fallback here can never rescue a
+send. It can only spend a doomed second request on every template error and bury the
+real error under a second one. (The invoices pipeline's default is on for a very
+different reason: its template has no approved English translation yet, so without a
+fallback *every* send fails. That is a bridge, not a permanent mode.)
+
+With it off, the engine's existing behaviour is exactly right: a `132000`-series
+rejection leaves the customer **pending** on the template error. Fix the template,
+and the welcomes flow on a later cycle. Nothing is consumed, nothing is lost.
+
+### Why is nothing filtered on `type`, `suspend` or `is_offline`?
+
+Daftra's `type` takes values 1/2/3 and nothing documents what they mean. Filtering
+on a guess would be the worst kind of bug: real customers silently never welcomed,
+marked seen, invisible in every log. The pipeline carries the fields for display
+and acts on none of them.
+
+This is the deliberate counterpart to §11's `POLL_PAYMENTS_STATUS=1`. There, the
+filter is justified because the *template text* requires it — "your balance was
+updated" is false for a pending payment, and the choice is auditable against the
+message being sent. Here no wording constrains the set, so there is nothing to
+justify a filter against. If the business later wants to exclude suspended clients,
+that needs `suspend`'s real semantics confirmed against Daftra's documentation
+first.
+
+### What a reviewer must confirm before this runs in production
+
+`aizen_new_customer` is **MARKETING** category, not UTILITY like the other two.
+That is not a labelling detail — it changes what Meta requires of the sender:
+
+- **Opt-in evidence.** Marketing messages require demonstrable consent. Someone has
+  to be able to say *how* each new customer opted in (a signup checkbox, terms
+  acceptance). If that answer does not exist, this pipeline should not be enabled,
+  and no amount of code correctness makes it compliant.
+- **Unregistered numbers.** A brand-new number may not be on WhatsApp yet. Those are
+  rejected permanently, abandoned once, and left visible in
+  `poll-status --customers`. The engine handles this correctly; the business should
+  expect to see those rows.
+- **First-run seeding means existing customers are not welcomed.** By design. If the
+  business *wants* a one-off welcome to current customers, that is `--send-existing`
+  on the first run — a deliberate, visible decision rather than a default.
+
 ## Back to
 
 - [Overview](index.md)
 - [Architecture](architecture.md)
 - [Next: getting started](guide/getting-started.md)
 - [Invoice PDF attachment](guide/invoice-pdf.md)
+- [Payments pipeline](guide/payments.md)
+- [Customers pipeline](guide/customers.md)

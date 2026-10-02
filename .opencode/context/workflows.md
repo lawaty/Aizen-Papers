@@ -38,8 +38,12 @@ per app →
    off the page.
 2. If the app is unknown to the state store: **seed all existing ids, send
    nothing** (unless `--send-existing`).
-3. Per new invoice: if the list row has no phone, re-fetch the invoice for the
-   authoritative one. No usable phone → mark seen, never retried.
+3. Per new invoice: **re-fetch the detail** when the row lacks the phone *or* the
+   items. The listing carries no `InvoiceItem` at all, so this is the normal path,
+   not the exception — see `contexts.md` § 7. The cap was checked before this, so
+   the extra read costs one request per invoice actually being sent. No usable
+   phone → mark seen, never retried. A failed detail fetch **fails the send**: no
+   PDF was built, so the invoice stays `pending` rather than going out wrong.
 4. Build → send → **mark seen only after the send attempt**. The send budget is
    claimed at the send site, so a failed send still consumes it.
 5. Classify: network/429/5xx → `pending` with bounded exponential backoff
@@ -70,8 +74,22 @@ prunes daily logs older than 30 days, so there is no second cron entry to
 maintain. `$PYTHON` must name a 3.10+ interpreter — the wrapper's `python3`
 default does not work on the production host (see `decisions.md`).
 
+**`python -m sender poll-payments` is this same trace**, through `cli._run_poll_payments`
+and the shared `cli._run_poll_common` (signal handling, the whole-run lock, the
+summary, and the post-lock report refresh are one implementation for both, so the
+two cannot drift). Three things differ and only three: the state path and its
+lock, the send-cap knob (`POLL_PAYMENTS_MAX_SENDS_PER_RUN`), and the extra
+Daftra hop — a payment row names no payer, so `DaftraClient.get_payment` reads
+the linked invoice too, inside the adapter, only for payments about to be sent.
+Everything in steps 1–5 above, including seeding, backoff, the deferred-by-cap
+rule and the free-form fallback, is inherited. There is a **second cron entry**
+setting `POLL_SUBCOMMAND=poll-payments`; the wrapper, the log format and the
+lock discipline are shared, the state and the budget are not. See
+[`contexts.md`](contexts.md) § 3.
+
 **Traps:** the project-dir `cd` is load-bearing. A second concurrent poller
-exits 1 by design. The first run per app seeds silently, so a fresh prod state
+exits 1 by design — but each pipeline has its **own** lock, so they do not block
+each other. The first run per app seeds silently, so a fresh prod state
 file shows `sent 0`.
 
 ---
@@ -128,9 +146,12 @@ gitignored `HANDOFF-deploy.md`, with the durable subset in
 
 per send attempt → `JsonlSendOutcomeRecorder.record` appends one JSON object to
 `REPORT_DATA_DIR/<host-local-date>.jsonl` (`O_APPEND`, one write per line) → at
-end of run `ReportStore.render()` rewrites `<date>.html` + `index.html` for every
-date it touched, via `write_text_atomic`; then `ReportStore.prune()` deletes
-anything past `REPORT_RETENTION_DAYS` (`0` disables).
+end of run `ReportStore.render()` rewrites `<date>.html` for every date it touched,
+plus `index.html` and `recipients.html` (both rebuilt from **all** retained days,
+not just the touched ones), via `write_text_atomic`; then `ReportStore.prune()`
+deletes anything past `REPORT_RETENTION_DAYS` (`0` disables) — dated JSONL and
+dated pages only, never the index. Every pipeline records into
+**one** set of files, tagged by `SendOutcome.kind` (§ `contexts.md` 4).
 
 The **JSONL is the record; the HTML is derived.** A renderer bug is therefore
 fixable by re-running `python -m sender report` (with `--date` for one day, or
@@ -144,5 +165,5 @@ prints timestamps.
 `REPORT_OBFUSCE_PHONE` defaults on and a generated `.htaccess` blocks `*.jsonl`
 and directory listing — that is not access control. The pages themselves still
 want `.htpasswd` or to live outside the docroot. `reports/` and `reports.stub/`
-are customer-PII artifacts and are **not yet in `.gitignore`** — see
-[`decisions.md`](decisions.md) drift list.
+hold customer PII and are now gitignored, but treat them as machine-local
+regardless.

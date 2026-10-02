@@ -49,6 +49,15 @@ number instead of silently dropping it, and parses money into `Decimal`, tolerat
 `"20"`), so the mapper and the poller normalize in one and the same pass instead
 of two passes that can disagree.
 
+**The two endpoints do not carry the same fields, and that is load-bearing.**
+`GET /invoices/{id}.json` returns `InvoiceItem[]`; `GET /invoices.json` (the
+listing the poller pages over) returns **no `InvoiceItem` key at all**, so every
+listed row maps to `items=()`. The mapper cannot tell an item-less invoice from
+an un-fetched one, which is why the poller re-fetches the detail before it
+renders (see [`application.md`](application.md)) and why `infrastructure/pdf.py`
+warns on an invoice that has a total but no rows. A listing that starts
+including items would make that fetch redundant, not wrong.
+
 ### `whatsapp/client.py` — `WhatsAppClient`
 
 Implements `domain.ports.MessageSender`. Posts the JSON payload to

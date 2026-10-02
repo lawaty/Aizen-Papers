@@ -8,6 +8,26 @@ poll_state.json
 poll_state.stub.json
 poll_state.json.lock
 stub_invoices.json
+# Payments pipeline artifacts. Machine-specific for the same reason as the
+# invoice ones: uploading a payments state file would mark real payments as
+# already confirmed, silently suppressing deliveries.
+poll_payments_state.json
+poll_payments_state.stub.json
+poll_payments_state.json.lock
+stub_payments.json
+poll_customers_state.json
+poll_customers_state.stub.json
+poll_customers_state.json.lock
+stub_customers.json
+# Lock sidecars for every pipeline's state file, including the stub ones a
+# hand-run poll can leave behind.
+poll_payments_state*.json.lock
+poll_customers_state*.json.lock
+poll_state*.json.lock
+# The send report holds customer PII (names, amounts, recipient numbers) and is
+# browsable from a web root; it belongs on this list like every other artifact.
+reports/
+reports.stub/
 webhook_events.jsonl
 *.bak
 # Rendered sample header PDF for Meta template review (regenerated on demand).

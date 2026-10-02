@@ -228,6 +228,151 @@ def test_money_raises_on_a_present_but_unparseable_amount(mapper, raw):
         mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": raw}})
 
 
+@pytest.mark.parametrize("raw", ["1e3", "1E3", "1e+3", "1e-3", "1.5e3", "1e999", "1 e 3"])
+def test_money_rejects_exponent_notation_instead_of_mangling_it(mapper, raw):
+    """The sanitizer strips every non-digit, so exponent form used to survive as a
+    silent change of magnitude: ``"1e3"`` became ``13`` and ``"1e999"`` became
+    ``1999``. That is precisely what this function promises never to do, so it
+    raises instead."""
+    with pytest.raises(ValueError, match="Unparseable money value"):
+        mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": raw}})
+
+
+def test_currency_words_still_strip_so_the_exponent_check_is_not_too_broad(mapper):
+    """The exponent guard must not reject the currency spelling that the
+    sanitizing regex exists to tolerate."""
+    invoice = mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "summary_total": "EGP 1,250.00"}})
+    assert invoice.total == Decimal("1250.00")
+
+
+def test_unmapped_tax_or_discount_is_reported_rather_than_dropped_silently(caplog, mapper):
+    """Tax is deliberately not modelled, so the customer's document would omit it
+    with nothing said. The mapper is the only layer that sees the raw payload, so
+    the tripwire lives here."""
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "summary_total": "1000",
+            "summary_tax1": "140",
+            "InvoiceItem": [{"item": "Roll", "quantity": "1", "unit_price": "1000", "subtotal": 1000}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice(payload)
+    assert "summary_tax1" in caplog.text
+    assert "000001" in caplog.text
+
+
+def test_item_level_tax_is_reported_too(caplog, mapper):
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "summary_total": "1000",
+            "InvoiceItem": [{"item": "Roll", "quantity": "1", "unit_price": "1000", "subtotal": 1000, "tax1": 140}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice(payload)
+    assert "InvoiceItem.tax1" in caplog.text
+
+
+def test_a_null_tax_does_not_warn(caplog, mapper):
+    """Daftra's own idiom for 'no tax' is ``null``, which must stay quiet — this is
+    what every live account sends today."""
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "summary_total": "1000",
+            "summary_tax1": None,
+            "InvoiceItem": [{"item": "Roll", "quantity": "1", "unit_price": "1000", "subtotal": 1000, "tax1": None}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice(payload)
+    assert "does not model" not in caplog.text
+
+
+def test_an_item_missing_money_is_reported_but_still_maps(caplog, mapper):
+    """Absent warns rather than raises: Daftra uses ``null`` for not-applicable
+    money elsewhere, and a raise here is a bare ``ValueError``, which the poller
+    classifies permanent — retiring a real invoice on an unfamiliar shape. The
+    defaults still apply so the document renders."""
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "InvoiceItem": [{"item": "Service call"}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        invoice = mapper.to_invoice(payload)
+    assert "quantity" in caplog.text
+    item = invoice.items[0]
+    assert (item.name, item.quantity, item.unit_price, item.total) == ("Service call", Decimal("1"), Decimal("0"), Decimal("0"))
+
+
+def test_a_complete_item_does_not_warn(caplog, mapper):
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "InvoiceItem": [{"item": "Roll", "quantity": "2", "unit_price": "500", "subtotal": 1000}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice(payload)
+    assert "carries no" not in caplog.text
+
+
+def test_an_unparseable_date_is_reported(caplog, mapper):
+    """Both an absent and an unparseable date render as ``None`` -> "N/A" on the
+    PDF, so the two are indistinguishable downstream unless the mapper says so."""
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        invoice = mapper.to_invoice({"Invoice": {"id": "1", "no": "000001", "date": "last Tuesday"}})
+    assert invoice.issue_date is None
+    assert "unparseable invoice date" in caplog.text
+
+
+def test_a_zero_deposit_or_discount_stays_quiet(caplog, mapper):
+    """Daftra sends ``deposit: "0"`` and ``summary_discount: 0`` on invoices that
+    carry neither. A truthiness test calls both present — a *string* zero is
+    truthy — and warns on essentially the whole ledger, which is the fastest way
+    to make an operator ignore the warning that matters."""
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "summary_total": "1000",
+            "deposit": "0",
+            "summary_discount": 0,
+            "InvoiceItem": [{"item": "Roll", "quantity": "1", "unit_price": "1000", "subtotal": 1000, "discount": "0.00"}],
+        }
+    }
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice(payload)
+    assert "does not model" not in caplog.text
+
+
+def test_an_unparseable_tax_amount_is_treated_as_present(caplog, mapper):
+    """Unparseable is not zero. It must be reported rather than silently skipped —
+    and it must not raise, because that would abandon an invoice over a field that
+    never reaches the document."""
+    payload = {"Invoice": {"id": "1", "no": "000001", "summary_tax1": "n/a"}}
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        invoice = mapper.to_invoice(payload)
+    assert invoice.number == "000001"
+    assert "summary_tax1" in caplog.text
+
+
+def test_an_absent_date_stays_quiet(caplog, mapper):
+    with caplog.at_level("WARNING", logger="sender.infrastructure.daftra.mapper"):
+        mapper.to_invoice({"Invoice": {"id": "1", "no": "000001"}})
+    assert "unparseable invoice date" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [
