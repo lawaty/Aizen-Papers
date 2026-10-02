@@ -1,6 +1,7 @@
 """Offline specs for the poller use case and the poll state store."""
 
 import json
+import logging
 
 import pytest
 
@@ -82,6 +83,25 @@ class ListRowWithoutAPhoneSource:
         raise self.error
 
 
+class CountingSource:
+    """A source that lists whatever it is given and counts the detail fetches."""
+
+    def __init__(self, listed, detail) -> None:
+        self.listed = listed
+        self.detail = detail
+        self.detail_calls: list[str] = []
+
+    def list_invoices(self, limit: int = 10, page: int = 1):
+        return list(self.listed)
+
+    def get_invoice(self, invoice_id):
+        self.detail_calls.append(str(invoice_id))
+        return self.detail
+
+    def get_raw_invoice(self, invoice_id):
+        return {}
+
+
 class DaftraFakeSession(FakeSession):
     def __init__(self, list_payload: dict, get_payload: dict) -> None:
         self.list_payload = list_payload
@@ -115,6 +135,9 @@ def _poller(apps, sender=None, state=None, clock=None, **kwargs) -> InvoicePolle
     )
 
 
+_ITEM = {"item": "A4 Paper Ream 80gsm", "quantity": "1", "unit_price": "100", "subtotal": 100}
+
+
 def _list_payload(invoice_id: str, number: str) -> dict:
     return {"result": "successful", "data": [{"Invoice": {"id": invoice_id, "no": number}}]}
 
@@ -135,7 +158,10 @@ def _list_payload_with_phone(invoice_id: str, number: str, phone: str) -> dict:
     }
 
 
-def _get_payload(invoice_id: str, number: str, phone: str) -> dict:
+def _get_payload(invoice_id: str, number: str, phone: str, items: list | None = None) -> dict:
+    """The *detail* response, which — unlike the list response — carries
+    ``InvoiceItem``. A real one always does, so the default models a normal
+    invoice; pass ``items=[]`` for the pathological one."""
     return {
         "result": "successful",
         "data": {
@@ -145,6 +171,7 @@ def _get_payload(invoice_id: str, number: str, phone: str) -> dict:
                 "summary_total": 100,
                 "invoice_html_url": "https://demo.daftra.com/invoices/1.pdf",
                 "Client": {"business_name": "Acme", "phone1": phone},
+                "InvoiceItem": items if items is not None else [_ITEM],
             }
         },
     }
@@ -634,7 +661,12 @@ def test_list_payload_without_phone_fetches_the_authoritative_detail():
     assert sender.payloads[0]["to"] == "201027693262"
 
 
-def test_list_payload_with_phone_avoids_a_get_invoice_call():
+def test_list_payload_with_phone_still_fetches_the_detail_for_the_items():
+    # The listing carries a phone, so the *phone* used to be the only reason to
+    # re-fetch — and it was enough, because the message was text only. The header
+    # document is this sender's own PDF, and the listing carries no InvoiceItem at
+    # all, so a row used as-is renders "this invoice has no products" to a
+    # customer whose invoice has three.
     session = DaftraFakeSession(
         _list_payload_with_phone("1", "INV-001", "01027693262"),
         _get_payload("1", "INV-001", "01027693262"),
@@ -644,8 +676,70 @@ def test_list_payload_with_phone_avoids_a_get_invoice_call():
     poller = _poller([PollApp("one", client)], sender=sender, send_existing=True)
     summary = poller.run_once()
     assert summary["apps"][0]["sent"] == 1
-    assert len(session.urls) == 1
+    assert len(session.urls) == 2
+    assert session.urls[1].endswith("/invoices/1.json")
     assert sender.payloads[0]["to"] == "201027693262"
+
+
+def test_a_list_row_that_already_carries_the_items_needs_no_detail_fetch():
+    # The guard is "is anything missing", not "did we come from a listing", so a
+    # source that does hand the items over is used as-is — one request per invoice
+    # is only worth paying when the fetch is the only way to get them.
+    source = CountingSource(
+        [make_stub_invoice()],
+        make_stub_invoice(customer_phone="01000000000"),
+    )
+    sender = CapturingSender()
+    poller = _poller([PollApp("one", source)], sender=sender, send_existing=True)
+    summary = poller.run_once()
+    assert summary["apps"][0]["sent"] == 1
+    assert source.detail_calls == []
+
+
+def test_the_detail_carries_the_items_the_listing_never_did():
+    source = CountingSource(
+        [make_stub_invoice(items=())],
+        make_stub_invoice(),
+    )
+    poller = _poller([PollApp("one", source)], sender=CapturingSender(), send_existing=True)
+    poller.run_once()
+    assert source.detail_calls == ["1"]
+
+
+def test_an_invoice_the_detail_also_has_no_items_for_is_still_sent(caplog):
+    # Daftra answered, and the answer was "no products". Refusing to send would
+    # strand a real invoice on a defect the operator has to see, so it goes out
+    # and says so in the log rather than going nowhere in silence.
+    source = CountingSource(
+        [make_stub_invoice(items=())],
+        make_stub_invoice(items=()),
+    )
+    sender = CapturingSender()
+    poller = _poller([PollApp("one", source)], sender=sender, send_existing=True)
+    with caplog.at_level(logging.WARNING, logger="sender.application.poller"):
+        summary = poller.run_once()
+    assert summary["apps"][0]["sent"] == 1
+    assert len(sender.payloads) == 1
+    assert "no line items" in caplog.text
+
+
+def test_a_failed_detail_fetch_keeps_the_invoice_for_a_retry():
+    # Nothing was sent, so the invoice must still be pending: a PDF we could not
+    # build is not a reason to stop trying.
+    state = InMemoryPollStateStore()
+
+    def _boom(invoice_id):
+        raise DaftraApiError(503, "Daftra down")
+
+    source = CountingSource([make_stub_invoice(items=())], make_stub_invoice())
+    source.get_invoice = _boom
+    sender = CapturingSender()
+    poller = _poller([PollApp("one", source)], sender=sender, state=state, send_existing=True)
+    summary = poller.run_once()
+    assert sender.payloads == []
+    assert summary["apps"][0]["failed"] == 1
+    assert "1" in state.pending("one")
+    assert not state.seen("one", "1")
 
 
 def test_invoice_with_no_phone_even_after_detail_is_skipped():

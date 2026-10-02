@@ -977,12 +977,38 @@ def render_invoice_pdf(invoice: Invoice) -> bytes:
     """
     currency = _flatten(invoice.currency)
     _warn_unshaped(invoice)
+    _warn_empty_items(invoice)
     canvas = _Canvas()
     _draw_heading(canvas, invoice, currency)
     _draw_items(canvas, invoice)
     _draw_totals(canvas, invoice)
     _draw_footers(canvas)
     return _assemble([canvas.content(page) for page in range(canvas.page_count)], canvas.glyphs)
+
+
+def _warn_empty_items(invoice: Invoice) -> None:
+    """Report an invoice that has money on it and no products to show for it.
+
+    The empty-items state is a designed one, so it renders rather than fails: an
+    invoice with no rows really can say so. But a *totalled* invoice with no rows
+    is never what the operator means, and the document is a customer-facing
+    statement of what they are being billed for — so it is a defect, and this is
+    the only place that can see both halves of it.
+
+    The check is deliberately narrow (a non-zero total is required), because the
+    legitimate case — an invoice with no items and nothing to charge for — must
+    not cry wolf on every such send.
+    """
+    if invoice.items or not invoice.total:
+        return
+    log.warning(
+        "invoice PDF: invoice %s totals %s but carries no line items; the document "
+        "will state that the invoice has no products. This is what a Daftra list "
+        "row (GET /invoices.json) produces on its own — it carries no InvoiceItem, "
+        "so the invoice must be re-fetched from GET /invoices/{id}.json before "
+        "rendering.",
+        invoice.number, _money(invoice.total),
+    )
 
 
 def _warn_unshaped(invoice: Invoice) -> None:

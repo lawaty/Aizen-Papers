@@ -40,6 +40,81 @@ SENT = "sent"
 FAILED = "failed"
 ABANDONED = "abandoned"
 
+#: Which document kind a send was about. The report is one audit trail for all
+#: three pipelines, so a row has to say which template it went out under.
+KIND_INVOICE = "invoice"
+KIND_PAYMENT = "payment"
+KIND_CUSTOMER = "customer"
+
+
+@dataclass(frozen=True)
+class Payment:
+    """One recorded payment against an invoice, as an outbound notification needs it.
+
+    Modelled the same way as :class:`Invoice` — only the facts a customer-facing
+    message carries, never a mirror of the ERP's payment record.
+
+    The customer fields are the awkward part and are deliberately *not* on the
+    payment itself: a Daftra payment row names no client and carries no phone, so
+    ``customer_name`` and ``customer_phone`` are filled in by the adapter from the
+    **linked invoice**, which is the only place the client record lives. A payment
+    whose invoice no longer resolves therefore arrives with no phone and is
+    skipped rather than guessed at.
+    """
+
+    id: str
+    #: Daftra's payment reference code (e.g. ``"000116"``) — the "operation
+    #: number" the template body prints. Falls back to ``id`` when absent.
+    number: str
+    customer_name: str = ""
+    customer_phone: str | None = None
+    #: Daftra's raw payment status (``"1"`` = completed), kept for logging only.
+    status: str = "Unknown"
+    currency: str = ""
+    amount: Decimal = Decimal("0")
+    payment_date: date | None = None
+    #: The invoice this payment settles; what makes the customer reachable.
+    invoice_id: str | None = None
+    #: ``cash``/``bank``/``cheque``/a gateway key. Logging only — not on the
+    #: template, so an unknown method never blocks a notification.
+    payment_method: str = ""
+
+
+@dataclass(frozen=True)
+class Customer:
+    """One client record in Daftra, as an outbound welcome needs it.
+
+    The third pipeline's document. Unlike a payment, a client row carries its own
+    name and phone, so reaching this customer costs **one** request — there is no
+    join to follow.
+
+    ``customer_name`` and ``customer_phone`` reuse the invoice field names on
+    purpose: the poller, the report and the templates all address "a customer"
+    the same way regardless of which document kind surfaced it, which is what lets
+    one engine drive all three pipelines.
+    """
+
+    id: str
+    #: The client number an operator reads in the ERP ("000001"). Falls back to
+    #: the id when Daftra leaves it blank.
+    number: str = ""
+    #: ``business_name``, else first + last, else a neutral fallback. Never empty:
+    #: the welcome template greets the customer by name, and skipping a nameless
+    #: client would mark it seen and silently lose the welcome forever.
+    customer_name: str = ""
+    customer_phone: str | None = None
+    #: When the account was created. Not used to decide who is new — the seen-set
+    #: does that — but it is what makes a "new customer" claim checkable after the
+    #: fact, so it is carried through to the report.
+    created: date | None = None
+    email: str = ""
+    #: Daftra's raw client type (1/2/3 seen in the wild). Carried for display
+    #: only and deliberately never filtered on: the semantics are undocumented,
+    #: and guessing them would silently drop real customers.
+    type: str = ""
+    suspend: str = ""
+    is_offline: str = ""
+
 
 @dataclass(frozen=True)
 class SendOutcome:
@@ -57,15 +132,25 @@ class SendOutcome:
     """
 
     app: str
+    #: The document id: an invoice id, or a payment id for a payment send. The
+    #: field keeps its historic name so rows already on disk in the report's
+    #: JSONL stay readable; :attr:`kind` is what says which kind this is.
     invoice_id: str
+    #: The document number: an invoice number, or a payment reference code.
     invoice_number: str
     customer_name: str
     attempted_at: float
     customer_phone: str | None = None
     currency: str = ""
+    #: The document amount: an invoice total, or a payment amount.
     total: Decimal = Decimal("0")
+    #: The document date: an invoice issue date, or a payment date.
     issue_date: date | None = None
     status: str = SENT
+    #: Which pipeline produced this row, ``KIND_INVOICE`` or ``KIND_PAYMENT``.
+    #: Defaults to an invoice so rows written before the payments pipeline
+    #: existed still render — and label — correctly.
+    kind: str = KIND_INVOICE
     #: Failure reason, or the template error that triggered a free-form fallback.
     error: str | None = None
     #: True when this attempt was delivered by the free-form fallback instead of
