@@ -72,16 +72,20 @@ InvoicePoller(apps, sender, builder, state, clock, *, interval, limit, dry_run, 
 
 ## Sequencing rules owned here
 
-- **Recipient resolution**: `--to` wins; otherwise the customer's own phone from
-  the invoice — but only if it passed normalization. Missing/unsubscribe-able
-  phone → clear `ValueError` telling the caller to pass `--to`.
+- **Recipient resolution**: `--to` wins, and stays a *single* recipient — it is
+  the operator overriding the record, so it is honoured literally. Otherwise every
+  number on the document is used, in the model's order, one payload built per
+  number. No usable number at all → clear `ValueError` telling the caller to pass
+  `--to`.
 - **`dry_run`**: if set, build everything, return `{"dry_run": True, ...}` and
   **never** call the sender.
 - **Guard**: if `sender is None` (no WhatsApp credentials) the send path fails
   fast with a `RuntimeError` explaining the missing config.
-- **Return shape**: `send_invoice` returns a dict carrying `invoice`, `payload`,
-  `to`, and (when sent) the sender's `response` — so the CLI never re-fetches or
-  re-builds.
+- **Return shape**: `send_invoice` returns a dict carrying `invoice` and the
+  parallel `recipients` / `payloads` / `responses` lists — so the CLI never
+  re-fetches or re-builds, and prints one line per number that went out.
+  `delivered_recipients` exposes what Meta actually accepted, which is what a
+  retry passes back as `exclude=` so a re-sent template cannot land twice.
 
 The poller owns the poll-specific rules:
 
@@ -98,6 +102,26 @@ The poller owns the poll-specific rules:
   request per *sent* invoice and is the only way to get the rows. The guard is
   "is anything missing" (`_needs_detail`), not "did this come from a listing", so
   a source that does supply the items is still used without the extra request.
+  One usable number satisfies `_needs_detail`; a second one does **not** cost an
+  extra request, because the listing already carried it.
+
+- **A document is addressed to a *set* of numbers, not one.** The fan-out lives
+  here, in the shared engine, so the invoice, payment and customer pipelines all
+  inherit it: each recipient is built and POSTed in turn, and the summary counts
+  *documents*, not messages. Two numbers therefore cost **two** units of the
+  per-run send cap, which is what keeps the cap bounding what actually reaches
+  Meta.
+
+- **A partly-delivered document is finished, never dropped and never repeated.**
+  `mark_seen` happens only once every number was served. If a send fails or the
+  cap lands *between* two recipients, the recipients already reached are written
+  to the state store's per-app `delivered` map, the document stays unseen, and a
+  later cycle sends **only** what is outstanding. The map is cleared by
+  `mark_seen`, so a fully-delivered document leaves nothing behind. Only a
+  *retryable* failure records it — a permanent one has already retired the
+  document, and writing the record after that would leave stale state. A cap
+  deferral mid-document is counted as `deferred_by_cap` (not `failed`), because it
+  is a throttle, not a delivery problem.
 - **A failed detail fetch fails the send** and is classified like any other
   fetch error: nothing was sent, so the invoice stays `pending` (transient) or
   `abandoned` (a 4xx). A PDF that cannot be built is not a reason to deliver a

@@ -44,7 +44,11 @@ nested *inside* the `Invoice` object by the live API; the mapper also accepts th
 sitting beside `Invoice`, which is the shape the offline stub used to emit. Guards
 against missing or malformed payloads, repairs booleans-as-ints, keeps a `0` invoice
 number instead of silently dropping it, and parses money into `Decimal`, tolerating
-`NaN` and decimal commas. Customer phones are normalized with the deployment's
+`NaN` and decimal commas. Every filled client phone field is collected, not just
+the first, so an invoice reaches a customer on both numbers when both are set;
+duplicates are collapsed after normalization, and a filled-but-unparseable field
+is dropped with a WARNING naming it rather than failing the whole document.
+Customer phones are normalized with the deployment's
 `DEFAULT_COUNTRY_CODE` (the mapper takes it as a constructor argument, default
 `"20"`), so the mapper and the poller normalize in one and the same pass instead
 of two passes that can disagree.

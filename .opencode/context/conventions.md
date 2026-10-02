@@ -12,6 +12,18 @@ there rather than restated.
   unions (`int | str`) and modern typing.
 - **Money is `Decimal`, never `float`.**
 - **Models are frozen dataclasses** so payloads cannot be mutated mid-pipeline.
+- **A document carries `customer_phones: tuple[str, ...]`, never a single
+  phone.** Daftra keeps two phone fields on a client and either may be filled, so
+  the tuple's order is the Daftra field preference (`phone2`, `phone1`, `mobile`,
+  `phone`), a one-value tuple is the ordinary case, and `()` means there is
+  nowhere to send. **Never index `[0]` unconditionally** — senders iterate and
+  display code must handle the empty case (the poller's "skip and mark seen"
+  behaviour hangs off that). De-duplicate **after** normalization, since `010…`
+  and `+2010…` are one person. `--to` is an explicit single-recipient override
+  and stays one. `SendOutcome.customer_phone` is deliberately still singular — the
+  report records one row per POST (`contexts.md` § 4). Field semantics:
+  [`docs/guide/customers.md`](../../docs/guide/customers.md) § *Phone*;
+  rationale: [`decisions.md`](decisions.md) § 11.
 - Long explanatory comments are welcome and idiomatic here — the codebase
   documents *why* inline, not just what. Match that density when editing.
 - `logging` for operational messages in `application/`/`infrastructure/`;
@@ -89,6 +101,11 @@ there rather than restated.
   what Meta would actually receive. **A change to one pipeline should be checked
   against its twin's suite too** — the shared engine means a behaviour change
   usually lands on both.
+- `tests/test_multi_recipient.py` is the cross-pipeline spec for fan-out and
+  partial delivery (all three pipelines, plus the manual-send paths). Its
+  `FailingOnNumberSender` fails **by recipient**, which is the only way to
+  express "the second number was rejected" as distinct from "the document was
+  rejected" — an invoice-level sender cannot tell them apart.
 - Run with `.venv/bin/python -m pytest -q`.
 
 ## Files and docs

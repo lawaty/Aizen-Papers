@@ -101,10 +101,23 @@ One Daftra request per new customer, versus two for a payment:
   is sent rather than skipped — a reachable customer with no name on file is still
   a real customer, and skipping would mark them handled and lose the welcome
   permanently. (An all-null row reads `مَرْحَبًا Customer،` — awkward but delivered.)
-- **Phone:** `phone2`, then `phone1`, then `mobile`/`phone`. Already-E.164 numbers
-  pass through; local `010…` gets `DEFAULT_COUNTRY_CODE` prepended; empty or
-  unparseable becomes "no phone", and the poller skips the customer and records it
-  as handled rather than retrying forever.
+- **Phone:** *every* filled field among `phone2`, `phone1`, `mobile`/`phone` —
+  not just the first. Daftra keeps two phone fields on a client and either may be
+  filled, so a customer who gave the business two numbers is contacted on both;
+  a customer with one filled field is contacted once. Already-E.164 numbers pass
+  through; local `010…` gets `DEFAULT_COUNTRY_CODE` prepended.
+  - The order (`phone2`, then `phone1`, then `mobile`/`phone`) decides which
+    number is *primary* — the one the report and the summary list first. It is
+    no longer a choice between the two, only a ranking.
+  - Duplicates are collapsed **after** normalization, so `01027693262` in one
+    field and `+201027693262` in the other is one recipient, not two messages to
+    one person. This is the common shape of a record filled in by hand.
+  - Empty fields are skipped silently — a blank second phone is the ordinary
+    case. A field that is filled but unparseable is dropped **with a WARNING
+    naming the field**, and the remaining numbers still go out: one mistyped
+    field must not cost the customer the message entirely.
+  - No usable number at all is still "no phone": the poller skips the customer,
+    warns, and records it as handled rather than retrying forever.
 
 ## Configuration
 

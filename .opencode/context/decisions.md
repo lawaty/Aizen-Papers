@@ -1,11 +1,12 @@
 # Decisions
 
 **The canonical decision log for this project is
-[`docs/design.md`](../../docs/design.md)** — 11 numbered rationales (layered DDD,
+[`docs/design.md`](../../docs/design.md)** — 12 numbered rationales (layered DDD,
 external truth stays external, template builder, phone normalization, safe by
 default, Meta constraints, minimalism, hand-rolled PDF, attachment-as-port, the
-poller, the second payments pipeline). Read it before proposing an architectural
-change, and add to it rather than duplicating here.
+poller, the second payments pipeline, the third customers pipeline). Read it
+before proposing an architectural change, and add to it rather than duplicating
+here.
 
 This file records only decisions **not** already in `docs/design.md`.
 
@@ -220,6 +221,41 @@ feature built against a schema no account currently sends. Do not silence
 `_warn_unmapped_money`, and do not replace `_is_money_present` with a truthiness
 test (Daftra sends `deposit: "0"`, so a bare test warns on the whole ledger and
 trains the operator to ignore it). Pinned by `tests/test_daftra_mapper.py`.
+
+---
+
+## 11. A document is addressed to a set of numbers, and a partial delivery is finished rather than repeated
+
+Daftra keeps two phone fields on a client and either may be filled, so every
+document carries `customer_phones: tuple[str, ...]` and a send fans out to each
+distinct normalized number, in the model's order.
+
+*Why:* a customer who gave the business two numbers asked to be reachable on
+both, and a single-field model quietly dropped one. The hard half is not the
+fan-out but the **retry**: once a document can be half-delivered, "retry the
+document" stops being safe, because it messages again the number that already
+got it — a duplicate invoice is worse than a late one. So the recipients reached
+are persisted per app (the `delivered` map in the state file, cleared by
+`mark_seen`) and a later cycle sends only what is outstanding. It is on disk
+rather than in memory for the same reason as `draining`: production runs one
+`poll --once` process per cron tick.
+
+*Consequence:* `mark_seen` moved out of the send into `_handle_document` and now
+fires only when **every** number was served. Do not push it back down into the
+per-recipient path, or a document is retired after its first number. Write the
+`delivered` record only for a **retryable** failure or a cap deferral — a
+permanent failure has already retired the document, and a record after that is
+stale state. A permanent failure on one number gives the whole document up, which
+is a deliberate choice: the operator has to fix the record, not half-mess a
+customer. Because one POST costs one unit of the per-run send cap, the cap can
+now bite *between* two recipients; that must defer, never count as a failure.
+`--to` remains a single-recipient override — honouring the operator's explicit
+number literally is the point of it.
+
+*Not in `docs/design.md`.* The rules themselves live in
+[`docs/layers/application.md`](../../docs/layers/application.md) § *Sequencing
+rules owned here* and `docs/guide/customers.md` § *Phone*; the behavioural spec is
+`tests/test_multi_recipient.py`. See `contexts.md` § 2 and § 9.
 
 ---
 

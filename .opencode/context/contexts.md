@@ -20,6 +20,16 @@ cases. Parses args, builds the object graph, prints output.
 Commands that only read (`show`, `list`, `payments`, `show-payment`) deliberately
 skip template resolution so they work without WhatsApp credentials.
 
+**The one-shot send commands print one line per recipient.** A
+`send`/`send-payment`/`send-customer` result is now **parallel lists** —
+`recipients` / `payloads` / `responses` (`recipients` + `payloads` on a dry run),
+and `preview_*` returns `(doc, recipients, payloads)`. `_print_fan_out` renders
+that, so the count of lines is a property of the customer's record. `--to`
+collapses to a single recipient. The `132000` alternate-builder retry
+(`_send_template_with_retry`) re-sends with `exclude=service.delivered_recipients`,
+so the second attempt cannot re-message a number the first one reached; read
+`delivered_recipients` in an `except` branch for the same reason.
+
 **Must not change silently:** adding an adapter import here is expected; adding a
 *business* rule here is not. `cli.py` is already 1,454 lines — the largest file in
 the repo — so new command logic belongs in `application/`, new parsing stays here.
@@ -49,8 +59,9 @@ pre-existing suite passes unedited.
 - `presentation/cli.py` — `_run_poll_common`, the signal/lock/exit-code shell both
   poll commands run under, shared verbatim so the two cannot drift.
 - `domain/ports.py` — the `PollStateStore` and `Clock` protocols it is written against.
-- `infrastructure/state.py` — `JsonPollStateStore`; what `seen`/`pending`/`abandoned` mean on disk.
+- `infrastructure/state.py` — `JsonPollStateStore`; what `seen`/`pending`/`abandoned`/`delivered` mean on disk.
 - `tests/test_poller.py` — the behavioural spec for the shared engine.
+- `tests/test_multi_recipient.py` — the fan-out / partial-delivery spec, run against all three pipelines.
 
 **Boundaries:** depends on `domain` only. Consecutive apps never run concurrently
 and never share state.
@@ -93,6 +104,31 @@ send still costs budget. Two invariants make it safe:
 - The cap also bounds **Daftra read** traffic: the per-invoice detail fetch sits
   inside `_handle_document`, which is only reached once `_send_cap_reached()` has
   passed. Extra reads scale with invoices *sent*, never with the page size.
+
+**A document is addressed to a *set* of numbers, so the fan-out lives here.**
+`Invoice`/`Payment`/`Customer` carry `customer_phones: tuple[str, ...]`
+(convention in `conventions.md`; why in [`decisions.md`](decisions.md) § 11). In
+`_handle_document`:
+
+- `_recipients()` normalizes and de-duplicates the tuple **again** — the engine is
+  written against a port, so a source may hand over a raw `010…` value.
+- `_deliver()` sends to exactly one number and returns `None` on success; it no
+  longer owns any document-level state.
+- `_handle_document()` owns the bookkeeping. The load-bearing consequence:
+  **`mark_seen` moved out of the send** and fires only once *every* number was
+  served, so a partly-delivered document stays unseen and a later cycle finishes
+  it. Reached numbers go to `PollStateStore.delivered`/`record_delivered` (§ 9) —
+  written only when a **retryable** failure or the cap leaves work outstanding,
+  never on the happy path, and cleared by `mark_seen`.
+- A failure on one number never cancels the ones already reached; a **permanent**
+  one gives the whole document up (via `_fail_permanent`, which retires it).
+- One POST per recipient costs one unit of the send cap, so the cap can now bite
+  **between** two recipients. That is a throttle, not a failure: it defers as
+  `deferred_by_cap` and the reached numbers are remembered.
+
+Rules: [`docs/layers/application.md`](../../docs/layers/application.md) §
+*Sequencing rules owned here*; field semantics:
+[`docs/guide/customers.md`](../../docs/guide/customers.md) § *Phone*.
 
 **Payload-level Meta error codes are classified, not just HTTP status.** See
 `_RETRYABLE_API_CODES` / `_PERMANENT_API_CODES` in `poller.py`: `130429`/`131056`
@@ -164,6 +200,14 @@ is a rendering of it.
 is a **separate port from `PollStateStore`** — different retention, different
 failure contract. Only real send attempts are recorded: never a dry run, a
 no-phone skip, or a pre-send build/listing failure.
+
+**One row per POST, not per document.** `_record` runs inside the per-recipient
+send, so a two-number invoice produces **two** rows sharing an
+`invoice_id`/`invoice_number`, each with its own recipient. `SendOutcome.customer_phone`
+is deliberately still singular — the row records an attempt at reaching *a*
+number, which is why `obfuscate_phone` and both renderers take a single phone.
+Do not collapse the rows by document. Pinned by
+`tests/test_multi_recipient.py::test_a_report_row_is_written_per_recipient`.
 
 **One report serves every pipeline** (§ 2 and § 3, plus the customer/welcome
 one — `application/poller.py:CustomerPoller`, `cli.py poll-customers`,
@@ -378,6 +422,17 @@ per-app bookkeeping to a JSON file.
 
 **Boundaries:** state is keyed **per app name**, and the name is derived from the
 account subdomain so a tenant's history is stable across restarts.
+
+**Four maps per app: `seen`, `pending`, `abandoned`, `delivered`.** The newest,
+`delivered`, records the recipients a **partly-delivered** document has already
+reached, so a later cycle finishes only the rest (§ 2). It is merged rather than
+replaced (the set grows within a cycle), trimmed like `pending`/`abandoned`, and
+removed by `mark_seen` / `mark_many_seen` / the reset path — a fully-delivered
+document leaves nothing behind. A state file written before multi-recipient
+delivery has no `delivered` key at all, which legitimately means "nothing partly
+delivered" rather than "lost"; `_entry` back-fills it. It lives in the file, not
+in memory, for the same reason as `draining`: production runs one `poll --once`
+process per cron tick.
 
 **Must not change:** a corrupt or missing state file must log a warning and start
 empty — the poller never crashes on its own bookkeeping. `--dry-run` must not
