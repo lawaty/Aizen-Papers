@@ -113,12 +113,16 @@ def _invoice_to_dict(invoice: Invoice) -> dict:
         "balance_due": str(invoice.balance_due),
         "issue_date": invoice.issue_date.isoformat() if invoice.issue_date else None,
         "public_url": invoice.public_url,
+        # Round-tripped so a rehearsal fixture written by an older build keeps the
+        # notes it had, and so ``stub-add`` can rehearse a document that has some.
+        "description": invoice.description,
         "items": [
             {
                 "name": item.name,
                 "quantity": str(item.quantity),
                 "unit_price": str(item.unit_price),
                 "total": str(item.total),
+                "description": item.description,
             }
             for item in invoice.items
         ],
@@ -132,6 +136,7 @@ def _invoice_from_dict(data: dict) -> Invoice:
             quantity=Decimal(str(item.get("quantity", "1"))),
             unit_price=Decimal(str(item.get("unit_price", "0"))),
             total=Decimal(str(item.get("total", "0"))),
+            description=str(item.get("description", "") or ""),
         )
         for item in data.get("items", []) or []
     )
@@ -150,6 +155,7 @@ def _invoice_from_dict(data: dict) -> Invoice:
         issue_date=date.fromisoformat(issue) if issue else None,
         items=items,
         public_url=data.get("public_url"),
+        description=str(data.get("description", "") or ""),
     )
 
 
@@ -230,6 +236,11 @@ class StubInvoiceSource:
                     "summary_unpaid": str(invoice.balance_due),
                     "date": invoice.issue_date.strftime("%Y-%m-%d") if invoice.issue_date else None,
                     "invoice_html_url": invoice.public_url,
+                    # The two free-text fields the live detail payload carries:
+                    # ``notes`` on the invoice, ``description`` on each line. Absent
+                    # when empty, exactly as the real row leaves them, so a
+                    # rehearsal shows what production shows.
+                    "notes": invoice.description or None,
                     "Client": {
                         "business_name": invoice.customer_name,
                         # Mirrors the real wire order on purpose: Daftra's ``phone2``
@@ -243,6 +254,7 @@ class StubInvoiceSource:
                     "InvoiceItem": [
                         {
                             "item": item.name,
+                            "description": item.description or None,
                             "quantity": str(item.quantity),
                             "unit_price": str(item.unit_price),
                             "subtotal": str(item.total),

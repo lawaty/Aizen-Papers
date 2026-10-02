@@ -11,6 +11,17 @@ class InvoiceItem:
     quantity: Decimal = Decimal("1")
     unit_price: Decimal = Decimal("0")
     total: Decimal = Decimal("0")
+    #: Free text the seller wrote about *this line* (Daftra's
+    #: ``InvoiceItem.description``) — a size, a colour, a finishing note. It is the
+    #: line's own prose and not a second name, which is why the PDF draws it under
+    #: the name rather than in the name column. Empty on most rows, and empty is
+    #: the ordinary case rather than a missing value: nothing is drawn for it.
+    #:
+    #: Last in the field order on purpose: callers construct items positionally
+    #: (``InvoiceItem("ورق", Decimal("2"), Decimal("50"), Decimal("100"))``), so
+    #: inserting it next to :attr:`name` would silently shift the three figures
+    #: one place along and turn a quantity into a description.
+    description: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,12 @@ class Invoice:
     #: ``public_url`` stays the human-facing page (Daftra's HTML preview), which is
     #: a *different* resource: the template header document must point at the PDF.
     pdf_url: str | None = None
+    #: Free text about the invoice as a whole (Daftra's ``notes``) — delivery
+    #: instructions, a payment term, a thank-you. Distinct from the per-line
+    #: :attr:`InvoiceItem.description`: this one belongs to the document, so the
+    #: PDF prints it once, above the products. Empty when the seller wrote nothing,
+    #: which is the common case.
+    description: str = ""
 
 
 #: Outcome statuses a :class:`SendOutcome` can carry. These mirror the poller's

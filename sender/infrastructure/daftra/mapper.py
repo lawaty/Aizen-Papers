@@ -34,6 +34,13 @@ PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
 #: is session-gated (it redirects to the login page without a browser session),
 #: which is why the sender renders its own copy instead of linking to it.
 PDF_URL_KEYS = ("invoice_pdf_url",)
+#: The free text an invoice carries *about itself* (Daftra calls it notes). Read
+#: before ``description``: ``notes`` is what the documented API writes and what the
+#: live account sends, while ``description`` is the spelling a few Daftra shapes use
+#: for the same field, so both are accepted rather than betting on one.
+NOTES_KEYS = ("notes", "description")
+#: The free text a single line carries about itself, under its product name.
+ITEM_DESCRIPTION_KEYS = ("description",)
 #: The phone fields Daftra keeps on a client, in preference order. ``phone1``
 #: and ``phone2`` are the two the ERP actually exposes; ``mobile``/``phone`` are
 #: older shapes seen in the wild. Every key is read as a *source of another
@@ -188,6 +195,7 @@ class DaftraInvoiceMapper:
             items=items,
             public_url=self._first(invoice, PUBLIC_URL_KEYS),
             pdf_url=self._first(invoice, PDF_URL_KEYS),
+            description=self._text(self._first(invoice, NOTES_KEYS)),
         )
 
     def to_invoices(self, raw: dict) -> list[Invoice]:
@@ -265,6 +273,7 @@ class DaftraInvoiceMapper:
             quantity=self._money(self._first(item, ("quantity", "qty"), default=1)),
             unit_price=self._money(unit_price),
             total=self._money(total),
+            description=self._text(self._first(item, ITEM_DESCRIPTION_KEYS)),
         )
 
     def _warn_unmapped_money(self, invoice: dict, items_raw: object) -> None:
@@ -304,6 +313,19 @@ class DaftraInvoiceMapper:
         if number is not None:
             return str(number)
         return str(invoice.get("id") or "")
+
+    @staticmethod
+    def _text(value) -> str:
+        """A free-text field, as the plain string the PDF will draw.
+
+        Deliberately has no default, unlike every other reader in this class: a
+        name-ish field can fall back to a neighbour or to a visible placeholder
+        because the document still needs *a* name there, but a note that Daftra
+        did not send has no honest substitute. ``""`` is the whole answer — the PDF
+        draws nothing for it, which is what "this invoice has no notes" looks like
+        on paper.
+        """
+        return "" if value is None else str(value)
 
     def _customer_name(self, invoice: dict, client: dict) -> str:
         for key in ("business_name", "client_business_name"):

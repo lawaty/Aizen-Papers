@@ -232,6 +232,12 @@ _TITLE_Y = _LOGO_TOP - 23.0
 _HEADER_RULE_Y = _LOGO_TOP - _LOGO_SIZE - 14.0
 _META_Y = _HEADER_RULE_Y - 22.0
 _META_PITCH = _LINE
+#: The invoice's own notes, hanging off the meta block: the air above the label,
+#: and the pitch of the wrapped lines under it. A shade tighter than
+#: :data:`_META_PITCH`, because this block is a paragraph under one label rather
+#: than a list of label-and-value rows — at the full pitch it reads as more rows.
+_NOTES_AIR = 10.0
+_NOTES_PITCH = 12.0
 #: The table's own verticals, all relative to the running baseline.
 _HEADING_AIR = 13.0  # air between the meta block and the section heading
 _BAND_AIR = 17.0  # section heading to the header band
@@ -241,6 +247,10 @@ _BAND_CLEAR = 10.0  # first item row below the band's bottom edge: enough for a
 # 9pt figure's cap to clear the 1pt accent rule under the band, and the only "air"
 # in the table that is not a multiple of the 13pt row pitch.
 _ROW_PITCH = _LINE  # item to item
+#: The pitch of the lines of a line description, under its own item's name. One
+#: point tighter than :data:`_ROW_PITCH`, so the description sits *inside* its row
+#: instead of reading as a row of its own — the figures beside it do not move.
+_DESC_PITCH = 11.0
 _STRIPE_ABOVE = 4.0  # the zebra band's top edge above its row's baseline
 _STRIPE_BELOW = 8.0  # and its bottom edge below
 _NAME_GUTTER = 4.0  # the gutter reserved at the name|quantity boundary
@@ -268,6 +278,7 @@ _CONTENT_BOTTOM = _BOTTOM_Y + 18
 
 #: The fixed chrome words, named so the layout does not repeat them inline.
 _TITLE_TEXT = "فاتورة"
+_NOTES_LABEL = "ملاحظات"
 _ITEMS_HEADING = "بنود الفاتورة"
 _ITEMS_EMPTY = "لا توجد بنود في هذه الفاتورة"
 
@@ -460,6 +471,67 @@ def _fit(text: str, size: int, width: float) -> str:
 def _fitted(value, size: int, width: float) -> str:
     """:func:`_fit` on a raw field value, flattened first."""
     return _fit(_flatten(value), size, width)
+
+
+def _wrap(value, size: float, width: float, field: str) -> list[str]:
+    """*value* as the lines that fit *width*, broken at word boundaries.
+
+    The module's only wrapping, and it exists for exactly the two fields on the
+    page that are **prose** rather than facts: an invoice's notes and a line's
+    description are sentences an operator typed, so they are drawn whole.
+    :func:`_fit` would ellipsise them, and an ellipsised note drops the half of a
+    delivery address, a size or a payment term that made it worth writing — which
+    is a worse failure than a name being shortened, because the customer cannot
+    tell that anything was cut.
+
+    Word widths are measured separately and summed. That is exact rather than an
+    approximation: a word's shaped width does not depend on its neighbours (the
+    Arabic contextual forms are chosen from the letters inside it), and reordering
+    a line moves spans around without changing how wide they are.
+
+    A word too wide for the column on its own — a URL, an unbroken code — is
+    hard-broken by character. It offers no break point, and letting it run would
+    push it leftwards into the neighbouring column, which is how a figure ends up
+    overlapped by prose.
+
+    ``[]`` means *draw nothing*: an absent or empty value, and a value that is
+    empty only after the undrawable characters were dropped. The drop is reported
+    once, here, naming *field* — before any measuring, so every line returned here
+    is the line that will actually be drawn.
+    """
+    text = _shown(value, field, placeholder="")
+    if not text:
+        return []
+    lines: list[str] = []
+    current = ""
+    for word in text.split(" "):
+        # ``_flatten`` has already collapsed runs of whitespace, so a single space
+        # is the only separator left and splitting on it loses nothing.
+        candidate = f"{current} {word}" if current else word
+        if _text_width(candidate, size) <= width:
+            current = candidate
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        if _text_width(word, size) <= width:
+            current = word
+            continue
+        chunk = ""
+        for char in word:
+            # Re-measured per character rather than accumulated, for the same
+            # reason :func:`_fit` re-measures per dropped one: an Arabic glyph's
+            # advance depends on the form shaping picked, and only measuring what
+            # would actually be drawn knows which form that is.
+            if chunk and _text_width(chunk + char, size) > width:
+                lines.append(chunk)
+                chunk = char
+            else:
+                chunk += char
+        current = chunk
+    if current:
+        lines.append(current)
+    return lines
 
 
 # --- runs: shaping, reordering, and picking a font --------------------------------
@@ -811,6 +883,35 @@ def _draw_heading(canvas: _Canvas, invoice: Invoice, currency: str) -> None:
         canvas.move_to(y - index * _META_PITCH)
         canvas.text(_LABEL, label, f"{field} label", _META_SIZE, _SOFT)
         canvas.text(_VALUE, _fitted(value, _META_SIZE, width), field, _META_SIZE, _INK)
+    _draw_notes(canvas, invoice)
+
+
+def _draw_notes(canvas: _Canvas, invoice: Invoice) -> None:
+    """The invoice's own free text, as a labelled paragraph above the products.
+
+    Placed above the items table because it is about the invoice rather than about
+    any one line: a seller who writes "delivery within Cairo" or "pay within 14
+    days" means it of the whole document, and a customer reading the products
+    first would never reach it below them.
+
+    In the secondary ink, like every other label on the page. The notes are prose
+    the operator chose to add, not a figure anyone is reconciling — at body ink
+    they would read as the most important thing on the page, which is not true.
+
+    Wrapped rather than fitted (see :func:`_wrap`), and every line asks for its own
+    space, so a note long enough to reach the foot of the page continues onto the
+    next one instead of being drawn into the footer.
+    """
+    lines = _wrap(invoice.description, _META_SIZE, _FULL[1], "invoice description")
+    if not lines:
+        return
+    canvas.need(_NOTES_AIR + (len(lines) + 1) * _NOTES_PITCH)
+    canvas.gap(_NOTES_AIR)
+    canvas.text(_FULL, _NOTES_LABEL, "description label", _META_SIZE, _SOFT)
+    for line in lines:
+        canvas.need(_NOTES_PITCH)
+        canvas.gap(_NOTES_PITCH)
+        canvas.text(_FULL, line, "invoice description", _META_SIZE, _SOFT)
 
 
 def _header_cells() -> tuple[tuple[Box, str, str], ...]:
@@ -899,13 +1000,36 @@ def _draw_items(canvas: _Canvas, invoice: Invoice) -> None:
         canvas.need(_LINE)
         canvas.text(_FULL, _ITEMS_EMPTY, "line items empty", _TABLE_SIZE, _SOFT)
     for index, item in enumerate(items):
-        if canvas.need(_HEAD_SPACE + _LINE):
+        lines = _wrap(
+            item.description,
+            _TABLE_SIZE,
+            _COL_NAME_WIDTH - _NAME_GUTTER,
+            f"item {index + 1} description",
+        )
+        # The row is as tall as its own lines plus its description's, and it is
+        # reserved and striped as one: splitting a description across a page break
+        # would separate a line's prose from the figures it belongs to.
+        extra = len(lines) * _DESC_PITCH
+        if canvas.need(_HEAD_SPACE + _LINE + extra):
             canvas.move_to(_TOP_Y - _CONTINUE_TOP)
             _draw_table_head(canvas)
         if index % 2:
             # The stripe goes down before the text that sits on it: a fill painted
-            # after the text would cover the figures it is meant to sit behind.
-            canvas.fill(_MARGIN_X, canvas.y - _STRIPE_ABOVE, _RIGHT - _MARGIN_X, _STRIPE_ABOVE + _STRIPE_BELOW, _ZEBRA)
+            # after the text would cover the figures it is meant to sit behind. It
+            # grows *downward* from its own row's baseline, never upward past it —
+            # a band anchored above its baseline would reach back over the row
+            # above, and now that a row can be several lines tall that is the
+            # description of the previous item, painted out by an opaque fill. The
+            # height grows with the row instead, so the description is banded with
+            # its own name. For a row with no description this is the arithmetic
+            # the layout has always used, unchanged.
+            canvas.fill(
+                _MARGIN_X,
+                canvas.y - extra - _STRIPE_BELOW,
+                _RIGHT - _MARGIN_X,
+                _STRIPE_ABOVE + _STRIPE_BELOW + extra,
+                _ZEBRA,
+            )
         canvas.text(
             _COL_NAME,
             _fitted(item.name, _TABLE_SIZE, _COL_NAME_WIDTH - _NAME_GUTTER),
@@ -926,6 +1050,15 @@ def _draw_items(canvas: _Canvas, invoice: Invoice) -> None:
         )
         _draw_figure(canvas, _COL_PRICE, _money(item.unit_price), _TABLE_SIZE, _INK, _TABLE_SIZE)
         _draw_figure(canvas, _COL_TOTAL, _money(item.total), _TABLE_SIZE, _INK, _TABLE_SIZE)
+        for line in lines:
+            # A description far longer than a page continues onto the next one
+            # rather than being drawn over the footer. The row was reserved whole
+            # above, so this only fires for a description that cannot fit a page at
+            # all — in which case the spill is unbanded, which is the lesser fault
+            # against writing the customer's own words into the page number.
+            canvas.need(_DESC_PITCH)
+            canvas.gap(_DESC_PITCH)
+            canvas.text(_COL_NAME, line, f"item {index + 1} description", _TABLE_SIZE, _SOFT)
         canvas.gap(_ROW_PITCH)
 
 
@@ -1027,9 +1160,14 @@ def _warn_unshaped(invoice: Invoice) -> None:
     fields: list[tuple[str, object]] = [
         ("customer name", invoice.customer_name),
         ("status", invoice.status),
+        ("invoice description", invoice.description),
     ]
     fields += [
         (f"item {index + 1} name", item.name) for index, item in enumerate(invoice.items or ())
+    ]
+    fields += [
+        (f"item {index + 1} description", item.description)
+        for index, item in enumerate(invoice.items or ())
     ]
     for name, value in fields:
         unshaped = unshaped_arabic(_flatten(value))

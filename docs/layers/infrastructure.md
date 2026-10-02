@@ -36,10 +36,11 @@ envelope whose `result` is not `successful`/`success`/absent.
 The translation layer. Reads the Daftra envelope
 (`{ result, code, data: { Invoice: { ..., Client, InvoiceItem[] } } }`) and the concrete
 v2 field names (e.g. `summary_total`, `summary_paid`, `summary_unpaid`,
-`payment_status`, `Client.phone1/phone2`, `InvoiceItem.item/quantity/unit_price`)
-into the normalized `Invoice`/`InvoiceItem` model. It maps the two URLs onto
-separate fields: `invoice_html_url` → `Invoice.public_url` (the human-facing page)
-and `invoice_pdf_url` → `Invoice.pdf_url` (the actual PDF). `Client` and `InvoiceItem` are
+`payment_status`, `Client.phone1/phone2`, `InvoiceItem.item/quantity/unit_price`,
+and the two free-text fields `notes` → `Invoice.description` and
+`InvoiceItem.description`) into the normalized `Invoice`/`InvoiceItem` model. It
+maps the two URLs onto separate fields: `invoice_html_url` → `Invoice.public_url`
+(the human-facing page) and `invoice_pdf_url` → `Invoice.pdf_url` (the actual PDF). `Client` and `InvoiceItem` are
 nested *inside* the `Invoice` object by the live API; the mapper also accepts them
 sitting beside `Invoice`, which is the shape the offline stub used to emit. Guards
 against missing or malformed payloads, repairs booleans-as-ints, keeps a `0` invoice
@@ -106,7 +107,11 @@ map the drawn glyphs need. Text goes through shape → reorder → glyph-id mapp
 first, so Arabic is drawn in its contextual forms, joined, and in visual order;
 the table is laid out right-to-left from the right margin. Text neither font can
 draw is dropped with a WARNING naming the field, and a value left empty renders
-as `-`. Money is never truncated; a too-wide name is shortened with `...`.
+as `-`. Money is never truncated; a too-wide name is shortened with `...`. The two
+free-text fields are the exception and are **wrapped**, not fitted: `notes` as one
+labelled paragraph above the products, `InvoiceItem.description` as a second line
+inside its own row, both drawn whole because an ellipsis there would delete part
+of what the seller wrote. See [Invoice PDF](../guide/invoice-pdf.md#the-two-free-text-fields).
 
 ### `arabic.py` — shaping and bidi
 

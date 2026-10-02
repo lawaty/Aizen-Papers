@@ -513,6 +513,332 @@ def test_an_over_wide_quantity_is_drawn_in_full_rather_than_truncated() -> None:
     assert "..." not in text
 
 
+#: An invoice whose every line carries a description, and which has notes of its own.
+#: The two together, because that is what an account that fills these fields in
+#: actually sends, and a test that only ever sees one of them cannot tell a shared
+#: layout fault from two independent ones. The prose is deliberately free of digits
+#: and punctuation: each value then draws as a single Arabic span, which is what lets
+#: these tests name a description by its glyph ids and assert on *its* baseline.
+NOTES = "التوصيل خلال أسبوع داخل القاهرة والدفع خلال أربعة عشر يوما من تاريخ الفاتورة"
+DESCRIPTIONS = ("وزن ثلاثمئة جرام وعرض سبعون سنتيمتر", "اللون بني فاتح", "العرض خمسة سنتيمتر")
+ITEM_NAMES = ("ورق حائط كلاسيك", "رول فيلكس", "شريط لاصق")
+
+
+def described_invoice(**overrides) -> Invoice:
+    base = dict(
+        description=NOTES,
+        items=tuple(
+            InvoiceItem(
+                name=name,
+                quantity=Decimal(index + 1),
+                unit_price=Decimal("50.00"),
+                total=Decimal("100.00"),
+                description=DESCRIPTIONS[index],
+            )
+            for index, name in enumerate(ITEM_NAMES)
+        ),
+    )
+    base.update(overrides)
+    return arabic_invoice(**base)
+
+
+def _baseline_of(pdf: bytes, glyphs: str) -> float:
+    """The baseline *glyphs* were drawn on, as the only one carrying them.
+
+    Remember the page's own convention: a larger y is *higher* up it, so "above"
+    is a greater baseline, not a smaller one.
+    """
+    found = {float(span["y"]) for span in spans(pdf) if span["gids"] == glyphs}
+    assert len(found) == 1, f"{glyphs!r} is drawn on {len(found)} baselines: {found}"
+    return found.pop()
+
+
+def _ink(pdf: bytes, glyphs: str) -> list[tuple[float, float, float, float]]:
+    """The ink boxes of every span carrying *glyphs*."""
+    return [_span_box(span) for span in spans(pdf) if span["gids"] == glyphs]
+
+
+def _colour_of(pdf: bytes, glyphs: str) -> str:
+    """The fill colour the span carrying *glyphs* was painted in.
+
+    Read out of the operator rather than off the span, because the colour is the
+    ``rg`` that opens the op and the span regex only matches the text state.
+    """
+    found = set()
+    for op in _ops(page_text(pdf)):
+        span = SPAN.search(op)
+        if not span or span["gids"] != glyphs:
+            continue
+        found.update(re.findall(r"^([\d.]+ [\d.]+ [\d.]+) rg$", op, re.M))
+    assert len(found) == 1, f"{glyphs!r} is drawn in {len(found)} colours: {found}"
+    return found.pop()
+
+
+def _line_gids(pdf: bytes) -> list[str]:
+    """Every drawn line as one glyph-id string, top line first.
+
+    Glyph ids and not text, because the ``/ToUnicode`` map reports the *presentation
+    form* each letter was drawn in — which is what makes copy-and-paste work, and
+    which also means the letters cannot be searched for by name. So a word is found
+    here the way it is drawn: through :func:`shaped_gids`, the same pipeline the
+    writer uses, so a word that reached the page is a word this can find.
+    """
+    lines = []
+    for baseline in sorted({float(span["y"]) for span in spans(pdf)}, reverse=True):
+        on_line = sorted(
+            (span for span in spans(pdf) if float(span["y"]) == baseline),
+            key=lambda span: float(span["x"]),
+        )
+        lines.append("".join(span["gids"] or "" for span in on_line))
+    return lines
+
+
+def test_the_invoice_notes_are_drawn_as_a_labelled_block_above_the_products() -> None:
+    """The invoice's own free text reaches the customer, labelled and in place.
+
+    Above the items table because it is about the invoice and not about any one
+    line, and labelled because an unlabelled paragraph between the meta rows and
+    the products reads as a fifth meta row whose value has overflowed.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    label = _baseline_of(pdf, shaped_gids("ملاحظات"))
+    notes = _baseline_of(pdf, shaped_gids(NOTES))
+    assert label > notes, "the label leads its own block"
+    assert notes > _baseline_of(pdf, shaped_gids("بنود الفاتورة")), "above the products"
+    # The customer name is the last Arabic meta row, and the notes are under it.
+    assert notes < _baseline_of(pdf, shaped_gids("شركة النور للديكور")), "below the meta rows"
+
+
+def test_an_invoice_with_no_notes_draws_no_notes_block_at_all() -> None:
+    """Empty means nothing is drawn — no label, no dash, and no line of air.
+
+    Most invoices on the live account carry no notes, so a placeholder would print
+    an empty heading above the products of every invoice that account sends. The
+    products' heading is asserted at the baseline the meta block alone puts it on
+    (four 13pt rows below :data:`META_Y`), which is what makes this a statement
+    about the empty case consuming no room and not merely about the text being
+    absent: a stray blank line would push the heading down without drawing a thing.
+    """
+    pdf = render_invoice_pdf(described_invoice(description=""))
+    text = stream_text(pdf)
+    assert shaped_gids("ملاحظات") not in text, "an empty note still drew its label"
+    assert shaped_gids(NOTES) not in text
+    assert _baseline_of(pdf, shaped_gids("بنود الفاتورة")) == META_Y - 4 * 13
+
+
+def test_the_notes_are_wrapped_and_never_ellipsised() -> None:
+    """A note is prose, so it wraps; it is never fitted with an ellipsis.
+
+    An ellipsised note drops the half of a delivery address, a size or a payment
+    term that made it worth writing — and unlike a shortened name the customer has
+    no way to tell that anything was left out.
+    """
+    words = ["توصيل", "داخل", "القاهرة", "خلال", "أسبوع"] * 12
+    pdf = render_invoice_pdf(arabic_invoice(description=f"بداية {' '.join(words)} خاتمة"))
+    assert "..." not in stream_text(pdf)
+    # Every word is drawn, all 62 of them: nothing was dropped to make the note fit.
+    lines = _line_gids(pdf)
+    for word in set(words) | {"بداية", "خاتمة"}:
+        assert any(shaped_gids(word) in line for line in lines), f"{word} was dropped"
+    # And it took more than one line to do it — the note wrapped rather than being
+    # fitted onto one, which is the whole difference from a name being shortened.
+    carried = [line for line in lines if shaped_gids("توصيل") in line]
+    assert len(carried) > 1, f"a {len(words)}-word note fitted on one line: {lines}"
+
+
+def test_every_wrapped_notes_line_stays_inside_the_text_column() -> None:
+    """Wrapping is measured against the real width, so no line runs off the paper.
+
+    Sixty-odd long Latin words at one line's worth of column each: an implementation
+    that fitted instead of wrapping would ellipsise, and one that wrapped without
+    measuring would run the line into the margin.
+    """
+    pdf = render_invoice_pdf(arabic_invoice(description=" ".join(["E" * 12] * 40)))
+    assert "..." not in stream_text(pdf)
+    for span in spans(pdf):
+        size = float(span["size"])
+        right = float(span["x"]) + (
+            arabic_width(span["gids"], size)
+            if span["gids"]
+            else latin_width(span["literal"], size)
+        )
+        assert float(span["x"]) >= LEFT_MARGIN - 0.01, span
+        assert right <= RIGHT_MARGIN + 0.01, span
+
+
+def test_a_line_description_is_drawn_under_its_own_name() -> None:
+    """The description belongs to the line it describes, so it shares its column.
+
+    Asserted from the drawn baselines rather than the writer's constants, and
+    between two items rather than at the end of the table — so it cannot pass by
+    being a whole-table block that happened to land under the last item.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    drawn = rows(pdf)
+    names = [_baseline_of(pdf, shaped_gids(name)) for name in ITEM_NAMES]
+    assert names[0] > names[1] > names[2], "the items are in document order"
+    for index, description in enumerate(DESCRIPTIONS):
+        below = _baseline_of(pdf, shaped_gids(description))
+        assert below < names[index], "the description is under its own name"
+        if index + 1 < len(names):
+            assert below > names[index + 1], "and above the next item, so it is this line's"
+        # The figures are still on the name's baseline: the description is a second
+        # line of the name cell, not a second row with figures of its own.
+        assert len(drawn[names[index]]) == 4
+
+
+def test_a_line_description_is_drawn_in_the_secondary_ink() -> None:
+    """The prose is quieter than the figures, and at their size but not their weight.
+
+    At body ink a paragraph under every item name would be the loudest thing on the
+    page; the figures are what a customer reconciles.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    description = _colour_of(pdf, shaped_gids(DESCRIPTIONS[0]))
+    name = _colour_of(pdf, shaped_gids(ITEM_NAMES[0]))
+    assert description != name, "a description must not read as the name above it"
+    for glyphs in (shaped_gids(DESCRIPTIONS[0]), shaped_gids(ITEM_NAMES[0])):
+        sizes = {span["size"] for span in spans(pdf) if span["gids"] == glyphs}
+        assert sizes == {"9"}, f"a table cell is 9pt, not {sizes}"
+
+
+def test_a_line_with_no_description_takes_no_extra_line() -> None:
+    """The row rhythm is unchanged for a line that has nothing to add.
+
+    Pinned as the exact 13pt pitch rather than "close to", because the alternative
+    is an empty line under every item of every invoice from an account that never
+    fills descriptions in — the overwhelming majority of them.
+    """
+    pdf = render_invoice_pdf(
+        arabic_invoice(items=tuple(InvoiceItem(name) for name in ITEM_NAMES))
+    )
+    baselines = sorted({float(span["y"]) for span in spans(pdf)}, reverse=True)
+    assert 13.0 in [top - below for top, below in zip(baselines, baselines[1:])]
+
+
+def test_a_long_line_description_wraps_inside_the_name_column() -> None:
+    """Wrapped to the name column's width, so it can never reach the quantity.
+
+    The name column ends where the quantity column begins, less the 4pt gutter. A
+    description that ignored that would run under the figures, which is the one
+    thing the column geometry exists to prevent.
+    """
+    pdf = render_invoice_pdf(
+        arabic_invoice(items=(InvoiceItem(name="صنف", description=" ".join(["توصيل"] * 30)),))
+    )
+    # The description's own lines are the ones under the item's name and inside the
+    # name column: the totals block is below them and its figures are money-shaped.
+    lines = [
+        span
+        for span in spans(pdf)
+        if span["gids"]
+        and float(span["y"]) < _baseline_of(pdf, shaped_gids("صنف"))
+        and float(span["x"]) >= RIGHT_MARGIN - 246.0 - 0.01
+    ]
+    assert len({span["y"] for span in lines}) > 1, "a 30-word description has to wrap"
+    # The name column: its right edge *is* the right margin, and its left edge stops
+    # short by the gutter reserved for the quantity column beside it.
+    for span in lines:
+        right = float(span["x"]) + arabic_width(span["gids"], float(span["size"]))
+        assert right <= RIGHT_MARGIN + 0.01, "a description left the name column"
+
+
+def test_a_word_too_wide_for_the_column_is_broken_rather_than_run_over() -> None:
+    """An unbreakable token — a long code, a URL — has no break point to be had.
+
+    Letting it run would push it leftwards into the neighbouring column, which is how
+    a figure ends up overlapped by prose, so it is broken by character instead.
+    """
+    pdf = render_invoice_pdf(
+        arabic_invoice(items=(InvoiceItem(name="صنف", description="A" * 300),))
+    )
+    # Literal spans are the figures as well as the token, so the money-shaped ones —
+    # which ``_money`` is the only producer of — are told apart by their own shape.
+    chunks = [
+        span
+        for span in spans(pdf)
+        if span["literal"]
+        and not MONEY.match(span["literal"])
+        and float(span["x"]) >= RIGHT_MARGIN - 246.0 - 0.01
+    ]
+    assert len(chunks) > 1, "a 300-character token has to be broken across lines"
+    for span in chunks:
+        width = latin_width(span["literal"], float(span["size"]))
+        assert RIGHT_MARGIN - 246.0 - 0.01 <= float(span["x"]), span
+        assert float(span["x"]) + width <= RIGHT_MARGIN + 0.01, span
+
+
+def test_a_stripe_covers_its_own_row_and_never_the_one_above_it() -> None:
+    """A stripe is painted *behind* text, so it must not reach up into the row above.
+
+    This is the regression the taller row made possible: a band measured upward from
+    its own baseline still clears a 13pt row, but a row is now several lines tall and
+    such a band lands squarely on the previous item's description — which an opaque
+    fill erases. PDF paints in operator order, so nothing in the file says the words
+    are gone.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    for stream in page_streams(pdf):
+        drawn: list[tuple[float, float, float, float]] = []
+        for op in _ops(stream):
+            rect = RECT.match(op)
+            if rect:
+                left, low = float(rect["x"]), float(rect["y"])
+                box = (left, low, left + float(rect["w"]), low + float(rect["h"]))
+                assert not any(
+                    _overlaps(box, other) for other in drawn
+                ), f"a stripe is painted over the row above it: {rect['x']} {rect['y']}"
+                continue
+            span = SPAN.search(op)
+            if span:
+                drawn.append(_span_box(span))
+
+
+def test_a_description_does_not_collide_with_any_other_line_on_the_page() -> None:
+    """The extra line is inserted into a layout that positions from a running baseline.
+
+    The failure mode is a description landing on the name of the item below it: not
+    visible in the source, obvious on the page, and invisible to any test that only
+    counts what was drawn. Every description is therefore checked against every
+    other span on the page, with the deliberately generous ink boxes this file uses.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    everything = [_span_box(span) for span in spans(pdf)]
+    for description in DESCRIPTIONS:
+        for box in _ink(pdf, shaped_gids(description)):
+            assert not any(
+                _overlaps(box, other) for other in everything if other != box
+            ), f"{description} overlaps another line: {box}"
+
+
+def test_an_arabic_description_is_drawn_from_the_arabic_font(caplog) -> None:
+    """Arabic prose goes through the same shaping as every other Arabic field.
+
+    Asserted through the glyph ids, because "the Arabic characters are somewhere in
+    the file" is true of the font dictionary too and says nothing about the page.
+    """
+    caplog.clear()
+    pdf = render_invoice_pdf(
+        described_invoice(description="ملاحظات الفاتورة", items=(InvoiceItem(name="صنف", description="توضيح"),))
+    )
+    assert shaped_gids("توضيح") in stream_text(pdf)
+    assert shaped_gids("ملاحظات الفاتورة") in stream_text(pdf)
+    assert "invoice PDF" not in caplog.text
+
+
+def test_a_persian_letter_in_a_description_is_reported(caplog) -> None:
+    """The tripwire covers the newest field on the page, not just the oldest.
+
+    A Persian or Urdu letter has no presentation form, so it is drawn half-joined.
+    That is already worth reporting for a customer name; a description is operator-
+    supplied text arriving by the same door and must not be the one field that gets
+    away with it.
+    """
+    caplog.clear()
+    render_invoice_pdf(described_invoice(items=(InvoiceItem(name="صنف", description="یادداشت"),)))
+    assert "item 1 description" in caplog.text
+
+
 def test_parentheses_and_backslashes_are_escaped() -> None:
     """``(``/``)``/``\\`` are structural inside a PDF string literal.
 

@@ -61,9 +61,37 @@ two fonts:
 | `Identity-H` `CIDFontType2` + `FontFile2` | all Arabic, including every contextual form and lam-alef ligature | yes — 87 KB subset, Flate-compressed |
 
 The document contains the invoice number, issue date, customer, currency,
-subtotal / total / paid / balance due, the line items (name, quantity, unit
-price, line total), and paginates when the item list is long, repeating the
-column headings on every page.
+subtotal / total / paid / balance due, the invoice's own description, the line
+items (name, description, quantity, unit price, line total), and paginates when
+the item list is long, repeating the column headings on every page.
+
+### The two free-text fields
+
+Daftra lets a seller write prose in two places, and both reach the page:
+
+| Where | Daftra field | Model field | Drawn as |
+|---|---|---|---|
+| the invoice | `notes` | `Invoice.description` | one labelled, wrapped paragraph (`ملاحظات`) under the meta rows, above the products |
+| one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
+
+They are **wrapped, never fitted**. This is the one thing that separates them from
+every other free field on the page: a name or a customer is `_fit`-shortened to
+its column with `...`, because a shortened name still says which product it is.
+A description is a sentence — a delivery instruction, a size, a payment term —
+and ellipsising one silently deletes the half that made it worth writing, with
+nothing on the page to say anything was cut. So `_wrap` in `pdf.py` breaks these
+two fields at word boundaries and draws every line, and a word too wide for its
+column (a URL, a long code) is broken by character rather than allowed to run into
+the neighbouring column.
+
+The two are separate fields on purpose: `notes` is about the invoice and is
+printed once above the products, because a customer reading the items first would
+never reach a note placed below them. The line description is about one row, so it
+sits inside that row, under its name, in the secondary ink — at body ink a
+paragraph under every item name would be the loudest thing on the page, and the
+figures are what a customer reconciles. A row with no description takes no extra
+line at all, and neither field draws anything when it is empty: no label, no `-`,
+and no line of air.
 
 ### Arabic and right-to-left
 
@@ -139,7 +167,12 @@ face would clog its joins, so Arabic is never stroked.
   accent rule under it; alternate item rows carry a zebra tint. There are no
   vertical column rules: the columns are edge-adjacent by construction (the unit
   price's right edge *is* the quantity's left edge), so a separator would run
-  its line straight through the last digit of every figure beside it.
+  its line straight through the last digit of every figure beside it. A zebra
+  band is measured **downward from its own row's baseline** and grows with the
+  row, never upward: a band anchored above its baseline still clears a 13pt row,
+  but a row with a description under it is several lines tall, and such a band
+  lands on the *previous* item's description — which an opaque fill erases, with
+  nothing in the file to say the words are gone.
 
 The layout's numbers are the constants in the geometry block of `pdf.py`
 (`_TITLE_Y`, `_HEADING_AIR`, `_BAND_*`, `_STRIPE_*`, `_TOTALS_*`,
@@ -188,7 +221,10 @@ customer name: U+4E2D U+6587 U+1F600; the PDF shows the text without them
 ```
 
 Arabic itself never warns: every Arabic letter in the invoice is drawn, shaped
-and joined.
+and joined. Both free-text fields are covered by this tripwire and by the
+unjoined-letter report below, exactly like the customer name and the item names:
+a description is operator-supplied text arriving by the same door and must not be
+the one field that quietly draws half-joined.
 
 ### An invoice with a total and no products
 
@@ -299,7 +335,7 @@ with backoff and never lost, permanent ones are recorded as `abandoned`.
 ```bash
 python -m sender preview --invoice-id 1                    # renders + uploads, never sends
 python -m sender preview --invoice-id 1 --attachment link  # no upload
-python -m sender preview --invoice-id 1 --stub             # offline: stub invoice, no upload
+python -m sender preview --invoice-id 1 --invoice-stub    # offline: stub invoice, no upload
 python -m sender send --invoice-id 1 --dry-run
 ```
 

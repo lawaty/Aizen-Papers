@@ -88,6 +88,15 @@ implicitly:
 explicit `status` string, customer phone) — deliberately *not* a mirror of
 Daftra's schema. `InvoiceItem` holds line-item view-model data.
 
+The two `description` fields are free text the seller typed, and they are
+deliberately distinct: `Invoice.description` is Daftra's `notes` and belongs to
+the document, while `InvoiceItem.description` belongs to one line. Both are
+optional — `""` is the ordinary case and means "nothing was written", never "the
+data was lost". `InvoiceItem.description` is declared **last** in the field order
+because callers construct items positionally; inserting it next to `name` would
+silently shift the three figures one place along. See
+[Invoice PDF](../guide/invoice-pdf.md) for where each is drawn.
+
 ### 5. The attachment contract — `attachments.py`
 
 `Invoice.pdf_url` is the invoice's real PDF (`invoice_pdf_url` in the Daftra

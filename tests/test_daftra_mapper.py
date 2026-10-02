@@ -198,6 +198,113 @@ def test_nested_invoice_items_are_not_dropped(mapper):
     assert item.total == Decimal("35000")
 
 
+def _with_invoice_fields(**fields) -> dict:
+    """REAL_INVOICE_RESPONSE with keys added to the ``Invoice`` node.
+
+    Built on the captured payload for the same reason as :func:`_detail_response`:
+    the real envelope, nesting and field names are the parts that decide whether a
+    key is read at all, and a hand-written row would quietly stop testing that.
+    """
+    import copy
+
+    payload = copy.deepcopy(REAL_INVOICE_RESPONSE)
+    payload["data"]["Invoice"].update(fields)
+    return payload
+
+
+def _with_item_fields(**fields) -> dict:
+    """REAL_INVOICE_RESPONSE with keys added to its single ``InvoiceItem``.
+
+    The captured row already carries ``description: ""``, so a test that wants to
+    see a description written has to fill it — which is also the point: the empty
+    string Daftra sends on most rows and a sentence an operator typed arrive over
+    the same key, and both have to reach the model.
+    """
+    import copy
+
+    payload = copy.deepcopy(REAL_INVOICE_RESPONSE)
+    payload["data"]["Invoice"]["InvoiceItem"][0].update(fields)
+    return payload
+
+
+def test_the_captured_items_empty_description_is_an_empty_string(mapper):
+    """The captured row says ``description: ""``, and that has to stay empty.
+
+    Not a cosmetic assertion: Daftra sends the key on every line whether or not
+    anyone wrote anything, so "the key is there" and "the seller wrote something"
+    are different facts, and only the second may put words on the customer's PDF.
+    """
+    assert mapper.to_invoice(REAL_INVOICE_RESPONSE).items[0].description == ""
+
+
+def test_a_written_line_description_is_mapped(mapper):
+    """``InvoiceItem.description`` is the line's own prose and reaches the model.
+
+    The key is not the name: the captured row carries both ``item`` (the product)
+    and ``description``, and a mapper that read the wrong one would either print
+    the product twice or drop what the operator wrote about the line.
+    """
+    invoice = mapper.to_invoice(_with_item_fields(description="وزن 300 جرام وعرض 70 سم"))
+    assert invoice.items[0].description == "وزن 300 جرام وعرض 70 سم"
+    # The name is untouched by it: the two are different fields, not one.
+    assert invoice.items[0].name == "دوبلكس فايج 300جم بكر 70سم"
+
+
+def test_a_line_with_no_description_key_at_all_is_empty_not_a_placeholder(mapper):
+    """Absent and empty are the same answer, and neither is ``"-"``.
+
+    A placeholder would print a dash under every line of every invoice an account
+    that never fills descriptions in sends, which is the overwhelming majority.
+    """
+    import copy
+
+    payload = copy.deepcopy(REAL_INVOICE_RESPONSE)
+    del payload["data"]["Invoice"]["InvoiceItem"][0]["description"]
+    assert mapper.to_invoice(payload).items[0].description == ""
+
+
+def test_the_invoice_notes_are_mapped(mapper):
+    """``notes`` is the free text about the invoice as a whole."""
+    invoice = mapper.to_invoice(_with_invoice_fields(notes="التوصيل خلال أسبوع داخل القاهرة"))
+    assert invoice.description == "التوصيل خلال أسبوع داخل القاهرة"
+
+
+def test_an_invoice_with_no_notes_is_empty(mapper):
+    """The captured payload carries no ``notes``, and that is the ordinary case."""
+    assert mapper.to_invoice(REAL_INVOICE_RESPONSE).description == ""
+
+
+def test_the_notes_fall_back_to_the_description_spelling(mapper):
+    """Daftra spells the same invoice-level field two ways; read whichever came.
+
+    ``notes`` is the documented and observed spelling. ``description`` is the one a
+    few shapes use for the same free text, and a tenant on that shape should get
+    its note printed rather than silently losing it — the whole point of reading
+    the field at all.
+    """
+    assert mapper.to_invoice(_with_invoice_fields(description="Payment within 14 days")).description == (
+        "Payment within 14 days"
+    )
+
+
+def test_notes_win_over_the_description_spelling(mapper):
+    """Both present: ``notes`` is the documented field, so it is the one read."""
+    invoice = mapper.to_invoice(_with_invoice_fields(notes="ملاحظات", description="description"))
+    assert invoice.description == "ملاحظات"
+
+
+def test_empty_notes_fall_through_to_the_description_spelling(mapper):
+    """Daftra sends ``notes: ""`` on most invoices, which must not win by being first.
+
+    A bare ``_first(invoice, ("notes", ...))`` would stop at the empty string on
+    every invoice that has a description under the other spelling, or — the worse
+    half of the same bug — an implementation that stopped at "notes is present"
+    would print an empty note and never look again.
+    """
+    invoice = mapper.to_invoice(_with_invoice_fields(notes="", description="Payment within 14 days"))
+    assert invoice.description == "Payment within 14 days"
+
+
 def test_invoice_header_fields_map_from_the_real_payload(mapper):
     invoice = mapper.to_invoice(REAL_INVOICE_RESPONSE)
     assert invoice.id == "1"
