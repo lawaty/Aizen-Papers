@@ -15,6 +15,7 @@ from the company's own domain.
 from __future__ import annotations
 
 import html
+import json
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
@@ -67,6 +68,19 @@ def _format_timestamp(epoch: float) -> str:
 
 def _format_date(value: date | None) -> str:
     return value.isoformat() if value else ""
+
+
+def _local_day(epoch: float) -> date:
+    """The host-local date an epoch falls on.
+
+    Local time is deliberate and matches how the poll summary prints timestamps:
+    the operator reads "what happened today" against the host's clock, so the
+    day boundary is the server's, not UTC's.
+    """
+    try:
+        return datetime.fromtimestamp(epoch).date()
+    except (OverflowError, OSError, ValueError):
+        return date.today()
 
 
 def outcome_to_json(outcome: SendOutcome) -> dict[str, Any]:
@@ -235,6 +249,166 @@ def render_date_page(
     )
 
 
+_SEARCH_CSS = (
+    ".bar{display:flex;gap:.5rem;flex-wrap:wrap;margin:0 0 1rem}"
+    ".bar input{flex:1 1 16rem;padding:.5rem .6rem;border:1px solid #cdd3d9;"
+    "border-radius:6px;font:inherit;background:#fff}"
+    ".bar select{padding:.5rem .6rem;border:1px solid #cdd3d9;border-radius:6px;"
+    "font:inherit;background:#fff}"
+    "#hits{overflow-x:auto}"
+    ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;"
+    "font-size:.85rem;white-space:nowrap}"
+)
+
+_SEARCH_FORM = (
+    '<div class="bar">'
+    '<input id="q" type="search" placeholder="Search phone, name, invoice, app..." '
+    'autocomplete="off" autofocus>'
+    '<select id="st"><option value="">All results</option>'
+    '<option value="sent">Sent only</option>'
+    '<option value="failed">Failed / abandoned only</option></select>'
+    "</div>"
+)
+
+_SEARCH_JS = """<script>
+const DATA = __DATA__;
+const q = document.getElementById("q");
+const st = document.getElementById("st");
+const hits = document.getElementById("hits");
+const esc = (v) => (v === null || v === undefined) ? "" : String(v)
+  .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+  .replace(/"/g,"&quot;");
+
+function badge(status) {
+  const ok = status === "sent";
+  const cls = ok ? "ok" : (status === "failed" ? "bad" : "warn");
+  const label = ok ? "Sent" : (status === "failed" ? "Failed" : "Abandoned");
+  return '<span class="badge ' + cls + '">' + label + "</span>";
+}
+
+function draw() {
+  const needle = q.value.trim().toLowerCase();
+  const want = st.value;
+  const rows = DATA.filter((r) => {
+    if (want === "sent" && r.s !== "sent") return false;
+    if (want === "failed" && r.s === "sent") return false;
+    if (!needle) return true;
+    // Digits are matched loosely so a national-format tail finds the stored
+    // international number despite a leading country code.
+    const digits = needle.replace(/\\D/g, "");
+    const hay = (r.p + " " + r.n + " " + r.i + " " + r.g + " " + r.a).toLowerCase();
+    if (hay.includes(needle)) return true;
+    return digits.length >= 4 && (r.p || "").replace(/\\D/g, "").includes(digits);
+  });
+  if (!rows.length) {
+    hits.innerHTML = '<p class="none">Nothing matches that filter.</p>';
+    return;
+  }
+  const body = rows.map((r) => "<tr>"
+    + '<td><a href="' + esc(r.u) + '">' + esc(r.d) + "</a></td>"
+    + "<td>" + esc(r.t) + "</td>"
+    + "<td>" + badge(r.s) + "</td>"
+    + "<td>" + esc(r.n) + "</td>"
+    + '<td class="mono">' + esc(r.p) + "</td>"
+    + "<td>" + esc(r.i) + "</td>"
+    + "<td>" + esc(r.a) + "</td>"
+    + '<td class="err">' + esc(r.x) + "</td>"
+    + "</tr>").join("");
+  hits.innerHTML = rows.length + " row(s)<table><thead><tr>"
+    + "<th>Date</th><th>Time</th><th>Status</th><th>Customer</th><th>Phone</th>"
+    + "<th>Invoice #</th><th>App</th><th>Notes</th>"
+    + "</tr></thead><tbody>" + body + "</tbody></table>";
+}
+q.addEventListener("input", draw);
+st.addEventListener("change", draw);
+draw();
+</script>
+"""
+
+
+def _json_for_script(payload: Any) -> str:
+    """Serialize ``payload`` for embedding inside a ``<script>`` element.
+
+    ``json.dumps`` alone is not safe here: HTML parsing ends a script block at
+    the first ``</script``, so a customer name from the ERP containing that
+    sequence (or ``<!--``) would break out of the tag and inject markup. The
+    three HTML-significant characters are escaped to their ``\\uXXXX`` JSON
+    forms, which parse back to the same strings but cannot terminate the block.
+    """
+    return (
+        json.dumps(payload, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def render_recipients(
+    entries: Sequence[SendOutcome],
+    *,
+    obfuscate: bool = True,
+) -> str:
+    """Render a searchable, sortable list of every recipient and what they got.
+
+    The date pages answer "what happened on the 12th". This answers the other
+    half of the question an operator actually has: "what did we send this
+    person, and did any of it fail". It is a single self-contained page whose
+    filter is plain client-side JavaScript, because the reports are static files
+    behind basic auth with no server-side code to lean on.
+    """
+    if not entries:
+        return _page(
+            "Recipients",
+            '<p class="sub"><a href="index.html">&larr; All dates</a></p>',
+            '<p class="none">No messages have been sent yet.</p>',
+        )
+
+    data = _json_for_script(
+        [
+            {
+                "d": _format_date(_local_day(entry.attempted_at)),
+                "t": _format_timestamp(entry.attempted_at),
+                "n": entry.customer_name or "",
+                "p": obfuscate_phone(entry.customer_phone)
+                if obfuscate
+                else (entry.customer_phone or ""),
+                "i": entry.invoice_number or "",
+                "g": entry.invoice_id or "",
+                "a": entry.app or "",
+                "s": entry.status or "",
+                "x": entry.error or "",
+                "u": f"{_local_day(entry.attempted_at).isoformat()}.html",
+            }
+            for entry in entries
+        ]
+    )
+    return _page(
+        "Recipients",
+        '<p class="sub"><a href="index.html">&larr; All dates</a></p>'
+        '<p class="sub">Filter by phone, name, invoice or app. '
+        f"{len(entries)} send attempt(s).</p>",
+        _SEARCH_FORM + '<div id="hits"></div>',
+        script=_SEARCH_JS.replace("__DATA__", data),
+    )
+
+
+def _page(title: str, sub: str, body: str, *, script: str = "") -> str:
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        '<meta name="robots" content="noindex,nofollow">'
+        f"<title>{html.escape(title)}</title>"
+        f"<style>{_style()}{_SEARCH_CSS}</style></head><body><div class='wrap'>"
+        f"<h1>{html.escape(title)}</h1>"
+        f"{sub}{body}"
+        "<footer>Generated by the Aizen invoice sender.</footer>"
+        "</div>"
+        f"{script}"
+        "</body></html>\n"
+    )
+
+
 def render_index(
     days: Iterable[date],
     counts: Mapping[date, tuple[int, int]] | None = None,
@@ -276,7 +450,8 @@ def render_index(
         "<title>Invoice send reports</title>"
         f"<style>{_style()}</style></head><body><div class='wrap'>"
         "<h1>Invoice send reports</h1>"
-        '<p class="sub">WhatsApp messages sent to customers, by date.</p>'
+        '<p class="sub">WhatsApp messages sent to customers, by date. '
+        '<a href="recipients.html">Browse by recipient &rarr;</a></p>'
         f"{body}"
         "<footer>Generated by the Aizen invoice sender.</footer>"
         "</div></body></html>\n"
