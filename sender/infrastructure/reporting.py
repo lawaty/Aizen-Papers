@@ -234,9 +234,17 @@ class ReportStore:
 
         if index:
             index_path = self._report_dir / "index.html"
+            kind_counts: dict[str, tuple[int, int]] = {}
+            for day in self.available_dates():
+                for item in self.load(day):
+                    sent, failed = kind_counts.get(item.kind, (0, 0))
+                    kind_counts[item.kind] = (
+                        sent + (1 if item.ok else 0),
+                        failed + (0 if item.ok else 1),
+                    )
             write_text_atomic(
                 index_path,
-                render_index(self._dates(), counts),
+                render_index(self._dates(), counts, kind_counts),
             )
             written.append(index_path)
 

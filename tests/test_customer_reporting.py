@@ -150,8 +150,67 @@ def test_the_abandoned_status_renders_for_a_customer():
 
 
 def test_the_index_is_titled_neutrally():
-    """One audit trail covers all three pipelines, so it may no longer be called the
-    invoice report."""
-    html = render_index([date(2026, 9, 24)])
-    assert "invoice" not in html.lower()
+    """One audit trail covers all three pipelines, so the page may no longer be
+    called the invoice report.
+
+    Scoped to the title and heading: the body legitimately names the Invoice
+    category, which is the point of showing all three.
+    """
+    html = render_index([date(2026, 9, 24)], {date(2026, 9, 24): (1, 0)}, {})
+    assert "invoice" not in html.split("</head>")[0].lower()
+    assert "invoice" not in html.split("<h1>")[1].split("</h1>")[0].lower()
     assert "2026-09-24" in html
+
+
+class TestIndexAlwaysShowsEveryCategory:
+    """The index must advertise all three pipelines, not only the busy one.
+
+    An index assembled purely from the rows on disk cannot distinguish "this
+    pipeline is deployed but idle today" from "this pipeline does not exist",
+    so a client would conclude the payments and welcomes were not audited.
+    """
+
+    def test_all_three_kinds_listed_when_only_invoices_have_rows(self) -> None:
+        page = render_index(
+            [date(2026, 9, 24)],
+            {date(2026, 9, 24): (1, 0)},
+            {KIND_INVOICE: (1, 0)},
+        )
+        for label in ("Invoice", "Payment", "Customer"):
+            assert label in page
+
+    def test_empty_tallies_render_as_zero_not_a_dash(self) -> None:
+        page = render_index([], {}, {KIND_INVOICE: (2, 1)})
+        assert "0" in page
+        assert "2" in page and "1" in page
+
+    def test_totals_sum_every_kind(self) -> None:
+        page = render_index(
+            [],
+            {},
+            {KIND_INVOICE: (2, 1), KIND_PAYMENT: (3, 0), KIND_CUSTOMER: (1, 2)},
+        )
+        assert "<strong>6</strong>" in page
+        assert "<strong>3</strong>" in page
+
+    def test_subtitle_names_all_three_categories(self) -> None:
+        page = render_index([], {}, {})
+        sub = page.split('<p class="sub">')[1].split("</p>")[0]
+        assert "invoices" in sub
+        assert "payment confirmations" in sub
+        assert "welcomes" in sub
+
+    def test_categories_appear_even_with_no_history_at_all(self) -> None:
+        page = render_index([], {}, {})
+        for label in ("Invoice", "Payment", "Customer"):
+            assert label in page
+        assert "No sends have been recorded yet." in page
+
+    def test_unknown_kind_is_still_listed(self) -> None:
+        page = render_index([], {}, {"something-new": (1, 0)})
+        assert "something-new" in page
+
+    def test_date_table_is_still_present(self) -> None:
+        page = render_index([date(2026, 9, 24)], {date(2026, 9, 24): (1, 0)}, {})
+        assert "By date" in page
+        assert "2026-09-24.html" in page
