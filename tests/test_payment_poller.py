@@ -466,9 +466,15 @@ class _TotalReportingSource:
         self._listed = list(listed)
         self.last_listing_total = total
         self.detail_calls: list[str] = []
+        self.pages: list[tuple[int, int]] = []
 
     def list_payments(self, limit: int = 10, page: int = 1):
-        return list(self._listed)
+        # Slices rather than returning everything: the poller's paging walk reasons
+        # about a page that runs out, so a source that ignored ``limit`` would make
+        # it re-read the same rows and inflate the seen-set.
+        self.pages.append((limit, page))
+        start = (page - 1) * limit
+        return self._listed[start : start + limit]
 
     def get_payment(self, payment_id):
         self.detail_calls.append(str(payment_id))
@@ -478,13 +484,14 @@ class _TotalReportingSource:
         return {}
 
 
-def _poller_for_source(source, state=None, sender=None) -> PaymentPoller:
+def _poller_for_source(source, state=None, sender=None, **kwargs) -> PaymentPoller:
     return PaymentPoller(
         apps=[PollApp(name="app1", source=source)],
         sender=sender or CapturingSender(),
         builder=_builder(),
         state=state or InMemoryPollStateStore(),
         clock=FakeClock(),
+        **kwargs,
     )
 
 
@@ -554,6 +561,50 @@ def test_a_listing_that_has_narrowed_below_what_was_handled_is_reported(caplog):
 
     assert "narrowed" in caplog.text
     assert "app1" in caplog.text
+
+
+def test_a_source_count_that_is_off_by_one_is_not_a_narrowing(caplog):
+    """Daftra's ``total_results`` disagrees with itself; that must stay quiet.
+
+    Found in production: the same tenant, same filter, same rows answered
+    ``total_results=126`` at ``limit=500`` and ``125`` at ``limit=10``. Compared
+    exactly, that warns every five minutes on a healthy pipeline — and a warning
+    that always fires is the one an operator learns to skip, which would have
+    hidden the actual fault this check was written for.
+    """
+    state = InMemoryPollStateStore()
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in range(1, 7)]
+    _poller_for_source(_TotalReportingSource(payments, 6), state=state).run_once()
+    assert len(state.seen_ids("app1")) == 6
+
+    caplog.clear()
+    _poller_for_source(_TotalReportingSource(payments, 5), state=state).run_once()
+
+    assert "narrowed" not in caplog.text
+
+
+@pytest.mark.parametrize("handled", [20, 126])
+def test_a_narrowing_to_a_fraction_of_the_account_still_reports(handled, caplog):
+    """The tolerance must not swallow the fault it was added for.
+
+    126 rows collapsing to 1 is the shape of the exclusion this guards against,
+    and it has to survive a 5% band. The larger fixture also pins the band against
+    the paging cap: with the production ``limit`` of 10 and ``max_pages`` of 5 a
+    single cycle never sees more than 50 rows, so a narrow regression has to be
+    scaled to what one cycle can actually hold.
+    """
+    state = InMemoryPollStateStore()
+    limit = max(10, handled)
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in range(1, handled + 1)]
+    _poller_for_source(
+        _TotalReportingSource(payments, handled), state=state, limit=limit
+    ).run_once()
+    assert len(state.seen_ids("app1")) == handled, "the first cycle must have seeded them"
+
+    caplog.clear()
+    _poller_for_source(_TotalReportingSource(payments, 1), state=state, limit=limit).run_once()
+
+    assert "narrowed" in caplog.text
 
 
 def test_a_source_with_no_total_opinion_is_never_reported(caplog):

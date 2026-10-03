@@ -579,9 +579,19 @@ class DocumentPoller(Generic[TDoc, TSource]):
                 )
             return
         total = getattr(app.source, "last_listing_total", None)
-        if handled and isinstance(total, int) and total < handled:
+        shortfall = handled - total if isinstance(total, int) else 0
+        # The tolerance is load-bearing and was found in production, not reasoned
+        # out in advance: Daftra's ``total_results`` does not agree with itself. The
+        # same tenant, same filter, same rows answers ``126`` at ``limit=500`` and
+        # ``125`` at ``limit=10``, so an exact ``total < handled`` comparison warns
+        # every cycle on a perfectly healthy pipeline — which is precisely the
+        # "warns so often it gets ignored" failure this check exists to avoid, and
+        # it would have hidden the real fault it was written for. So the shortfall
+        # has to be *material*: the exclusion this guards against dropped a listing
+        # from 126 rows to 1, and nothing that small survives a 5% band.
+        if shortfall >= max(2, handled // 20):
             log.warning(
-                "app %s: the source reports %d %s(s) matching the listing but %d "
+                "app %s: the source reports %s %s(s) matching the listing but %d "
                 "have already been handled; the listing has narrowed and newer %s "
                 "may be invisible to this pipeline",
                 app.name, total, self._noun, handled, self._plural,
