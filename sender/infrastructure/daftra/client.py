@@ -100,63 +100,60 @@ class DaftraClient:
     def get_payment(self, payment_id: int | str) -> Payment:
         """The payment, resolved far enough to actually address the customer.
 
-        Two requests, and that is the price of reaching the customer at all: a
-        Daftra payment record names no client, so the payer only exists on the
-        invoice the payment settles. Doing the second hop *here* rather than in
-        the poller keeps the application layer free of Daftra's join order, and
-        keeps ``PaymentSource`` stating what a caller needs rather than how many
-        calls it costs.
+        Two requests, and this is the price of reaching the customer at all: a
+        Daftra ``ClientPayment`` row names the payer by ``client_id`` but carries no
+        business name — for a company client the name lives on the ``Client``
+        record, and the row's own first/last are empty — so the payer has to be
+        read as well as the payment. Doing the second hop *here* rather than in the
+        poller keeps the application layer free of Daftra's join order, and keeps
+        ``PaymentSource`` stating what a caller needs rather than how many calls it
+        costs.
 
-        A payment whose invoice cannot be read raises
-        :class:`DaftraApiError`, which the poller classifies like any other fetch
-        failure: a transient one is retried with backoff, a 404 (the invoice was
-        deleted) is abandoned once and left visible for an operator.
+        A payment with no ``client_id``, or one whose client cannot be read,
+        returns without the second request and reaches the model with only whatever
+        the payment row itself carried: its inline phones when it has them, no
+        phone otherwise. The poller skips a payment nobody can be reached about,
+        which is the honest outcome — and it is why the row's own contact fields are
+        kept as a fallback in the mapper rather than discarded.
         """
         raw = self._fetch_payment(payment_id)
         payment = self._payment_mapper.to_payment(raw)
-        if not payment.invoice_id:
-            # No linked invoice means no identifiable payer. Hand it back as-is so
-            # the poller records the honest outcome (skipped, no usable phone)
-            # instead of inventing a second request that cannot help.
+        client_id = self._client_id(raw)
+        if not client_id:
+            # No payer to follow. Hand it back as-is so the poller records the
+            # honest outcome (skipped, no usable phone) instead of inventing a
+            # second request that cannot help.
             return payment
-        return self._payment_mapper.to_payment(raw, self._fetch_invoice(payment.invoice_id))
+        return self._payment_mapper.to_payment(raw, self._fetch_client(client_id))
 
     def get_raw_payment(self, payment_id: int | str) -> dict:
-        """Just the payment row, un-joined — what ``show-payment --raw`` prints."""
+        """Just the client-payment row, un-joined — what ``show-payment --raw`` prints."""
         return self._fetch_payment(payment_id)
 
     def list_payments(self, limit: int = 10, page: int = 1) -> list[Payment]:
-        """One page of payments, newest first (the endpoint's own default order).
+        """One page of client payments, newest first (the endpoint's own order).
 
         The status filter is applied server-side so a page is never spent on
         payments that are not going to be announced — which matters because a
         page is exactly the unit the poller's paging logic reasons about.
 
-        ``include_client_credit=1`` is **not** optional and is the whole reason
-        this pipeline can see payments at all. ``/invoice_payments.json`` excludes
-        ``client_credit`` rows by default, and on a real account that is nearly
-        every payment: of 125 payments on one tenant, 124 were ``client_credit``
-        and exactly one was ``cash``. Left to its default the endpoint answered
-        ``total_results=1`` — that single ``cash`` row from five months earlier —
-        on every request regardless of ``limit``, ``page``, ``sort``, ``status``,
-        ``invoice_id``, ``treasury_id`` or ``branch_id``. The 124 others were
-        demonstrably there, reachable individually via
-        ``/invoice_payments/{id}.json`` and embedded in each invoice's detail, so
-        the pipeline was not failing: it was being handed one old row it had
-        already announced, forever, and reporting ``listed 1, new 0`` with a zero
-        exit code and no warning.
+        This is ``/client_payments.json``: money received into a client's **account**,
+        which is what the ``aizen_new_payment`` template talks about ("a payment was
+        recorded on your account", "your account balance has been updated"). It is a
+        different resource from ``/invoice_payments.json`` — separate endpoint,
+        separate id space, and on the live ``mohamedsoph2006`` tenant 125 rows
+        against 109 with **no id appearing in both** — so this is a swap of what is
+        announced, not an addition.
 
-        A ``client_credit`` row is money received against an invoice — it settles
-        one, and the template tells the customer their balance was updated — so it
-        is exactly what this pipeline exists to announce. :meth:`_invoice_id`
-        already recorded that these rows exist; this is the request that makes them
-        visible. The flag is passed unconditionally rather than exposed as a knob
-        because omitting it does not narrow the announcement, it *silences* it.
+        Unlike ``/invoice_payments.json`` this endpoint hides nothing: it returned
+        all 109 rows, across ``cash``, ``bank`` and ``manual_payment_19``, with no
+        flag needed. So the ``include_client_credit`` workaround that resource
+        requires is simply absent here, and is deliberately not sent.
         """
-        params: dict = {"page": page, "limit": limit, "include_client_credit": 1}
+        params: dict = {"page": page, "limit": limit}
         if self._payments_status:
             params["status"] = self._payments_status
-        payload = self._request("GET", "/invoice_payments.json", params=params)
+        payload = self._request("GET", "/client_payments.json", params=params)
         self._last_listing_total = _total_results(payload)
         return self._payment_mapper.to_payments(payload)
 
@@ -210,6 +207,11 @@ class DaftraClient:
             raise ValueError(f"Invalid customer id: {customer_id!r}")
         return self._request("GET", f"/clients/{sid}.json")
 
+    #: The payments path reaches the payer through the same read. Named for what it
+    #: is *for* there, so the call site reads as "fetch the payer" rather than
+    #: forcing the reader to know it is the customers endpoint too.
+    _fetch_client = _fetch_customer
+
     def _fetch_invoice(self, invoice_id: int | str) -> dict:
         sid = str(invoice_id)
         if not sid.isdigit():
@@ -220,7 +222,30 @@ class DaftraClient:
         sid = str(payment_id)
         if not sid.isdigit():
             raise ValueError(f"Invalid payment id: {payment_id!r}")
-        return self._request("GET", f"/invoice_payments/{sid}.json")
+        return self._request("GET", f"/client_payments/{sid}.json")
+
+    @staticmethod
+    def _client_id(raw: dict) -> str | None:
+        """The payer a client-payment row names, or ``None`` when it names nobody.
+
+        Read off the **raw** row rather than the model, because it decides whether
+        the second request is worth making at all, and a mapped ``Payment`` has no
+        field for it. A null here must stay a real ``None`` rather than the string
+        ``"None"``, which would be sent on as a customer id and 404.
+        """
+        node = raw.get("data") if isinstance(raw, dict) else None
+        if isinstance(node, dict):
+            candidate = node.get("ClientPayment")
+            node = candidate if isinstance(candidate, dict) else node
+        elif isinstance(raw, dict):
+            row = raw.get("ClientPayment")
+            node = row if isinstance(row, dict) else raw
+        if not isinstance(node, dict):
+            return None
+        value = node.get("client_id")
+        if value is None or value == "" or str(value) == "None":
+            return None
+        return str(value)
 
     def _request(self, method: str, path: str, **kwargs) -> dict:
         url = f"{self._base}{path}"

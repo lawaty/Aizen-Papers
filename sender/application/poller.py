@@ -544,11 +544,11 @@ class DocumentPoller(Generic[TDoc, TSource]):
         steady state, and a warning on every one of them would train the operator to
         ignore the log. What is *not* normal is a source offering **less of the
         account than it used to** — and that is a real failure here, not a
-        hypothetical one. ``/invoice_payments.json`` excludes ``client_credit`` rows
-        by default, and on a live tenant that was 124 of 125 payments: the pipeline
-        spent weeks reporting ``listed 1, new 0`` with a zero exit code and nothing
-        in the log to say the endpoint was showing it one old row out of a hundred
-        and twenty-five.
+        hypothetical one. The payments pipeline had exactly this fault, on the resource it
+used to read: ``/invoice_payments.json`` excludes ``client_credit`` rows by
+        default, and on a live tenant that was 124 of 125 payments, so it reported
+        ``listed 1, new 0`` with a zero exit code and nothing in the log to say the
+        endpoint was showing it one old row out of a hundred and twenty-five.
 
         Two checks, because they catch different faults and each is blind to the
         other's case:
@@ -1210,14 +1210,14 @@ class InvoicePoller(DocumentPoller[Invoice, InvoiceSource]):
 
 
 class PaymentPoller(DocumentPoller[Payment, PaymentSource]):
-    """Announce recorded payments under the ``aizen_new_payment`` template.
+    """Announce recorded client payments under the ``aizen_new_payment`` template.
 
     Structurally identical to the invoice pipeline — same state machine, same
     invariants, same failure classification — and deliberately so. The only real
-    difference is in what has to be fetched: a Daftra payment record names no
-    client and carries no phone, so reaching the customer means reading the
-    linked invoice as well. That cost is paid here, in the adapter, and the
-    engine above neither knows nor cares.
+    difference is in what has to be fetched: a Daftra ``ClientPayment`` row names
+    its payer by id but carries no company name, so reaching the customer means
+    reading that client as well. That cost is paid in the adapter, and the engine
+    above neither knows nor cares.
     """
 
     KIND = KIND_PAYMENT
@@ -1230,17 +1230,19 @@ class PaymentPoller(DocumentPoller[Payment, PaymentSource]):
         return app.source.get_payment(document_id)
 
     def _needs_detail(self, payment: Payment) -> bool:
-        """Always: the listing row cannot address the customer at all.
+        """Always: the listing row cannot be trusted to name the customer.
 
-        ``/invoice_payments.json`` returns the amount, the date, the reference
-        code and the invoice id, but ``client_id`` is usually null and the payer
-        contact fields are empty — the payer is only identified through the
-        invoice it settles. A payment whose invoice cannot be read therefore
-        arrives with no phone and is skipped, never guessed at.
+        ``/client_payments.json`` returns the amount, the date, the reference code
+        and the payer's ``client_id`` — and, on the live account, a phone number on
+        99 of 109 rows. What it never carries is a **business name**: for a company
+        client the name lives on the ``Client`` record and the row's own
+        first/last are empty. So a payment taken from the listing greets the
+        customer as the generic "Customer", and the second read is what turns that
+        into a message worth sending.
 
-        Asking the question anyway rather than hardcoding ``True`` keeps the
-        intent readable next to the invoice rule it mirrors, and leaves room for
-        a Daftra account whose payment rows do carry the payer.
+        Always ``True``, therefore, rather than "only when a phone is missing": a
+        row with a usable phone is still missing the name, and skipping the read
+        would trade a reachable customer for an unnamed one.
         """
         return True
 

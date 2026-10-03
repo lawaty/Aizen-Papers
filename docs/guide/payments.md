@@ -4,9 +4,16 @@
 
 ---
 
-A second notification pipeline, parallel to the invoice one: it watches Daftra
-for recorded payments and confirms each new one to the customer under the
+A second notification pipeline, parallel to the invoice one: it watches Daftra for
+recorded **client payments** and confirms each new one to the customer under the
 `aizen_new_payment` WhatsApp template.
+
+A *client payment* is money received into a client's **account** — a deposit, a
+prepayment, an opening balance. That is what `aizen_new_payment` talks about: it
+says a payment was recorded **على حسابكم** ("on your account") and that the account
+balance was updated. It never mentions an invoice. See
+[What a "new payment" is](#what-a-new-payment-is) for the resource this does and
+does not read.
 
 It is the same machinery as the invoice pipeline — same state store, same
 retry/abandon rules, same send cap, same free-form fallback, same HTML report —
@@ -46,7 +53,7 @@ Four positional body parameters, in this order:
 | # | Body text | Value | Format |
 |---|---|---|---|
 | 1 | `مَرْحَبًا …` | customer name | sanitized, bidi-isolated |
-| 2 | `رقم العملية` | payment **reference code** (`code`, e.g. `000116`) | isolated |
+| 2 | `رقم العملية` | payment **reference code** (`code`, e.g. `000244`) | isolated |
 | 3 | `تاريخ الدفع` | payment date | `DD/MM/YYYY` |
 | 4 | `مبلغ الدفعة` | amount | `1,500.00`, no currency symbol (`ج.م` is in the body) |
 
@@ -57,71 +64,76 @@ pins all of it.
 
 ## What a "new payment" is
 
-Daftra's `GET /invoice_payments.json`, newest first. By default only **completed**
-payments (`status=1`), filtered server-side, because the message tells the
-customer their balance was updated and only a completed payment does that. Set
+Daftra's `GET /client_payments.json`, newest first. By default only **completed**
+payments (`status=1`), filtered server-side, because the message says the account
+balance was updated and only a completed payment does that. Set
 `POLL_PAYMENTS_STATUS` blank to announce every row, or to `2`/`3`/… for another
 status.
 
-### `client_credit` payments are requested explicitly
+### It is not the invoice-payments endpoint
 
-Daftra **excludes `client_credit` rows from `/invoice_payments.json` by default**,
-so the sender asks for them with `include_client_credit=1` on every listing. This
-is not a preference; omitting the parameter does not narrow what is announced, it
-**silences** it.
+Daftra has two payment resources and they are **not two views of the same rows**:
 
-On the live `mohamedsoph2006` tenant, 124 of the account's 125 payments were
-`client_credit` and exactly one was `cash`. Left at its default the endpoint
-answered `total_results=1` — that single `cash` row from months earlier — on every
-request, regardless of `limit`, `page`, `sort`, `status`, `invoice_id`,
-`treasury_id` or `branch_id`. The other 124 were demonstrably there, reachable
-individually at `/invoice_payments/{id}.json` and embedded in each invoice's
-detail, so the pipeline was not failing: it was handed one already-announced row
-and reported `listed 1, new 0` with a zero exit code and nothing in the log.
+| | `/client_payments.json` | `/invoice_payments.json` |
+|---|---|---|
+| what the money is | into a client's **account** | settling a specific **invoice** |
+| rows carrying `invoice_id` | 0 of 109 | all of them |
+| overlapping ids (live tenant) | **none** — 109 vs 125 | |
+| the payer | inline on the row | only via the invoice |
 
-A `client_credit` row is money received **against an invoice** — it settles one,
-and the template tells the customer their balance was updated — so it is exactly
-what this pipeline exists to announce. If you ever need the narrow old behaviour,
-filter on `payment_method` rather than dropping the flag: a listing that excludes
-the category is indistinguishable, in the summary line, from a day with no
-payments at all.
+The two id spaces are disjoint even though both run from 1 to ~245, so they are
+never confused with each other — and the consequence is that switching is a **swap,
+not an addition**: the 126 invoice payments this pipeline briefly announced are not
+part of this resource, and are no longer announced.
 
-### If you turn the flag on for the first time
+The template settles which one is right. `aizen_new_payment` is written in account
+terms throughout, so `/client_payments.json` is the resource it describes. Announcing
+invoice payments through it would tell a customer their *account balance* was
+updated when the money had actually settled a bill.
 
-The seen-set is what stops a newly-visible backlog from being announced all at
-once, and it only helps if it already contains those rows. Turning this on against
-a state file written while the flag was absent will surface every payment the
-account has ever recorded as *new*. Seed first — one cycle with a page size large
-enough to hold the whole backlog, so it seeds instead of sending:
+Unlike the invoice resource, this one **hides nothing**: it returned all 109 rows on
+the live tenant across `cash`, `bank` and `manual_payment_19`, with no flag needed.
+(For the record, `/invoice_payments.json` *does* exclude `client_credit` rows unless
+sent `include_client_credit=1`, which is how that resource was losing 124 of 125
+payments. That workaround is deliberately **not** sent here — it would be cargo cult
+for a bug in a resource this pipeline does not read.)
+
+### If you have just switched this pipeline over
+
+The seen-set is what stops a newly-visible backlog from being announced all at once,
+and it only helps if it already contains those rows. A state file written against the
+*other* resource contains none of these ids, so the first cycle after switching would
+otherwise treat all 109 as new. Seed first, with a page size large enough to hold the
+whole backlog:
 
 ```bash
 python -m sender poll-reset --payments --app <tenant> --yes
-POLL_PAYMENTS_LIMIT=500 python -m sender poll-payments --once --dry-run
+POLL_PAYMENTS_LIMIT=500 python -m sender poll-payments --once --dry-run   # check
+POLL_PAYMENTS_LIMIT=500 python -m sender poll-payments --once             # then seed
 ```
 
-The `--dry-run` reports what it *would* seed and writes nothing. Drop it, and check
-`poll-status --payments` shows the full count, before letting cron resume.
+The `--dry-run` reports what it *would* seed and writes nothing. Confirm with
+`poll-status --payments` before letting cron resume.
 
 ## Why two Daftra calls per payment
 
-A payment record names no payer — `client_id` is usually null and the contact
-fields are empty — because the payer exists only on the invoice the payment
-settles. So each new payment costs:
+A `ClientPayment` row names its payer by `client_id` and — on 99 of the 109 live rows
+— carries the phone number inline. What it **never** carries is a business name: for
+a company client the name lives on the `Client` record and the row's own
+`first_name`/`last_name` are empty. So reading the listing alone would greet every
+company customer as the generic "Customer".
 
-1. `GET /invoice_payments/{id}.json` — the payment,
-2. `GET /invoices/{invoice_id}.json` — and its client, for the name and phone.
+Each new payment therefore costs:
+
+1. `GET /client_payments/{id}.json` — the payment,
+2. `GET /clients/{client_id}.json` — and its name and phones.
 
 That join lives in the adapter (`DaftraClient.get_payment`), so the application
 layer never learns Daftra's join order. It is bounded by the send cap: a backlog
 costs listing pages, not one detail call per row.
 
-If the linked invoice has been deleted, the 404 is permanent — the payment is
-abandoned once and left visible in `poll-status --payments` rather than retried
-forever. To re-drive it after fixing the data:
-
-```bash
-python -m sender poll-reset --payments --app <tenant> --payment-id <id> --yes
-```
+A row with no `client_id` costs **one** request and keeps whatever phone it carried
+itself; one with neither is unreachable and is skipped rather than guessed at.
 
 ## Configuration
 
@@ -159,7 +171,11 @@ A second cron entry. `tools/run_poll.sh` takes the subcommand from
 
 **Never upload a `poll_payments_state.json` from development.** It is keyed by
 payment id; a file from another machine marks real payments as already confirmed
-and they are never sent again.
+and they are never sent again. It is also **meaningless across a resource change**:
+the ids in it belong to whichever endpoint last wrote it, so switching this pipeline
+between client payments and invoice payments silently re-marks every row. Re-seed
+whenever the endpoint changes — see
+[If you have just switched this pipeline over](#if-you-have-just-switched-this-pipeline-over).
 
 ## Rehearsing offline
 

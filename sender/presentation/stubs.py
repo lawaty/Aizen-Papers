@@ -507,13 +507,25 @@ class StubPaymentSource:
 
     def get_raw_payment(self, payment_id: int | str) -> dict:
         payment = self.get_payment(payment_id)
+        phones = list(payment.customer_phones)
         return {
             "result": "successful",
             "code": 200,
             "data": {
-                "InvoicePayment": {
+                "ClientPayment": {
                     "id": payment.id,
-                    "invoice_id": payment.invoice_id,
+                    # The resource is a client payment: no invoice is settled, so
+                    # this is null on every live row, exactly as Daftra sends it.
+                    "invoice_id": None,
+                    # The payer is named by id and the row carries its own phone,
+                    # which is the shape the real endpoint has — 99 of 109 rows on
+                    # the live account had a phone here. What it never has is a
+                    # business name, which is why the adapter reads the client.
+                    "client_id": "1",
+                    "first_name": "",
+                    "last_name": "",
+                    "phone1": phones[0] if phones else "",
+                    "phone2": phones[1] if len(phones) > 1 else "",
                     "payment_method": payment.payment_method,
                     "amount": str(payment.amount),
                     "date": payment.payment_date.strftime("%Y-%m-%d 00:00:00")
@@ -521,21 +533,13 @@ class StubPaymentSource:
                     else None,
                     "status": payment.status,
                     "currency_code": payment.currency,
-                    # The live row carries an empty payer; the customer only
-                    # appears once the linked invoice is read. Reproduced here so
-                    # a rehearsal of the raw payload looks like production.
-                    "client_id": None,
-                    "first_name": "",
-                    "last_name": "",
-                    "phone1": "",
-                    "phone2": "",
                     "code": payment.number,
                 }
             },
         }
 
     def list_payments(self, limit: int = 10, page: int = 1) -> list[Payment]:
-        # Newest first, mirroring /invoice_payments.json, including the status
+        # Newest first, mirroring /client_payments.json, including the status
         # narrowing the real client does server-side: a stub run that ignored it
         # would rehearse a page shape the poller never sees in production.
         start = (page - 1) * limit

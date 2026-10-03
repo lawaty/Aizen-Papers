@@ -229,8 +229,8 @@ class PaymentNotificationService:
         self, payment_id: int | str, to_phone: str | None = None, freeform: bool = False
     ):
         payment = self.get_payment(payment_id)
-        # A payment's phones come from the *linked invoice's* client, so it carries
-        # both of that client's numbers exactly as the invoice does.
+        # A payment's phones come from the *payer's own client record*, so it
+        # carries both of that client's numbers exactly as the invoice does.
         recipients = _recipients_for(payment, to_phone, noun="Payment", number=payment.number)
         builder_method = self._builder.build_text if freeform else self._builder.build
         return payment, recipients, [builder_method(payment, r) for r in recipients]

@@ -63,6 +63,30 @@ renders (see [`application.md`](application.md)) and why `infrastructure/pdf.py`
 warns on an invoice that has a total but no rows. A listing that starts
 including items would make that fetch redundant, not wrong.
 
+### Payment resources — client payments, not invoice payments
+
+The payments pipeline reads **`/client_payments.json`**, not
+`/invoice_payments.json`. The two are separate Daftra resources with separate
+endpoints and **disjoint id spaces** (109 rows against 125 on the live
+`mohamedsoph2006` tenant, none shared), so this is a swap of what is announced
+rather than an addition.
+
+The template decides it: `aizen_new_payment` says a payment was recorded **على
+حسابكم** ("on your account") and that the account balance was updated. It never
+mentions an invoice, so the invoice resource would be announcing the wrong thing.
+
+`get_payment` is two requests: the payment, then `/clients/{client_id}.json` for
+the payer. The second is not optional — a `ClientPayment` row carries the payer's
+phone inline (99 of 109 live rows) but **never a business name**, so without it
+every company customer is greeted as the generic "Customer". A row with no
+`client_id` costs one request and keeps whatever phone it carried itself.
+
+Unlike `/invoice_payments.json`, this endpoint **hides nothing**: it returned all
+109 rows across `cash`, `bank` and `manual_payment_19` with no flag. The
+`include_client_credit=1` workaround that the invoice resource requires is
+deliberately not sent — it would be cargo cult for a bug in a resource this
+pipeline does not read. See [Payments guide](../guide/payments.md).
+
 ### `whatsapp/client.py` — `WhatsAppClient`
 
 Implements `domain.ports.MessageSender`. Posts the JSON payload to

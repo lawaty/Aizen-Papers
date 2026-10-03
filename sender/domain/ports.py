@@ -17,10 +17,11 @@ class PaymentSource(Protocol):
 
     ``get_payment`` is the poller's "give me the authoritative document for this
     id" hook and returns a **fully resolved** payment — including the customer
-    name and phone, which Daftra does not put on the payment record itself. How
-    many requests that costs is the adapter's business, not the caller's: the
+    name and phone. A Daftra ``ClientPayment`` row does carry the payer's phone
+    inline, but never a business name, so the name needs that client's record.
+    How many requests that costs is the adapter's business, not the caller's: the
     port states what the caller needs, and ``DaftraClient`` happens to satisfy it
-    by also reading the linked invoice.
+    by also reading the payer.
     """
 
     def get_payment(self, payment_id: int | str) -> Payment: ...

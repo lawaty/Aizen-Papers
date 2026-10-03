@@ -77,23 +77,29 @@ KIND_CUSTOMER = "customer"
 
 @dataclass(frozen=True)
 class Payment:
-    """One recorded payment against an invoice, as an outbound notification needs it.
+    """One recorded **client payment** — money received into a client's account.
 
-    Modelled the same way as :class:`Invoice` — only the facts a customer-facing
-    message carries, never a mirror of the ERP's payment record.
+    A deposit, a prepayment, an opening balance: not a payment settling an
+    invoice. That distinction is Daftra's, not a modelling convenience. The two are
+    separate resources with separate endpoints and disjoint id spaces, and the
+    approved ``aizen_new_payment`` template is written in exactly these terms — a
+    payment recorded **على حسابكم**, "on your account", with the account balance
+    updated. It never mentions an invoice.
 
-    The customer fields are the awkward part and are deliberately *not* on the
-    payment itself: a Daftra payment row names no client and carries no phone, so
-    ``customer_name`` and ``customer_phones`` are filled in by the adapter from the
-    **linked invoice**, which is the only place the client record lives — and which
-    means a payment inherits *both* of that client's phone fields, so a payment
-    reaches a customer on as many numbers as their invoice does. A payment whose
-    invoice no longer resolves therefore arrives with no phone at all and is
-    skipped rather than guessed at.
+    Modelled the way :class:`Invoice` is: only the facts a customer-facing message
+    carries, never a mirror of the ERP's payment record.
+
+    The payer is the awkward part and is deliberately *not* resolved here. A
+    ``ClientPayment`` row names its payer by ``client_id`` and usually carries the
+    phone inline, but it has **no business name** — for a company client that lives
+    on the ``Client`` record — so ``customer_name`` and ``customer_phones`` are
+    filled in by the adapter, which reads that client record. A payment whose payer
+    cannot be read therefore arrives with no phone at all and is skipped rather than
+    guessed at.
     """
 
     id: str
-    #: Daftra's payment reference code (e.g. ``"000116"``) — the "operation
+    #: Daftra's payment reference code (e.g. ``"000244"``) — the "operation
     #: number" the template body prints. Falls back to ``id`` when absent.
     number: str
     customer_name: str = ""
@@ -114,7 +120,10 @@ class Payment:
     currency: str = ""
     amount: Decimal = Decimal("0")
     payment_date: date | None = None
-    #: The invoice this payment settles; what makes the customer reachable.
+    #: The invoice this payment settles. **Always ``None`` for a client payment** —
+    #: this resource does not settle invoices and Daftra sends the field null on
+    #: every row. Kept because ``show-payment`` prints it, and a field that is
+    #: honestly ``None`` is better than a field that is absent.
     invoice_id: str | None = None
     #: ``cash``/``bank``/``cheque``/a gateway key. Logging only — not on the
     #: template, so an unknown method never blocks a notification.

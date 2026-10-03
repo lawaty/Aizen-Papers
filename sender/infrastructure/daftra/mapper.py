@@ -116,15 +116,22 @@ def _row_label(row: dict) -> str:
     """A human-readable identity for an unnormalizable listing row.
 
     Daftra nests the record inside the row (or the row *is* the record in the
-    flat shape), and the wrapper key says which kind it is — ``Invoice`` or
-    ``InvoicePayment``. The kind is named in the label so an operator reading a
-    warning knows which pipeline dropped the row and which state file it will be
-    re-attempted against. Falls back to a generic label so the warning is never
-    empty.
+    flat shape), and the wrapper key says which kind it is — ``Invoice``,
+    ``ClientPayment`` or ``Client``. The kind is named in the label so an operator
+    reading a warning knows which pipeline dropped the row and which state file it
+    will be re-attempted against. Both payment wrappers map to "payment" on purpose:
+    they are two Daftra resources for the same word, and a label that said which
+    would send an operator looking in the wrong pipeline. Falls back to a generic
+    label so the warning is never empty.
     """
     node = None
     kind = None
-    for key, kind in (("Invoice", "invoice"), ("InvoicePayment", "payment"), ("Client", "customer")):
+    for key, kind in (
+        ("Invoice", "invoice"),
+        ("InvoicePayment", "payment"),
+        ("ClientPayment", "payment"),
+        ("Client", "customer"),
+    ):
         if isinstance(row.get(key), dict):
             node = row[key]
             break
@@ -517,34 +524,65 @@ class DaftraInvoiceMapper:
 
 
 class DaftraPaymentMapper(DaftraInvoiceMapper):
-    """Translate ``/invoice_payments`` rows into :class:`Payment`.
+    """Translate ``/client_payments`` rows into :class:`Payment`.
 
-    A subclass rather than a sibling so it reuses the parts of the invoice
-    mapping that are genuinely the same rules and not invoice-specific: parsing a
-    money string that may arrive localized or with a tax split, parsing Daftra's
-    several date spellings, picking the client name out of an ``Invoice`` node
-    with ``Client`` nested inside it, and normalizing a phone with the
-    deployment's country code. Duplicating any of those would be a second place
-    to get a customer's amount or number wrong.
+    A **client payment** is money received into a client's *account* — a deposit, a
+    prepayment, an opening balance. It is not a payment settling an invoice, and the
+    two are separate Daftra resources with separate endpoints, separate id spaces
+    and no overlap: on the live ``mohamedsoph2006`` tenant, ``/invoice_payments.json``
+    holds 125 rows and ``/client_payments.json`` holds 109, and not one id appears
+    in both. This mapper reads the client side, which is what the message sent to a
+    customer is actually about: the approved ``aizen_new_payment`` template says a
+    payment was recorded **على حسابكم** — "on your account" — and that the account
+    balance was updated. It never mentions an invoice, so the invoice resource
+    would be announcing the wrong thing.
+
+    What this costs in exchange is the payer. A ``ClientPayment`` row *does* carry
+    ``client_id`` and usually the phone numbers inline (99 of 109 rows had a phone),
+    but it has **no business name** at all — for a company client the name lives on
+    the ``Client`` record, and the payment row's own ``first_name``/``last_name`` are
+    empty. So the name still costs one further read, of ``/clients/{id}.json``,
+    which is where both the name and the authoritative phones come from.
+
+    A subclass rather than a sibling so it reuses the parts of the mapping that are
+    genuinely the same rules: parsing a money string that may arrive localized or
+    with a tax split, parsing Daftra's several date spellings, preferring the
+    business name over first+last, and normalizing a phone with the deployment's
+    country code. Duplicating any of those would be a second place to get a
+    customer's amount or number wrong.
     """
 
-    def to_payment(self, raw: dict, invoice_raw: dict | None = None) -> Payment:
-        """Normalize one payment.
+    def to_payment(self, raw: dict, client_raw: dict | None = None) -> Payment:
+        """Normalize one client payment.
 
-        *invoice_raw* is the **linked invoice's** raw payload, when the caller has
-        one. It is not decoration: a payment record carries no payer — ``client_id``
-        is usually null and the contact fields are empty — so the invoice it settles
-        is the only place the customer exists. Without it the payment comes back
-        with no name and no phone and the poller skips it, which is the correct
-        outcome for a payment nobody can be reached about.
+        *client_raw* is the **payer's** raw ``Client`` payload, when the caller has
+        one. It is not decoration: the payment row names the client by id but carries
+        no business name, so without it a company client arrives as the generic
+        "Customer" and the message greets them by a placeholder. When the client
+        cannot be read the payment still maps — with no phone — and the poller skips
+        it, which is the correct outcome for a payment nobody can be reached about.
         """
         node = self._payment_node(raw)
         if not isinstance(node, dict):
             raise ValueError(f"Unexpected Daftra payment payload shape: {type(raw).__name__}")
         if not node.get("id"):
             raise ValueError(f"Malformed Daftra response: missing payment data in {list(node)[:6]}")
-        invoice = self._invoice_node(invoice_raw)
-        client = invoice.get("Client") if isinstance(invoice.get("Client"), dict) else {}
+        client = self._client_node(client_raw)
+        # Explicit precedence, per field, because the two sources are authoritative
+        # for different things and a blind merge gets both directions wrong. When
+        # the payer's own record has been read it wins outright — including its
+        # *empty* fields, so a phone the client has since cleared does not survive
+        # on the receipt. The row is the fallback for the case that matters: the
+        # client could not be read, and the number Daftra wrote on the payment
+        # itself is still the best way to reach someone who has already paid.
+        source = client if client else node
+        payer = {
+            "business_name": self._first(source, ("business_name",)),
+            "first_name": self._first(source, ("first_name",)),
+            "last_name": self._first(source, ("last_name",)),
+            "phone1": self._first(source, ("phone1",)),
+            "phone2": self._first(source, ("phone2",)),
+        }
         return Payment(
             id=str(node.get("id")),
             # ``code`` is the receipt reference the customer is quoted — the
@@ -552,12 +590,19 @@ class DaftraPaymentMapper(DaftraInvoiceMapper):
             # an account whose payments carry no code, so a payment is never sent
             # with an empty identifier.
             number=str(self._first(node, ("code",)) or node.get("id")),
-            customer_name=self._customer_name(invoice, client),
-            customer_phones=self._customer_phones(invoice, client),
+            # Both arguments are the same merged payer, which is the
+            # ``DaftraCustomerMapper`` trick: ``_customer_name`` then prefers the
+            # business name and falls back to first+last, and both now come from
+            # whichever source won above.
+            customer_name=self._customer_name(payer, payer),
+            customer_phones=self._customer_phones(payer, payer),
             status=str(self._first(node, ("status",), default="Unknown") or "Unknown"),
             currency=str(self._first(node, CURRENCY_KEYS) or ""),
             amount=self._money(self._first(node, ("amount",))),
             payment_date=self._date(self._first(node, ("date", "created"))),
+            # Kept on the model and always ``None`` for a client payment: the two
+            # resources are disjoint, so there is no invoice to point at. Read by
+            # ``show-payment`` so the field stays truthful rather than absent.
             invoice_id=self._invoice_id(node),
             payment_method=str(self._first(node, ("payment_method",), default="") or ""),
         )
@@ -586,10 +631,10 @@ class DaftraPaymentMapper(DaftraInvoiceMapper):
 
     @staticmethod
     def _payment_node(raw: dict) -> dict:
-        """Unwrap the ``InvoicePayment`` node from a detail or listing payload.
+        """Unwrap the ``ClientPayment`` node from a detail or listing payload.
 
-        Accepts both shapes Daftra uses: ``{"data": {"InvoicePayment": {...}}}``
-        for a single record and ``{"data": [{"InvoicePayment": {...}}]}`` for a
+        Accepts both shapes Daftra uses: ``{"data": {"ClientPayment": {...}}}``
+        for a single record and ``{"data": [{"ClientPayment": {...}}]}`` for a
         page. A payload that is already the flat record is passed through, which
         is what the offline stub and hand-written test rows use.
         """
@@ -597,39 +642,38 @@ class DaftraPaymentMapper(DaftraInvoiceMapper):
             return raw
         data = raw.get("data")
         if isinstance(data, dict):
-            candidate = data.get("InvoicePayment")
+            candidate = data.get("ClientPayment")
             return candidate if isinstance(candidate, dict) else data
-        row = raw.get("InvoicePayment")
+        row = raw.get("ClientPayment")
         return row if isinstance(row, dict) else raw
 
     @staticmethod
-    def _invoice_node(raw: dict | None) -> dict:
-        """Unwrap the ``Invoice`` node from a linked invoice's payload, or ``{}``.
+    def _client_node(raw: dict | None) -> dict:
+        """Unwrap the payer's ``Client`` node from a detail payload, or ``{}``.
 
-        The same two shapes as :meth:`_payment_node`, and for the same reason: the
-        two-hop fetch in the client may have been answered with either. An absent
-        or unreadable invoice yields ``{}``, which makes ``_customer_name`` fall
-        back to its generic "Customer" and the phone ``None`` — i.e. a payment with
-        no reachable customer, which the poller skips.
+        The same two envelopes as :meth:`_payment_node`, for the same reason. An
+        absent or unreadable client yields ``{}``, which leaves the payment with
+        whatever the payment row itself carried — and with no phone if that was
+        empty too, i.e. a payment nobody can be reached about, which the poller
+        skips rather than guessing at.
         """
         if not isinstance(raw, dict):
             return {}
         data = raw.get("data")
         if isinstance(data, dict):
-            candidate = data.get("Invoice")
+            candidate = data.get("Client")
             return candidate if isinstance(candidate, dict) else data
-        row = raw.get("Invoice")
+        row = raw.get("Client")
         return row if isinstance(row, dict) else raw
 
     @staticmethod
     def _invoice_id(payment_node: dict) -> str | None:
-        """The linked invoice id, or ``None`` when the payment has no invoice.
+        """The linked invoice id, or ``None`` — which is every client payment.
 
-        Payments that do not settle an invoice exist (``client_credit``,
-        opening-balance rows); Daftra excludes them from this endpoint by default,
-        but a null here must stay a real ``None`` rather than the string ``"None"``,
-        because the client uses it to decide whether the second hop is worth
-        making at all.
+        Kept because ``show-payment`` prints it, and because a field that is
+        honestly ``None`` beats a field that is absent. It is not what drives the
+        second hop any more: that is the payer's ``client_id`` now, since a client
+        payment has no invoice to settle and the payer *is* the client.
         """
         value = payment_node.get("invoice_id")
         if value is None or value == "":

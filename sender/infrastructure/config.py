@@ -121,9 +121,11 @@ def _env_int(source: Mapping[str, str], key: str, default: int) -> int:
 
 _BUILDER_MODES = ("auto", "legacy", "new")
 
-#: Daftra's ``InvoicePayment.status`` values. Used only to reject a typo in
-#: ``POLL_PAYMENTS_STATUS`` early; the default (completed) is the only one the
-#: payments pipeline is expected to run with.
+#: Daftra's payment ``status`` values, which ``ClientPayment`` and
+#: ``InvoicePayment`` share. Used only to reject a typo in ``POLL_PAYMENTS_STATUS``
+#: early; the default (completed) is the only one the payments pipeline is expected
+#: to run with. Verified against both endpoints: all 109 live client payments are
+#: ``1``, and filtering by it behaves identically on either resource.
 PAYMENT_STATUSES = ("0", "1", "2", "3", "4", "5")
 
 #: The spellings accepted for an on/off environment flag, the same ones the

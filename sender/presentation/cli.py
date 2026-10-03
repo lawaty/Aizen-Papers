@@ -529,7 +529,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--to",
         help=(
             "Send to this number only. By default the message goes to every number on "
-            "the payer's client, read from the linked invoice."
+            "the payer's client record."
         ),
     )
     send_payment.add_argument("--dry-run", action="store_true", help="Print the payload without calling Meta")
@@ -1497,13 +1497,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                         print(json.dumps(asdict(payment), indent=2, default=str))
                 else:
                     for payment in payment_service.list_payments(args.limit):
-                        # The payer column can be empty on a listing row — the
-                        # customer only comes with the linked invoice — so it is
-                        # allowed to print blank rather than pretending otherwise.
+                        # The payer column is blank on a listing row: the business
+                        # name only comes with the payer's client record, which the
+                        # poller reads per payment. Printing blank is honest here;
+                        # ``show-payment <id>`` resolves the payer in full.
                         print(
                             f"{payment.number:<10} {payment.customer_name:<28} "
                             f"{payment.amount} {payment.currency:<5} "
-                            f"invoice {payment.invoice_id or '-'}"
+                            f"{payment.payment_date or '-'} "
+                            f"{payment.payment_method or '-'}"
                         )
             elif args.command in customer_cmds:
                 # Same shape as the payment commands: show/customers never send, so
