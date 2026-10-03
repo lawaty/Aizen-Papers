@@ -233,8 +233,82 @@ def test_the_client_sends_the_status_filter_to_daftra():
     session = _Listing()
     client = DaftraClient(api_key="k", session=session, payments_status="1")
     payments = client.list_payments(limit=5, page=2)
-    assert session.params == {"page": 2, "limit": 5, "status": "1"}
+    assert session.params == {
+        "page": 2,
+        "limit": 5,
+        "status": "1",
+        "include_client_credit": 1,
+    }
     assert [p.id for p in payments] == ["116"]
+
+
+def test_the_listing_asks_for_the_payments_the_endpoint_excludes_by_default():
+    """``include_client_credit`` is what makes this pipeline able to see payments.
+
+    ``/invoice_payments.json`` drops ``client_credit`` rows unless asked, and on a
+    live tenant that was 124 of 125 payments: the endpoint answered
+    ``total_results=1`` on every request — one ``cash`` row from months earlier —
+    whatever the paging, so the poller reported ``listed 1, new 0`` indefinitely
+    and exited zero. Omitting this parameter does not narrow what is announced, it
+    silences it, which is why the test asserts its presence rather than a default.
+
+    Pinned per call rather than once in a fixture, so removing the flag from any one
+    of the request-building paths fails here.
+    """
+    from fakes import FakeResponse
+
+    class _Listing(_PaymentSession):
+        def get(self, url: str, **kwargs):
+            self.params = kwargs.get("params")
+            return FakeResponse(200, {"data": [REAL_PAYMENT_ROW]})
+
+    for kwargs in ({}, {"limit": 5}, {"page": 3}, {"limit": 50, "page": 2}):
+        session = _Listing()
+        client = DaftraClient(api_key="k", session=session, payments_status=None)
+        client.list_payments(**kwargs)
+        assert session.params["include_client_credit"] == 1, kwargs
+
+
+def test_the_source_total_is_kept_for_the_quiet_listing_tripwire():
+    """The listing's own count is recorded, and an absent one stays ``None``.
+
+    ``None`` is the load-bearing part: the tripwire compares the source's count
+    against what has already been handled, and a source that reports nothing must
+    read as "no opinion" rather than "there is nothing there" — otherwise a
+    payload without ``pagination`` would read as a count of zero and warn on
+    every cycle.
+    """
+    from fakes import FakeResponse
+
+    class _WithTotal(_PaymentSession):
+        def get(self, url: str, **kwargs):
+            return FakeResponse(
+                200,
+                {"data": [REAL_PAYMENT_ROW], "pagination": {"total_results": 125}},
+            )
+
+    class _WithoutTotal(_PaymentSession):
+        def get(self, url: str, **kwargs):
+            return FakeResponse(200, {"data": [REAL_PAYMENT_ROW]})
+
+    counted = DaftraClient(api_key="k", session=_WithTotal())
+    assert counted.last_listing_total is None, "no listing has run yet"
+    counted.list_payments()
+    assert counted.last_listing_total == 125
+
+    silent = DaftraClient(api_key="k", session=_WithoutTotal())
+    silent.list_payments()
+    assert silent.last_listing_total is None
+
+    # A non-integer count is not a count. ``True`` is an ``int`` in Python and must
+    # not pass as "1 payment exists".
+    class _Nonsense(_PaymentSession):
+        def get(self, url: str, **kwargs):
+            return FakeResponse(200, {"data": [], "pagination": {"total_results": True}})
+
+    odd = DaftraClient(api_key="k", session=_Nonsense())
+    odd.list_payments()
+    assert odd.last_listing_total is None
 
 
 def test_no_status_filter_sends_no_status_parameter():

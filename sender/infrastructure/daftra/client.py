@@ -12,6 +12,23 @@ from sender.infrastructure.util import json_or_none
 from .mapper import DaftraCustomerMapper, DaftraInvoiceMapper, DaftraPaymentMapper
 
 
+def _total_results(payload: dict) -> int | None:
+    """Daftra's own count of the rows a listing matched, or ``None`` if it did not say.
+
+    The count is the one piece of *source-side* truth a listing carries, and it is
+    the only thing that can tell "the account has no new payments" apart from "the
+    endpoint is showing me less of the account than it used to". The rows themselves
+    cannot: a paginated page looks identical whether the account shrank or not.
+    ``None`` rather than ``0`` when the key is missing, because an absent count must
+    not read as "there is nothing there".
+    """
+    pagination = payload.get("pagination") if isinstance(payload, dict) else None
+    if not isinstance(pagination, dict):
+        return None
+    total = pagination.get("total_results")
+    return total if isinstance(total, int) and not isinstance(total, bool) else None
+
+
 class DaftraClient:
     """One Daftra account, read three ways: invoices, payments and clients.
 
@@ -53,6 +70,21 @@ class DaftraClient:
         # Server-side narrowing of the payment listing. ``None`` means "no filter",
         # which is a real mode (see the payments guide), not a missing value.
         self._payments_status = payments_status or None
+        #: The source's own count from the most recent ``list_payments`` call, read
+        #: by the poller's "did the source go quiet?" tripwire. ``None`` until a
+        #: listing has run, and ``None`` forever for a source that does not report it.
+        self._last_listing_total: int | None = None
+
+    @property
+    def last_listing_total(self) -> int | None:
+        """How many payments the source says matched the last listing, if it said.
+
+        Read through ``getattr`` by the poller rather than declared on the port, so
+        that a source which cannot report a total (the offline stub, a test double)
+        simply does not get asked instead of having to implement a method that
+        means nothing to it. ``None`` means "no opinion", never "none exist".
+        """
+        return self._last_listing_total
 
     def get_invoice(self, invoice_id: int | str) -> Invoice:
         return self._mapper.to_invoice(self._fetch_invoice(invoice_id))
@@ -99,11 +131,33 @@ class DaftraClient:
         The status filter is applied server-side so a page is never spent on
         payments that are not going to be announced — which matters because a
         page is exactly the unit the poller's paging logic reasons about.
+
+        ``include_client_credit=1`` is **not** optional and is the whole reason
+        this pipeline can see payments at all. ``/invoice_payments.json`` excludes
+        ``client_credit`` rows by default, and on a real account that is nearly
+        every payment: of 125 payments on one tenant, 124 were ``client_credit``
+        and exactly one was ``cash``. Left to its default the endpoint answered
+        ``total_results=1`` — that single ``cash`` row from five months earlier —
+        on every request regardless of ``limit``, ``page``, ``sort``, ``status``,
+        ``invoice_id``, ``treasury_id`` or ``branch_id``. The 124 others were
+        demonstrably there, reachable individually via
+        ``/invoice_payments/{id}.json`` and embedded in each invoice's detail, so
+        the pipeline was not failing: it was being handed one old row it had
+        already announced, forever, and reporting ``listed 1, new 0`` with a zero
+        exit code and no warning.
+
+        A ``client_credit`` row is money received against an invoice — it settles
+        one, and the template tells the customer their balance was updated — so it
+        is exactly what this pipeline exists to announce. :meth:`_invoice_id`
+        already recorded that these rows exist; this is the request that makes them
+        visible. The flag is passed unconditionally rather than exposed as a knob
+        because omitting it does not narrow the announcement, it *silences* it.
         """
-        params: dict = {"page": page, "limit": limit}
+        params: dict = {"page": page, "limit": limit, "include_client_credit": 1}
         if self._payments_status:
             params["status"] = self._payments_status
         payload = self._request("GET", "/invoice_payments.json", params=params)
+        self._last_listing_total = _total_results(payload)
         return self._payment_mapper.to_payments(payload)
 
     def get_customer(self, customer_id: int | str) -> Customer:

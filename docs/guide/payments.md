@@ -63,8 +63,44 @@ customer their balance was updated and only a completed payment does that. Set
 `POLL_PAYMENTS_STATUS` blank to announce every row, or to `2`/`3`/… for another
 status.
 
-Daftra excludes `client_credit` and opening-balance payments from this endpoint by
-default, which is what you want: neither is a customer settling an invoice.
+### `client_credit` payments are requested explicitly
+
+Daftra **excludes `client_credit` rows from `/invoice_payments.json` by default**,
+so the sender asks for them with `include_client_credit=1` on every listing. This
+is not a preference; omitting the parameter does not narrow what is announced, it
+**silences** it.
+
+On the live `mohamedsoph2006` tenant, 124 of the account's 125 payments were
+`client_credit` and exactly one was `cash`. Left at its default the endpoint
+answered `total_results=1` — that single `cash` row from months earlier — on every
+request, regardless of `limit`, `page`, `sort`, `status`, `invoice_id`,
+`treasury_id` or `branch_id`. The other 124 were demonstrably there, reachable
+individually at `/invoice_payments/{id}.json` and embedded in each invoice's
+detail, so the pipeline was not failing: it was handed one already-announced row
+and reported `listed 1, new 0` with a zero exit code and nothing in the log.
+
+A `client_credit` row is money received **against an invoice** — it settles one,
+and the template tells the customer their balance was updated — so it is exactly
+what this pipeline exists to announce. If you ever need the narrow old behaviour,
+filter on `payment_method` rather than dropping the flag: a listing that excludes
+the category is indistinguishable, in the summary line, from a day with no
+payments at all.
+
+### If you turn the flag on for the first time
+
+The seen-set is what stops a newly-visible backlog from being announced all at
+once, and it only helps if it already contains those rows. Turning this on against
+a state file written while the flag was absent will surface every payment the
+account has ever recorded as *new*. Seed first — one cycle with a page size large
+enough to hold the whole backlog, so it seeds instead of sending:
+
+```bash
+python -m sender poll-reset --payments --app <tenant> --yes
+POLL_PAYMENTS_LIMIT=500 python -m sender poll-payments --once --dry-run
+```
+
+The `--dry-run` reports what it *would* seed and writes nothing. Drop it, and check
+`poll-status --payments` shows the full count, before letting cron resume.
 
 ## Why two Daftra calls per payment
 
@@ -166,6 +202,25 @@ Identical to the invoice pipeline, and inherited rather than reimplemented:
 - the first run per tenant **seeds without sending** — use `--send-existing` to
   confirm the existing history instead;
 - `--dry-run` writes nothing, not even the state file.
+
+### The quiet-listing tripwire
+
+A quiet cycle is normal and logs nothing. Two things that are *not* quiet are
+reported, because the alternative is the failure this pipeline actually had — a
+healthy `new 0`, a zero exit code, and no indication that the endpoint was showing
+one row out of a hundred and twenty-five:
+
+- **an empty listing for a tenant that has already handled documents.** Every
+  handled document exists in the account, so an empty page means the filter, the
+  endpoint, or the account changed — not that the day was quiet;
+- **the source's own count is below the number already handled.** A page of
+  already-seen documents looks identical whether the account shrank or not, so only
+  Daftra's `pagination.total_results` can reveal that the listing has *narrowed*.
+  It is read through `getattr`, so a source with no opinion (the offline stub) is
+  simply never asked; `None` means "no opinion", never "there is nothing there".
+
+Both warnings name the tenant and say to check the listing rather than the send
+path, because that is where the fault was.
 
 ## Related
 

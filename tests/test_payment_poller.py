@@ -453,4 +453,124 @@ def test_the_stub_listing_honours_the_status_filter():
         make_stub_payment(id="2", number="000002", status="2"),
     ]
     assert [p.number for p in StubPaymentSource(payments).list_payments()] == ["000001"]
+
+
+class _TotalReportingSource:
+    """A source that also reports how many rows the account holds in total.
+
+    Mirrors ``DaftraClient.last_listing_total``, which the poller reads with
+    ``getattr`` so a source without an opinion is simply never asked.
+    """
+
+    def __init__(self, listed, total) -> None:
+        self._listed = list(listed)
+        self.last_listing_total = total
+        self.detail_calls: list[str] = []
+
+    def list_payments(self, limit: int = 10, page: int = 1):
+        return list(self._listed)
+
+    def get_payment(self, payment_id):
+        self.detail_calls.append(str(payment_id))
+        return self._listed[0]
+
+    def get_raw_payment(self, payment_id):
+        return {}
+
+
+def _poller_for_source(source, state=None, sender=None) -> PaymentPoller:
+    return PaymentPoller(
+        apps=[PollApp(name="app1", source=source)],
+        sender=sender or CapturingSender(),
+        builder=_builder(),
+        state=state or InMemoryPollStateStore(),
+        clock=FakeClock(),
+    )
+
+
+def test_a_listing_that_has_gone_empty_for_an_established_app_is_reported(caplog):
+    """An empty page is not a quiet day once documents have been handled.
+
+    Every already-handled document exists in the account, so a source offering
+    none of them has changed under us — a filter, the endpoint, or the account.
+    Reported, because the alternative is the exact failure this pipeline had: a
+    healthy-looking ``new 0``, a zero exit code, and nothing in the log.
+    """
+    state = InMemoryPollStateStore()
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in (1, 2)]
+    _poller_for_source(_TotalReportingSource(payments, 2), state=state).run_once()
+    assert state.seen_ids("app1"), "the first cycle should have handled something"
+
+    caplog.clear()
+    gone = _TotalReportingSource([], 0)
+    _poller_for_source(gone, state=state).run_once()
+
+    assert "came back empty" in caplog.text
+    assert "app1" in caplog.text
+
+
+def test_a_quiet_cycle_on_an_established_app_is_not_reported(caplog):
+    """A page of already-seen documents is the steady state and must stay silent.
+
+    The tripwire's whole value is that it is rare. If an ordinary cycle with
+    nothing new logged a warning, the real one would be buried in a warning that
+    fires every five minutes.
+    """
+    state = InMemoryPollStateStore()
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in (1, 2)]
+    _poller_for_source(_TotalReportingSource(payments, 2), state=state).run_once()
+
+    caplog.clear()
+    _poller_for_source(_TotalReportingSource(payments, 2), state=state).run_once()
+
+    assert "came back empty" not in caplog.text
+    assert "narrowed" not in caplog.text
+
+
+def test_an_established_app_whose_first_cycle_finds_nothing_is_not_reported(caplog):
+    """No documents handled yet means an empty page is just an empty account."""
+    state = InMemoryPollStateStore()
+    _poller_for_source(_TotalReportingSource([], 0), state=state).run_once()
+    assert "came back empty" not in caplog.text
+
+
+def test_a_listing_that_has_narrowed_below_what_was_handled_is_reported(caplog):
+    """The regression that hid for weeks: the endpoint showing less, not more.
+
+    ``/invoice_payments.json`` answered with one of a hundred and twenty-five rows
+    for months because ``client_credit`` payments are excluded by default. Nothing
+    about the page itself looks wrong — it is full, it is all already seen, it is
+    newest-first — so only the source's own count reveals that the account did
+    not shrink.
+    """
+    state = InMemoryPollStateStore()
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in (1, 2, 3)]
+    _poller_for_source(_TotalReportingSource(payments, 3), state=state).run_once()
+    assert len(state.seen_ids("app1")) == 3
+
+    caplog.clear()
+    # Same rows, but the source now claims the account holds fewer than we handled.
+    _poller_for_source(_TotalReportingSource(payments, 1), state=state).run_once()
+
+    assert "narrowed" in caplog.text
+    assert "app1" in caplog.text
+
+
+def test_a_source_with_no_total_opinion_is_never_reported(caplog):
+    """``None`` means "no opinion", and no opinion must not warn.
+
+    The offline stub and any test double do not report a total. Reading that as a
+    count of zero would warn on every rehearsal, which is how a tripwire stops
+    being read.
+    """
+    state = InMemoryPollStateStore()
+    payments = [make_stub_payment(id=str(i), number=f"00000{i}") for i in (1, 2)]
+    plain = _app("app1", payments)
+    _poller_for_source(plain.source, state=state).run_once()
+
+    caplog.clear()
+    _poller_for_source(plain.source, state=state).run_once()
+
+    assert "narrowed" not in caplog.text
+    assert "came back empty" not in caplog.text
     assert len(StubPaymentSource(payments, status=None).list_payments()) == 2

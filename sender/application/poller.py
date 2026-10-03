@@ -437,6 +437,7 @@ class DocumentPoller(Generic[TDoc, TSource]):
             return result
         result["listed"] = len(listed)
         ids = [str(doc.id) for doc in listed]
+        self._warn_if_source_went_quiet(app, listed)
         result["first_run"] = first_run
         result["dry_run"] = self._dry_run
         # Anything unexpected from here on (a failed batch-exit state write, an
@@ -535,6 +536,56 @@ class DocumentPoller(Generic[TDoc, TSource]):
             if not self._dry_run:
                 self._state.set_draining(app.name, False)
         return result
+
+    def _warn_if_source_went_quiet(self, app: PollApp, listed: list[TDoc]) -> None:
+        """Report a listing that has gone suspiciously quiet for an established app.
+
+        A quiet cycle is normal and must stay silent: an app with nothing new is the
+        steady state, and a warning on every one of them would train the operator to
+        ignore the log. What is *not* normal is a source offering **less of the
+        account than it used to** — and that is a real failure here, not a
+        hypothetical one. ``/invoice_payments.json`` excludes ``client_credit`` rows
+        by default, and on a live tenant that was 124 of 125 payments: the pipeline
+        spent weeks reporting ``listed 1, new 0`` with a zero exit code and nothing
+        in the log to say the endpoint was showing it one old row out of a hundred
+        and twenty-five.
+
+        Two checks, because they catch different faults and each is blind to the
+        other's case:
+
+        - **The listing came back empty** for an app that has already handled
+          documents. Every one of those documents exists, so an empty page is not a
+          quiet day — the filter, the endpoint, or the account changed under us.
+        - **The source's own count is below what we have already handled.** This is
+          the one that catches a narrowing: the rows are unchanged from our point of
+          view (a page of already-seen documents looks the same however many there
+          are behind it), so only the source's ``total_results`` can tell that the
+          account did not shrink. Read with ``getattr`` because a source that cannot
+          report a total — the offline stub, a test double — has no opinion to give,
+          and no opinion must never read as "none exist".
+        """
+        # ``seen_ids`` is on the port, so this works for every store; reading it
+        # before the ``listed`` test below costs one list copy on a cycle that is
+        # about to walk the seen-set anyway.
+        handled = len(self._state.seen_ids(app.name))
+        if not listed:
+            if handled:
+                log.warning(
+                    "app %s: the %s listing came back empty although %d %s(s) have "
+                    "already been handled; the source is offering none of them, so "
+                    "new %s cannot be seen. Check the listing's filters and the "
+                    "account, not the send path",
+                    app.name, self._noun, handled, self._noun, self._plural,
+                )
+            return
+        total = getattr(app.source, "last_listing_total", None)
+        if handled and isinstance(total, int) and total < handled:
+            log.warning(
+                "app %s: the source reports %d %s(s) matching the listing but %d "
+                "have already been handled; the listing has narrowed and newer %s "
+                "may be invisible to this pipeline",
+                app.name, total, self._noun, handled, self._plural,
+            )
 
     def _list_candidates(self, app: PollApp, *, draining: bool = False) -> list[TDoc]:
         """List documents, paging forward while the page is saturated and still
