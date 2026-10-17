@@ -757,6 +757,61 @@ def test_an_invoice_with_no_notes_draws_no_notes_block_at_all() -> None:
     assert _baseline_of(pdf, shaped_gids("بنود الفاتورة")) == META_Y - 4 * 13
 
 
+def test_the_notes_keep_the_breaks_the_operator_typed() -> None:
+    """One typed line is one drawn line — the notes are not flattened into prose.
+
+    A weighable invoice's figures are entered one per line (الوزن القائم, الوزن
+    صافي, سعر الكيلو), and that is how the operator reads them back. Collapsing
+    those newlines turns three separately-meaningful facts into a running sentence
+    the customer has to stop and re-read to tell apart, so the paragraph splits on
+    its line breaks before wrapping.
+
+    Asserted by drawing: each typed line has to occupy its own baseline, and in the
+    order it was typed.
+    """
+    typed = (
+        "التسليم صباحاً عند باب المصنع\n"
+        "الوزن القائم: ١٢٠ كجم\n"
+        "الوزن صافي: ١١٠ كجم\n"
+        "سعر الكيلو: ٥٠ ج.م"
+    )
+    pdf = render_invoice_pdf(arabic_invoice(description=typed))
+    last = _page_spans(pdf, -1)
+    notes = sorted(
+        (span for span in last if float(span["size"]) == NOTES_SIZE),
+        key=lambda span: -float(span["y"]),  # top line first
+    )
+    # Four typed lines, four drawn baselines — not one flattened run, and not four
+    # lines of one wrapped sentence.
+    assert len({round(float(span["y"]), 2) for span in notes}) == 4, (
+        f"expected one baseline per typed line, got {[s['y'] for s in notes]}"
+    )
+    # And they are consecutive: one pitch apart, with no blank line between.
+    ys = sorted(float(span["y"]) for span in notes)
+    assert all(
+        abs((ys[i + 1] - ys[i]) - NOTES_PITCH) < 0.01 for i in range(len(ys) - 1)
+    ), f"the typed lines are not evenly pitched: {ys}"
+
+    # Each line carries its own text, so nothing merged across a break.
+    for word in ("التسليم", "الوزن القائم", "الوزن صافي", "سعر الكيلو"):
+        assert any(shaped_gids(word) in span["gids"] for span in notes), (
+            f"{word} is not on a line of its own"
+        )
+
+
+def test_a_blank_line_between_typed_lines_costs_no_drawn_line() -> None:
+    """An empty line is skipped, not drawn as air.
+
+    The cap is four lines of the customer's table, so spending one on whitespace
+    the operator left by pressing return twice would buy nothing.
+    """
+    assert len(
+        [s for s in _page_spans(render_invoice_pdf(
+            arabic_invoice(description="أولا\n\nثانيا\n\nثالثا")), -1)
+         if float(s["size"]) == NOTES_SIZE]
+    ) == 3
+
+
 def test_the_notes_are_wrapped_and_never_ellipsised(caplog) -> None:
     """A note is prose, so it wraps; it is never fitted with an ellipsis.
 

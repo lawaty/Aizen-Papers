@@ -38,8 +38,8 @@ says so explicitly instead of being omitted — so "never run" is never misread 
 "nothing to report".
 
 **Must not change silently:** adding an adapter import here is expected; adding a
-*business* rule here is not. `cli.py` is already 1,454 lines — the largest file in
-the repo — so new command logic belongs in `application/`, new parsing stays here.
+*business* rule here is not. `cli.py` is the largest file in the repo, so new
+command logic belongs in `application/`, new parsing stays here.
 
 ---
 
@@ -362,7 +362,7 @@ shaping, so the sender resolves Arabic contextual forms and run order itself and
 reads the embedded font directly.
 
 **Start here**
-- `infrastructure/pdf.py` — the writer (1,261 lines).
+- `infrastructure/pdf.py` — the writer; `render_invoice_pdf` is the entry point.
 - `infrastructure/truetype.py` — glyph-id lookup and `Identity-H`/`FontFile2` emission.
 - `infrastructure/arabic.py` — contextual forms and run reversal.
 - `infrastructure/fonts/README.md` — why a 87 KB Noto Naskh Arabic subset is committed (OFL).
@@ -373,7 +373,12 @@ standard-14 Helvetica; the subset contains almost no ASCII.
 
 **Must not change:** the font subset is committed and licence-bound; do not
 regenerate it casually. Undrawable characters are dropped with a WARNING naming
-the field — Arabic itself must never warn. **Numeric fields overflow rather than
+the field — Arabic itself must never warn. The separate **unshaped** tripwire
+(`_warn_unshaped`) is narrowed to **letters** (`category == "L"`): a digit,
+comma or harakat has no joining form, so warning on it is noise — and the notes
+are full of Arabic-Indic digits, so a letters-blind check would fire on every
+weighable invoice and train the operator to skip the warning that matters.
+**Numeric fields overflow rather than
 ellipsise**: an over-wide amount *or quantity* is drawn in full, because a
 truncated figure is a wrong figure; only item *names* go through `_fit` and get
 `...`. The two **free-text** fields — `Invoice.description` (Daftra's `notes`) and
@@ -381,7 +386,23 @@ truncated figure is a wrong figure; only item *names* go through `_fit` and get
 at word boundaries and draws every line, because an ellipsis on a delivery
 instruction or a size deletes the half that made it worth writing and nothing on
 the page says anything was cut. An empty one draws **nothing at all** — no label,
-no `-`, no line of air — since most invoices carry neither. A **totalled**
+no `-`, no line of air — since most invoices carry neither.
+
+**The invoice notes are a footnote at the foot of the *last* page, and reserving
+its room is a two-pass layout.** `Invoice.description` is drawn small, faint
+(`_FAINT`, one step below `_SOFT`) and **unlabelled**, right-anchored and narrower
+than the text column (`_NOTES_FOOTER_*`), so it reads as a footnote rather than a
+fifth meta row. Because a page's foot is only the last page's foot *after* layout,
+`render_invoice_pdf` lays the document out once and, **only if the last page is too
+full**, lays it out a second time with the band reserved on every page
+(`_Canvas(bottom=…)`), pushing the overflow rows onto a fresh last page. The guard
+is load-bearing: reserving unconditionally would change pagination for every
+invoice to solve a problem most do not have. The band is deliberately more
+generous than the ink box (air + a full line pitch per line), so a row can never
+sit flush against the notes. The paragraph is **capped at `_NOTES_FOOTER_LINES`
+(4)** because its height is a reservation; overflowing the cap logs a WARNING
+naming the field — a truncation may not be silent, the same rule as the ellipsis
+ban above. `_draw_body` exists so the two passes cannot drift. A **totalled**
 invoice with no line
 items also warns (`_warn_empty_items`): it is the signature of a row that was
 never re-fetched from the detail endpoint (§ 7), and the rendered table would

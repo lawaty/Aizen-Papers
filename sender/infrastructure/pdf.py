@@ -310,6 +310,12 @@ _ITEMS_HEADING = "بنود الفاتورة"
 _ITEMS_EMPTY = "لا توجد بنود في هذه الفاتورة"
 
 _WHITESPACE = re.compile(r"\s+")
+#: The line breaks the notes paragraph **keeps**, split on before wrapping.
+#: ``\s+`` swallows all of these, which is what made the operator's own layout
+#: disappear; the set is the full set, so CRLF, a lone CR, and the Unicode
+#: separators a phone keyboard may emit all break the line rather than being
+#: flattened into a single run.
+_LINE_BREAK = re.compile(r"[\r\n\u0085\u2028\u2029]+")
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # WinAnsi renders "…" as one glyph; a plain "..." is font-independent.
 _ELLIPSIS = "..."
@@ -922,9 +928,16 @@ def _draw_heading(canvas: _Canvas, invoice: Invoice, currency: str) -> None:
 def _notes_footer_lines(invoice: Invoice) -> list[str]:
     """The notes as the lines the bottom-right paragraph will draw.
 
-    Wrapped (not fitted — see :func:`_wrap`) and then capped at
-    :data:`_NOTES_FOOTER_LINES`, because the paragraph's height is what the
-    layout reserves on the last page.
+    The operator's **own line breaks are kept**: each line they typed is its own
+    line on the page. They enter a weighable invoice's figures one per line —
+    الوزن القائم, الوزن صافي, سعر الكيلو — and collapsing those into one running
+    sentence turns three separately-meaningful facts into something a customer has
+    to stop and re-read to tell apart. So the text is split on its line breaks
+    first and each piece wrapped on its own, rather than flattened whole.
+
+    A line still wraps if it is too long for the corner (see :func:`_wrap`), and
+    the whole paragraph is then capped at :data:`_NOTES_FOOTER_LINES`, because its
+    height is what the layout reserves on the last page.
 
     Overflowing the cap is **reported rather than silently dropped**. The rest of
     the module refuses to ellipsise free text precisely because an ellipsis on a
@@ -934,7 +947,13 @@ def _notes_footer_lines(invoice: Invoice) -> list[str]:
     here, and silently drawing the first four lines of them would state a wrong
     net weight rather than a missing one.
     """
-    lines = _wrap(invoice.description, _NOTES_FOOTER_SIZE, _NOTES_FOOTER_WIDTH, "invoice description")
+    raw = "" if invoice.description is None else str(invoice.description)
+    lines: list[str] = []
+    for paragraph in _LINE_BREAK.split(raw):
+        # ``_wrap`` flattens whitespace and drops undrawable characters within the
+        # piece, and returns nothing for an empty one — so a blank line between
+        # paragraphs costs neither a drawn line nor one of the four.
+        lines.extend(_wrap(paragraph, _NOTES_FOOTER_SIZE, _NOTES_FOOTER_WIDTH, "invoice description"))
     if len(lines) > _NOTES_FOOTER_LINES:
         log.warning(
             "invoice PDF: the notes need %d lines at the foot of the page but only "
