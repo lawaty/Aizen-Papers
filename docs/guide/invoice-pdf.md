@@ -71,7 +71,7 @@ Daftra lets a seller write prose in two places, and both reach the page:
 
 | Where | Daftra field | Model field | Drawn as |
 |---|---|---|---|
-| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | an unlabelled paragraph in the body ink at the foot of the **last** page, bottom-right, one line per `<p>` |
+| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | an unlabelled paragraph in the body ink on the **last** page, right-aligned and set about four and a half lines below the table, one line per `<p>` |
 | one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
 
 They are **wrapped, never fitted**. This is the one thing that separates them from
@@ -84,7 +84,7 @@ two fields at word boundaries and draws every line, and a word too wide for its
 column (a URL, a long code) is broken by character rather than allowed to run into
 the neighbouring column.
 
-### The notes paragraph: the foot of the last page
+### The notes paragraph: under the table, on the last page
 
 **Daftra's notes arrive as HTML, and the field is `html_notes`.** The operator
 types into a rich-text editor, which writes `html_notes` and leaves plain `notes`
@@ -97,7 +97,8 @@ line breaks — and drops the rest, so the document never sees `<p>`,
 placeholder. That conversion lives in the mapper because it is the only layer
 that sees the wire format.
 
-The invoice's notes are drawn at the **bottom-right of the last page**, in the
+The invoice's notes are drawn on the **last** page, right-aligned and about
+four and a half of the page's 13pt lines below the table, in the
 body ink and half a point under the body size. They used to be set at 7.5pt in a
 faint grey: legible on paper, and effectively **absent on a phone** — which is
 where these documents are actually read, since they arrive as a WhatsApp
@@ -131,7 +132,7 @@ page. Overflowing the cap logs a WARNING naming the field — it is a truncation
 and this module's rule is that a truncation may not be silent.
 
 The two are separate fields on purpose: `notes` is about the whole document, so it
-is printed once at the foot of the last page, where it annotates
+is printed once under the table on the last page, where it annotates
 every page without competing with any of them. The line description is about one
 row, so it sits inside that row, under its name, in the secondary ink — at body
 ink a paragraph under every item name would be the loudest thing on the page, and

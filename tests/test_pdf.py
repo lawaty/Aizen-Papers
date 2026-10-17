@@ -71,7 +71,7 @@ SOFT_RGB = "0.44 0.46 0.48"
 #: than the paragraph's ink box — reserving the ink alone would let a row sit
 #: flush against the notes, which is not what "leave room" means on a printed page.
 CONTENT_BOTTOM = 74.0
-NOTES_AIR = 10.0
+NOTES_AIR = 56.0
 NOTES_PITCH = 10.5
 #: The paragraph's cap, restated. Used only as the upper bound of the band, never
 #: as an expectation about any one document.
@@ -741,6 +741,34 @@ def test_the_notes_are_readable_on_a_phone() -> None:
     assert len(soft_text) >= len(notes), (
         f"{len(soft_text)} ops use the body ink but {len(notes)} notes spans were drawn"
     )
+
+
+def test_the_notes_sit_four_and_a_half_lines_under_the_table_not_at_the_page_foot() -> None:
+    """The paragraph belongs to the table, so it hangs just below it.
+
+    Anchored hard against the bottom margin it reads as page furniture that fell to
+    the bottom of the sheet — a footnote, in the pejorative sense — when what it
+    carries is the same operator's figures as the table above it. So it is set off
+    by a stated margin of air rather than parked on the floor.
+
+    Measured from the page's own geometry: the gap between the content floor (the
+    lowest a table row may sit) and the paragraph's last line is a bit over four of
+    the page's 13pt lines. Asserted as a *range* rather than an equality so this
+    pins the intent — real air, near the table, not at the foot — without failing
+    over a point of a line.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    notes = _notes_spans_on(pdf, -1)
+    assert notes, "the notes must be drawn"
+    lowest_note = min(float(span["y"]) for span in notes)
+
+    gap = lowest_note - CONTENT_BOTTOM
+    assert 4 * 13 <= gap <= 5 * 13 + 1, (
+        f"the paragraph sits {gap:.1f}pt under the table: it should be about four "
+        "and a half of the page's 13pt lines, not parked on the bottom margin"
+    )
+    # And it really is off the floor: the old 10pt is what this replaced.
+    assert gap > 30.0
 
 
 def test_the_notes_sit_on_the_right_and_do_not_span_the_whole_column() -> None:

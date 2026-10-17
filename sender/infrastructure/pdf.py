@@ -268,9 +268,14 @@ _NOTES_FOOTER_SIZE = 8.5
 #: joining strokes of the line above crowd it.
 _NOTES_FOOTER_PITCH = 10.5
 #: The air between the last row above and the paragraph's first line.
-_NOTES_FOOTER_AIR = 10.0
-#: Right-anchored and narrower than the text column, so the paragraph sits in the
-#: page's bottom-*right* rather than spanning it — the shape a footnote takes.
+#: The air between the table's last row and the paragraph — about four and a half
+#: of the page's 13pt rhythm, stated in those terms so it reads as *space on the
+#: page* rather than as a number. Anchored here rather than at the very foot: a
+#: paragraph hard against the bottom margin reads as page furniture that fell to
+#: the bottom, where the figures belong beside the table they describe.
+_NOTES_FOOTER_AIR = 56.0
+#: Right-anchored and narrower than the text column, so the paragraph sits on the
+#: page's right rather than spanning it.
 _NOTES_FOOTER_WIDTH = 250.0
 #: The table's own verticals, all relative to the running baseline.
 _HEADING_AIR = 13.0  # air between the meta block and the section heading
@@ -995,8 +1000,10 @@ def _draw_notes_footer(canvas: _Canvas, lines: list[str]) -> None:
         return
     canvas.on_page(canvas.page_count - 1, _FOOTER_Y)
     for index, line in enumerate(lines):
-        # The last line sits just above the content floor; each earlier line is
-        # one pitch higher, so the paragraph reads downward into the corner.
+        # The paragraph hangs off the space the layout reserved: its last line
+        # sits :data:`_NOTES_FOOTER_AIR` above the content floor — four and a half
+        # lines of air under the table — and each earlier line is one pitch higher,
+        # so it reads downward toward the page's right margin.
         y = _CONTENT_BOTTOM + _NOTES_FOOTER_AIR + (len(lines) - 1 - index) * _NOTES_FOOTER_PITCH
         canvas.move_to(y)
         canvas.text(_NOTES_FOOTER_BOX, line, "invoice description", _NOTES_FOOTER_SIZE, _SOFT)
