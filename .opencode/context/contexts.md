@@ -455,11 +455,23 @@ so a fixture's nesting can never break the mapper. A fourth mapper should subcla
 `PUBLIC_URL_KEYS`, `PDF_URL_KEYS`, `NOTES_KEYS`, `ITEM_DESCRIPTION_KEYS` and the
 phone keys are all read through `_first`, which **skips `None`/`""`/`[]`** — so
 tuple order *is* precedence, and a field Daftra sends empty falls through to the
-next spelling. That is what makes `NOTES_KEYS = ("notes", "description")` work:
-Daftra sends `notes: ""` on most invoices, and a stop-at-first-match read would
-never reach the alternate spelling. Free-text fields map to `""` when absent and
-warn about nothing — `_text` deliberately has **no default**, unlike every other
-reader in the class, because a note Daftra did not send has no honest substitute.
+next spelling. Free-text fields map to `""` when absent and warn about nothing —
+`_text` deliberately has **no default**, unlike every other reader in the class,
+because a note Daftra did not send has no honest substitute.
+
+**The mapper is the only layer that knows HTML exists.** Daftra's notes box is a
+rich-text editor: it writes `html_notes` and leaves plain `notes` at `null`, so
+`NOTES_KEYS` leads with `html_notes` and falls back to `notes` / `description`.
+Reading `notes` first finds nothing on real invoices — measured, `notes` was
+empty on all 68 and `html_notes` populated on 22 — and the result is
+indistinguishable from an operator who never typed a note, so it fails silently.
+`html_notes_to_text` (a `html.parser` subclass, per the stdlib-only rule in
+`conventions.md`) turns the markup into plain text **at this boundary**: the
+domain model and `infrastructure/pdf.py` never see a tag, and do not strip one.
+Its conversion is **total** — it degrades to tag-stripped text and warns rather
+than raising, because a `ValueError` escaping to the poller is classified
+permanent (§ 2) and would retire a real invoice over the one field the customer
+asked to be shown. The operator's line breaks survive it; § 6 draws them.
 
 **Daftra's listing order is not a detail, and only one endpoint has to be told.**
 `GET /clients.json` answers newest-first **only** under
