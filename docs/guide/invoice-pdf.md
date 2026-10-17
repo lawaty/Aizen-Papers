@@ -86,59 +86,50 @@ the neighbouring column.
 
 ### The notes paragraph: under the table, on the last page
 
-**Daftra's notes arrive as HTML, and the field is `html_notes`.** The operator
-types into a rich-text editor, which writes `html_notes` and leaves plain `notes`
-at `null`. Measured across the three configured accounts: `notes` was empty on
-all 68 invoices, `html_notes` populated on 22. Reading `notes` finds nothing and
-looks exactly like an operator who never typed a note. The mapper
+Daftra's notes arrive as HTML, and the field is `html_notes`. The operator types
+into a rich-text editor, which writes `html_notes` and leaves plain `notes` at
+`null`. Measured across the three configured accounts: `notes` was empty on all 68
+invoices, `html_notes` populated on 22. Reading `notes` finds nothing and looks
+exactly like an operator who never typed a note. The mapper
 (`html_notes_to_text`) turns block tags into newlines — they are the operator's
 line breaks — and drops the rest, so the document never sees `<p>`,
 `<span style=...>`, `&nbsp;`, or Daftra's trailing `replace_template_notes`
 placeholder. That conversion lives in the mapper because it is the only layer
 that sees the wire format.
 
-The invoice's notes are drawn on the **last** page, right-aligned and about
-four and a half of the page's 13pt lines below the table, in the
-body ink and half a point under the body size. They used to be set at 7.5pt in a
-faint grey: legible on paper, and effectively **absent on a phone** — which is
-where these documents are actually read, since they arrive as a WhatsApp
-attachment scaled to roughly two thirds of an A4 page. So the size and the
-contrast both moved; the paragraph stays subordinate by *position* and by being
-prose beneath the figures, not by being small and pale.
+The paragraph is drawn **in flow**, immediately after the totals, in the body ink
+and half a point under the body size. Two properties follow, and both are the
+reason it is written this way rather than positioned:
 
-Pinning it to the *last* page is the awkward half. A page's foot is only the last
-page's foot once the document has been laid out, so there is no page to reserve
-room on until after the fact. So `render_invoice_pdf` lays the document out once,
-and **only if the last page turns out to be too full** does it lay it out a second
-time with the paragraph's height reserved on every page — which pushes the rows
-that no longer fit onto a fresh last page, the one that then has room. A second
-pass is a plain re-layout and needs no third: once the band is reserved,
-`_Canvas.need` cannot place content below it, so the last page is guaranteed to
-have the space.
+- **The gap is relative to the table.** An earlier version anchored the paragraph
+  to the page's bottom margin, so on a short invoice it floated far below the
+  table no matter how large the air constant was — the distance being measured was
+  to the page, not to the table. Here the air is a fixed 90 screen pixels (67.5pt,
+  about five of the page's 13pt lines) measured from wherever the last row ended.
+- **It cannot overlap the table**, because nothing is drawn below it.
 
-The reservation is deliberately more generous than the paragraph's ink box — it
-reserves the air plus a full line pitch per line, so a table row can never sit
-flush against the notes. Reserving the ink alone would avoid a literal overlap
-while still looking like a mistake on paper.
+It lands on the **last** page because the totals block before it is atomic and
+drawn last, so it is always on the last page and so is anything after it.
 
-A short invoice is therefore laid out exactly once and loses no rows to the
-band. That guard is the point: reserving unconditionally would cost every invoice
-room, including the majority whose last page is half empty, and would change
-pagination for all of them to solve a problem most of them do not have.
+**The table concedes the space rather than the paragraph reserving it.** While the
+items are laid out, `_Canvas.reserve` withholds the height of the totals and the
+notes, so the last row that will not fit moves onto a new page. That keeps the
+tail together with each other *and* with the table's end. The alternative — the
+tail asking for its own space — orphans the totals and the notes below a page
+break, on a page of their own, with the gap that makes the paragraph legible
+measured from a table that is no longer there.
 
-The paragraph is **capped at four lines**, because its height is a reservation:
-the more lines it takes, the more of the last page's table is pushed onto another
-page. Overflowing the cap logs a WARNING naming the field — it is a truncation,
-and this module's rule is that a truncation may not be silent.
+Because the reservation is withheld rather than drawn, it costs nothing on the
+many invoices whose table stops well short of the page foot.
 
-The two are separate fields on purpose: `notes` is about the whole document, so it
-is printed once under the table on the last page, where it annotates
-every page without competing with any of them. The line description is about one
-row, so it sits inside that row, under its name, in the secondary ink — at body
-ink a paragraph under every item name would be the loudest thing on the page, and
-the figures are what a customer reconciles. A row with no description takes no extra
-line at all, and neither field draws anything when it is empty: no label, no `-`,
-and no line of air.
+The size and ink are set for a **phone**, which is where these documents are
+actually read: they arrive as a WhatsApp attachment scaled to roughly two thirds
+of an A4 page, and the original 7.5pt faint grey rendered at under 5pt of screen —
+legible in print, effectively absent in the hand.
+
+The paragraph is **capped at four lines**. Overflowing the cap logs a WARNING
+naming the field — it is a truncation, and this module's rule is that a
+truncation may not be silent.
 
 ### Arabic and right-to-left
 

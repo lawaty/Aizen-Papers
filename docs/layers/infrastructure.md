@@ -133,8 +133,8 @@ the table is laid out right-to-left from the right margin. Text neither font can
 draw is dropped with a WARNING naming the field, and a value left empty renders
 as `-`. Money is never truncated; a too-wide name is shortened with `...`. The two
 free-text fields are the exception and are **wrapped**, not fitted: `notes` as a
-paragraph in the body ink under the table on the last page (whose band the layout reserves,
-re-laying the document out when the last page is too full to hold it),
+paragraph in the body ink in flow under the table on the last page (the items table
+withholds that space, so it breaks early rather than the tail being orphaned),
 `InvoiceItem.description` as a second line inside its own row, both drawn whole
 because an ellipsis there would delete part of what the seller wrote. See
 [Invoice PDF](../guide/invoice-pdf.md#the-two-free-text-fields).

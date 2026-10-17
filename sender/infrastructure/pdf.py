@@ -268,12 +268,18 @@ _NOTES_FOOTER_SIZE = 8.5
 #: joining strokes of the line above crowd it.
 _NOTES_FOOTER_PITCH = 10.5
 #: The air between the last row above and the paragraph's first line.
-#: The air between the table's last row and the paragraph — about four and a half
-#: of the page's 13pt rhythm, stated in those terms so it reads as *space on the
-#: page* rather than as a number. Anchored here rather than at the very foot: a
-#: paragraph hard against the bottom margin reads as page furniture that fell to
-#: the bottom, where the figures belong beside the table they describe.
-_NOTES_FOOTER_AIR = 56.0
+#: The air between the table's last row and the paragraph — 90 screen pixels at
+#: 96dpi, which is the same gap as about five of the page's 13pt rhythm. Stated in
+#: pixels as well as lines because it is a distance *on the page*, and the page's
+#: own leading is what it has to read as.
+#:
+#: It is measured from wherever the content **ended**, not from the page's bottom
+#: margin, and that is the whole point: an earlier version anchored the paragraph
+#: to a fixed floor, so on a short invoice it floated far below the table no
+#: matter how large this number was. Drawing it in flow — the same way the totals
+#: block is drawn — makes the gap relative to the table by construction, and makes
+#: an overlap impossible for the same reason: there is nothing below it to overlap.
+_NOTES_FOOTER_AIR = 67.5
 #: Right-anchored and narrower than the text column, so the paragraph sits on the
 #: page's right rather than spanning it.
 _NOTES_FOOTER_WIDTH = 250.0
@@ -672,17 +678,19 @@ class _Canvas:
     dictionary (``/W``, ``/ToUnicode``) is written after the last page.
     """
 
-    def __init__(self, bottom: float = _CONTENT_BOTTOM) -> None:
+    def __init__(self) -> None:
         self._pages: list[list[bytes]] = [[]]
         self._page = 0
         self._y = _TOP_Y
-        #: The baseline no content may run below. Normally the page's own bottom
-        #: margin, but raised for the whole document when a band at the foot of
-        #: the last page has to be kept clear for something — see
-        #: :func:`render_invoice_pdf`. It is a per-canvas value rather than a
-        #: constant because it is a property of *this* layout, and a reservation
-        #: for one document must not silently move the text on every other.
-        self._bottom = bottom
+        #: Extra height at the foot of the page that the *flowing* content must not
+        #: use — the space claimed by whatever is drawn after it (the totals and
+        #: the notes beneath them). Set while the items are laid out and cleared
+        #: before the totals are drawn, so the tail is conceded by the table rather
+        #: than reserved against it: the last row that will not fit moves onto a
+        #: new page, which keeps the totals and the notes together with each other
+        #: *and* with the table's end, instead of the tail being orphaned below a
+        #: page break.
+        self.reserve = 0.0
         #: glyph id -> the code point it was drawn for.
         self.glyphs: dict[int, str] = {}
 
@@ -799,7 +807,7 @@ class _Canvas:
 
     def need(self, height: float = _LINE) -> bool:
         """Break to a new page when *height* no longer fits. True if it did."""
-        if self._y - height >= self._bottom:
+        if self._y - height >= _CONTENT_BOTTOM + self.reserve:
             return False
         self._pages.append([])
         self._page = len(self._pages) - 1
@@ -977,36 +985,46 @@ def _notes_footer_lines(invoice: Invoice) -> list[str]:
     return lines[:_NOTES_FOOTER_LINES]
 
 
-def _draw_notes_footer(canvas: _Canvas, lines: list[str]) -> None:
-    """The notes paragraph, bottom-right of the **last** page.
+def _draw_notes(canvas: _Canvas, invoice: Invoice) -> None:
+    """The invoice's own free text, as a paragraph under the table.
 
-    Positioned from the page's own geometry rather than flowed, because it is
-    furniture: the foot of the last page is a fixed place, and a paragraph that
-    landed wherever the content happened to stop would be on the second-last page
-    of a two-page invoice and buried under the table of a full one.
+    Drawn **in flow**, straight after the totals block, with a fixed air above it
+    (:data:`_NOTES_FOOTER_AIR`). Two things follow from that, and both are the
+    reason it is written this way rather than positioned:
 
-    The space it occupies was already reserved during layout (see
-    :func:`render_invoice_pdf`), which is what lets it be drawn straight into the
-    last page's op list with no second pass and no overlap.
+    - The gap is relative to the table, not to the page. An earlier version
+      anchored the paragraph to the page's bottom margin, so on a short invoice —
+      where the content stops halfway down — it floated far below the table it
+      belongs to, and no value of the air constant could fix that, because the
+      distance being measured was the wrong one. Here the air is measured from
+      wherever the last row ended.
+    - It **cannot overlap the table**, because there is nothing drawn below it.
+      An earlier version needed the whole document laid out twice, with the
+      paragraph's height reserved on every page, purely to stop the table running
+      into a fixed position; drawing in flow removes the possibility rather than
+      reserving against it, so there is no second pass, no re-layout, and no
+      per-document bottom margin.
 
-    Set in :data:`_SOFT` at :data:`_NOTES_FOOTER_SIZE` — the body ink, half a
-    point under the body size — because the reader is holding a phone. A WhatsApp
+    It lands on the **last** page as a property of where it sits: the totals block
+    is atomic and drawn last, so it is always on the last page, and so is anything
+    drawn after it.
+
+    The space is conceded by the table rather than reserved by this block (see
+    :data:`_Canvas.reserve`), so the paragraph cannot be separated from what it
+    annotates by a page break.
+
+    Set in :data:`_SOFT` at :data:`_NOTES_FOOTER_SIZE` — the body ink, half a point
+    under the body size — because the reader is holding a phone. A WhatsApp
     attachment is scaled to the screen, so the old 7.5pt rendered at under 5pt of
-    screen: present on paper, absent in the hand. Subordination comes from where
-    the paragraph is and from the fact that it is prose under the figures, not
-    from making it hard to read.
+    screen: present on paper, absent in the hand.
     """
+    lines = _notes_footer_lines(invoice)
     if not lines:
         return
-    canvas.on_page(canvas.page_count - 1, _FOOTER_Y)
-    for index, line in enumerate(lines):
-        # The paragraph hangs off the space the layout reserved: its last line
-        # sits :data:`_NOTES_FOOTER_AIR` above the content floor — four and a half
-        # lines of air under the table — and each earlier line is one pitch higher,
-        # so it reads downward toward the page's right margin.
-        y = _CONTENT_BOTTOM + _NOTES_FOOTER_AIR + (len(lines) - 1 - index) * _NOTES_FOOTER_PITCH
-        canvas.move_to(y)
+    canvas.gap(_NOTES_FOOTER_AIR)
+    for line in lines:
         canvas.text(_NOTES_FOOTER_BOX, line, "invoice description", _NOTES_FOOTER_SIZE, _SOFT)
+        canvas.gap(_NOTES_FOOTER_PITCH)
 
 
 def _header_cells() -> tuple[tuple[Box, str, str], ...]:
@@ -1200,18 +1218,6 @@ def _draw_footers(canvas: _Canvas) -> None:
         canvas.text(((_PAGE_WIDTH - width) / 2, width, "left"), text, "footer", _FOOTER_SIZE, _SOFT)
 
 
-def _draw_body(canvas: _Canvas, invoice: Invoice, currency: str) -> None:
-    """The flowing part of the document: everything but the page furniture.
-
-    Split out because :func:`render_invoice_pdf` lays it out **twice** on the
-    documents that need it, and a second copy of this call list is exactly the
-    kind of thing that would then drift between the two passes.
-    """
-    _draw_heading(canvas, invoice, currency)
-    _draw_items(canvas, invoice)
-    _draw_totals(canvas, invoice)
-
-
 def render_invoice_pdf(invoice: Invoice) -> bytes:
     """Render *invoice* as a single-or-more page PDF document.
 
@@ -1219,35 +1225,31 @@ def render_invoice_pdf(invoice: Invoice) -> bytes:
     data: a value neither font can represent is dropped with a WARNING, and a
     value that is empty renders as ``-``.
 
-    The notes are drawn at the foot of the **last** page, which is the awkward half
-    of that: a page's foot is only the *last* page's foot once the document has
-    been laid out, so there is no page to reserve room on until after the fact.
-    So the document is laid out once, and only if the last page turns out to be
-    too full for the paragraph is it laid out a second time with the paragraph's
-    height reserved on every page — which pushes the rows that no longer fit onto
-    a fresh last page, the one that then has room. The second pass is a plain
-    re-layout and needs no third: with the band reserved, :meth:`_Canvas.need`
-    cannot place content below it, so the last page is guaranteed to have the
-    space.
-
-    The alternative — reserving the band unconditionally — would cost every
-    invoice the room, including the great majority whose last page is half empty,
-    and would change pagination for all of them to solve a problem most of them do
-    not have.
+    One pass, and one page flow: the heading, the items, the totals, then the
+    notes as a paragraph under them (see :func:`_draw_notes`). The notes land on
+    the last page because the totals block before them is atomic and drawn last,
+    so it is always on the last page and so is anything after it — no page index
+    is computed and nothing depends on how many pages the document turned out to
+    be.
     """
     currency = _flatten(invoice.currency)
     _warn_unshaped(invoice)
     _warn_empty_items(invoice)
-    notes = _notes_footer_lines(invoice)
-    band = _NOTES_FOOTER_AIR + len(notes) * _NOTES_FOOTER_PITCH
 
     canvas = _Canvas()
-    _draw_body(canvas, invoice, currency)
-    if notes and canvas.y < _CONTENT_BOTTOM + band:
-        canvas = _Canvas(bottom=_CONTENT_BOTTOM + band)
-        _draw_body(canvas, invoice, currency)
-
-    _draw_notes_footer(canvas, notes)
+    _draw_heading(canvas, invoice, currency)
+    # While the items are laid out, the space the totals and the notes need is
+    # withheld, so the table breaks *before* the tail instead of the tail being
+    # pushed below a page break. Withheld rather than drawn-as-content so it costs
+    # nothing on the many invoices whose table stops well short of the page foot.
+    notes = _notes_footer_lines(invoice)
+    canvas.reserve = _TOTALS_BLOCK + (
+        (_NOTES_FOOTER_AIR + len(notes) * _NOTES_FOOTER_PITCH) if notes else 0.0
+    )
+    _draw_items(canvas, invoice)
+    canvas.reserve = 0.0
+    _draw_totals(canvas, invoice)
+    _draw_notes(canvas, invoice)
     _draw_footers(canvas)
     return _assemble([canvas.content(page) for page in range(canvas.page_count)], canvas.glyphs)
 

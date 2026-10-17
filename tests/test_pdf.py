@@ -71,16 +71,10 @@ SOFT_RGB = "0.44 0.46 0.48"
 #: than the paragraph's ink box — reserving the ink alone would let a row sit
 #: flush against the notes, which is not what "leave room" means on a printed page.
 CONTENT_BOTTOM = 74.0
-NOTES_AIR = 56.0
+#: The air between the table's last row and the paragraph, restated. 90 screen
+#: pixels at 96dpi, which is the same gap as about five of the page's 13pt lines.
+NOTES_AIR = 67.5
 NOTES_PITCH = 10.5
-#: The paragraph's cap, restated. Used only as the upper bound of the band, never
-#: as an expectation about any one document.
-NOTES_LINES = 4
-
-
-def _band_top(lines: int) -> float:
-    """The baseline no content may fall below when the paragraph is *lines* long."""
-    return CONTENT_BOTTOM + NOTES_AIR + lines * NOTES_PITCH
 
 #: Helvetica's advance widths per 1000 em, for the characters these fixtures can
 #: actually put in a string: digits, a decimal point, a thousands separator, and
@@ -743,32 +737,41 @@ def test_the_notes_are_readable_on_a_phone() -> None:
     )
 
 
-def test_the_notes_sit_four_and_a_half_lines_under_the_table_not_at_the_page_foot() -> None:
-    """The paragraph belongs to the table, so it hangs just below it.
+def test_the_notes_sit_about_five_lines_under_the_table() -> None:
+    """The gap is measured from the table, which is what "under the table" means.
 
-    Anchored hard against the bottom margin it reads as page furniture that fell to
-    the bottom of the sheet — a footnote, in the pejorative sense — when what it
-    carries is the same operator's figures as the table above it. So it is set off
-    by a stated margin of air rather than parked on the floor.
-
-    Measured from the page's own geometry: the gap between the content floor (the
-    lowest a table row may sit) and the paragraph's last line is a bit over four of
-    the page's 13pt lines. Asserted as a *range* rather than an equality so this
-    pins the intent — real air, near the table, not at the foot — without failing
-    over a point of a line.
+    An earlier version anchored the paragraph to the page's bottom margin, so on a
+    short invoice it floated far below the table no matter how large the air
+    constant was — the distance being compared was to the page, not to the table.
+    Drawing it in flow makes the gap relative to where the last row ended, so this
+    measures that directly: the distance between the last thing drawn above it and
+    the paragraph's first line.
     """
     pdf = render_invoice_pdf(described_invoice())
-    notes = _notes_spans_on(pdf, -1)
+    last = _page_spans(pdf, -1)
+    notes = [span for span in last if _is_notes_span(span)]
     assert notes, "the notes must be drawn"
     lowest_note = min(float(span["y"]) for span in notes)
 
-    gap = lowest_note - CONTENT_BOTTOM
-    assert 4 * 13 <= gap <= 5 * 13 + 1, (
-        f"the paragraph sits {gap:.1f}pt under the table: it should be about four "
-        "and a half of the page's 13pt lines, not parked on the bottom margin"
+    # The nearest thing drawn above the paragraph — the totals block's last line —
+    # not merely the highest thing on the page, which is the letterhead.
+    above = [
+        float(span["y"])
+        for span in last
+        if not _is_notes_span(span)
+        and float(span["size"]) != FOOTER_SIZE
+        and float(span["y"]) > lowest_note
+    ]
+    assert above, "the page needs content above the notes for this to measure"
+
+    gap = min(above) - lowest_note
+    assert abs(gap - NOTES_AIR) < 0.01, (
+        f"the paragraph sits {gap:.1f}pt under the table, not the stated "
+        f"{NOTES_AIR:.1f}pt"
     )
-    # And it really is off the floor: the old 10pt is what this replaced.
-    assert gap > 30.0
+    # And that is about five of the page's 13pt lines — near the table, not on the
+    # floor, whatever the page's length.
+    assert 4.5 * 13 <= NOTES_AIR <= 5.5 * 13
 
 
 def test_the_notes_sit_on_the_right_and_do_not_span_the_whole_column() -> None:
@@ -1998,14 +2001,14 @@ def test_the_font_embedding_is_compressed_but_still_the_right_bytes() -> None:
 def _is_notes_span(span: dict[str, str]) -> bool:
     """True if *span* belongs to the notes paragraph.
 
-    Needs **both** halves, because neither identifies it alone. Size alone
-    collides with the status chip, which is set at the same :data:`NOTES_SIZE`.
-    Content alone collides with everything: a continuation page's table rows run
-    down to the content floor, which is exactly where the paragraph sits. Together
-    they are exact — no other text is set at this size *and* drawn inside the band
-    the paragraph owns, because that band is reserved away from content.
+    Needs **both** halves. Size alone collides with the status chip, which is set
+    at the same :data:`NOTES_SIZE`; content alone collides with everything else on
+    the page. Together they are exact: the chip is the only other text at this
+    size, and it lives in the letterhead above :data:`META_Y`, so the paragraph is
+    every span at this size **below** the meta block — which is also exactly what
+    it is, being drawn after the table.
     """
-    return float(span["size"]) == NOTES_SIZE and float(span["y"]) < _band_top(NOTES_LINES)
+    return float(span["size"]) == NOTES_SIZE and float(span["y"]) < META_Y
 
 
 def _notes_spans(pdf: bytes) -> list[dict[str, str]]:
@@ -2064,95 +2067,35 @@ def test_the_notes_band_is_reserved_so_the_table_cannot_reach_it() -> None:
         )
 
 
-def test_a_large_last_table_breaks_to_leave_room_for_the_notes() -> None:
-    """When the last page would collide, the table breaks instead of overprinting.
+def test_the_notes_can_never_overlap_the_table_whatever_the_table_is() -> None:
+    """Overlap is now impossible rather than reserved against.
 
-    Swept over item counts and **self-targeting**: rather than hard-coding a count
-    that happens to collide — which is a test of that number, and breaks the day
-    a row's height changes — each count is rendered without notes and its last
-    page's lowest content line is measured. The counts whose last page would run
-    into the paragraph's band are exactly the ones this has to get right, and those
-    are the ones asserted on.
+    This was the requirement that made the document lay out twice with a reserved
+    band: keep the table from running into a paragraph pinned to the bottom of the
+    page. Drawing the paragraph **in flow**, after the totals, removes the
+    possibility — there is nothing drawn below it — so there is nothing left to
+    reserve and no page count to reason about.
 
-    It is a narrow window by construction, which is why it is searched for rather
-    than assumed: the band is ~20pt tall and a row is 13pt, so only one or two
-    item counts in every page-full's worth land inside it.
-
-    Two things are asserted. Every count, at every fill level, must leave the band
-    clear — that is the guarantee. And at least one count must genuinely pay for
-    the band, so the guarantee cannot pass vacuously.
+    Swept across table sizes anyway, because "impossible by construction" is a
+    claim about the drawing order and this is the assertion that holds it: at every
+    fill level, nothing drawn on the last page overlaps the paragraph.
     """
-    at_risk: list[int] = []
-    # Wide enough to span a whole page's worth of thresholds — the band bites in
-    # a ~20pt window every 13pt row, so a narrower sweep risks missing the only
-    # count that exercises the break, and would then pass vacuously.
     for count in range(20, 71):
-        without = render_invoice_pdf(arabic_invoice(description="", items=_items(count)))
-        # The paragraph's own drawn extent is the ink box; the *reserved* extent is
-        # larger (air plus a full pitch per line), and it is the reservation the
-        # layout must honour, so both are needed and they are not the same number.
-        with_notes = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(count)))
-        notes = _notes_spans(with_notes)
+        pdf = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(count)))
+        notes = _notes_spans(pdf)
         assert notes, f"{count} items: the paragraph was not drawn"
-        band_top = _band_top(len(notes))
         band = (
             LEFT_MARGIN,
             min(float(s["y"]) for s in notes) - 0.25 * NOTES_SIZE,
             RIGHT_MARGIN,
             max(float(s["y"]) for s in notes) + 0.75 * NOTES_SIZE,
         )
-
-        # The guarantee, at every count: nothing on the last page is in the band.
-        assert page_count(with_notes) >= page_count(without), (
-            f"{count} items: reserving the band made the document shorter"
-        )
-        for span in _page_spans(with_notes, -1):
+        for span in _page_spans(pdf, -1):
             if _is_notes_span(span):
                 continue
             assert not _overlaps(_span_box(span), band), (
-                f"{count} items: span at y={span['y']} is drawn into the notes band "
-                f"(top {band_top:.1f})"
+                f"{count} items: span at y={span['y']} is drawn into the paragraph"
             )
-
-        # Is this count one where the last page *would* have run into the band?
-        lowest = min(
-            (float(span["y"]) for span in _page_spans(without, -1)
-             if float(span["size"]) != FOOTER_SIZE),
-            default=None,
-        )
-        if lowest is not None and lowest < band_top:
-            at_risk.append(count)
-
-    assert at_risk, (
-        "no item count in the sweep produced a last page that would run into the "
-        "reserved band, so this test cannot prove the reservation works"
-    )
-
-    # At each of those, the reservation is demonstrably what saved the layout: the
-    # un-reserved render puts content below the band, the reserved one does not.
-    # Asserted as a pair so a change that silently stopped reserving fails here
-    # rather than passing because both renders happened to agree.
-    for count in at_risk:
-        with_notes = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(count)))
-        without = render_invoice_pdf(arabic_invoice(description="", items=_items(count)))
-        reserved_low = min(
-            (float(span["y"]) for span in _page_spans(with_notes, -1)
-             if not _is_notes_span(span) and float(span["size"]) != FOOTER_SIZE),
-            default=float("inf"),
-        )
-        plain_low = min(
-            (float(span["y"]) for span in _page_spans(without, -1)
-             if float(span["size"]) != FOOTER_SIZE),
-            default=float("inf"),
-        )
-        assert plain_low < band_top, (
-            f"{count} items was chosen as at-risk but its un-reserved last page "
-            f"already clears the band ({plain_low:.1f} vs {band_top:.1f})"
-        )
-        assert reserved_low >= band_top, (
-            f"{count} items: content still runs to y={reserved_low:.1f}, inside the "
-            f"band reserved to {band_top:.1f}; the table did not break to leave room"
-        )
 
 
 def test_the_table_continues_onto_the_next_page_and_the_notes_follow_it() -> None:
