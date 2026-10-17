@@ -52,18 +52,19 @@ META_Y = 639.0  # the meta rows' first baseline: below the header's closing rule
 
 #: The notes paragraph's size, restated from the writer's constants so a change
 #: to them has to be made deliberately in two places — the same contract as the
-#: margins above. It is also how the paragraph is *found* in a rendered page: it
-#: is the only text on the page set at this size, which matching on the notes'
-#: own glyph ids cannot do (the shaper's output for a prefix of the note
-#: collides with the title and the section heading).
-NOTES_SIZE = 7.5
-#: The sizes the notes paragraph must not compete with, restated the same way:
-#: the meta rows are body text and the page number is chrome.
-META_SIZE = 9.0
+#: margins above.
+#:
+#: It is *not* what identifies the paragraph: the status chip is set at the same
+#: size, and body text runs to within a point of it. See :func:`_is_notes_span`.
+NOTES_SIZE = 8.5
+#: The other sizes the paragraph is compared against, restated the same way:
+#: chrome (the page number), the chip, and body text.
 FOOTER_SIZE = 8.0
-#: The faint ink the paragraph is painted in, restated so a change to the palette
-#: has to be deliberate here too.
-FAINT_RGB = "0.58 0.6 0.62"
+CHIP_SIZE = 8.5
+META_SIZE = 9.0
+#: The ink the paragraph is painted in, restated so a change to the palette has to
+#: be deliberate here too.
+SOFT_RGB = "0.44 0.46 0.48"
 #: The band's reserved geometry, restated from the writer's constants on the same
 #: contract as the margins above: content may not run below this, so the paragraph
 #: always has its air and its full line pitch. It is deliberately more generous
@@ -71,7 +72,10 @@ FAINT_RGB = "0.58 0.6 0.62"
 #: flush against the notes, which is not what "leave room" means on a printed page.
 CONTENT_BOTTOM = 74.0
 NOTES_AIR = 10.0
-NOTES_PITCH = 9.5
+NOTES_PITCH = 10.5
+#: The paragraph's cap, restated. Used only as the upper bound of the band, never
+#: as an expectation about any one document.
+NOTES_LINES = 4
 
 
 def _band_top(lines: int) -> float:
@@ -674,14 +678,14 @@ def test_the_notes_are_a_footnote_at_the_foot_of_the_last_page() -> None:
     """
     pdf = render_invoice_pdf(described_invoice())
     last = _page_spans(pdf, -1)
-    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    notes = _notes_spans_on(pdf, -1)
     assert notes, "the notes must be drawn on the last page"
 
     highest_note = max(float(span["y"]) for span in notes)
     for span in last:
         # The page number is chrome and belongs at the very foot of the sheet,
         # below the paragraph; everything the customer reconciles must be above it.
-        if float(span["size"]) in (NOTES_SIZE, FOOTER_SIZE):
+        if _is_notes_span(span) or float(span["size"]) == FOOTER_SIZE:
             continue
         assert float(span["y"]) > highest_note, (
             f"span at y={span['y']} sits below the notes, which must come last"
@@ -691,34 +695,51 @@ def test_the_notes_are_a_footnote_at_the_foot_of_the_last_page() -> None:
     assert shaped_gids("ملاحظات") not in page_text(pdf)
 
 
-def test_the_notes_paragraph_is_smaller_and_shadier_than_every_other_text() -> None:
-    """A footnote is set apart by size and ink, not by being in a box.
+def test_the_notes_are_readable_on_a_phone() -> None:
+    """These documents are read on a handset, so the notes are not set too small to read.
 
-    The point of moving to the corner is that the notes stop competing with the
-    figures the invoice exists to state, so at the meta rows' size and ink they
-    would still be read as part of the statement rather than as a footnote.
+    A WhatsApp attachment is scaled to the screen — an A4 page to a phone is
+    about two thirds — which turned the old 7.5pt paragraph into under 5pt of
+    screen. That was legible on paper and effectively absent on the phone the
+    customer is actually holding, and it is how a weighable invoice's figures
+    could be on the page and unreadable on it.
+
+    So the paragraph is set at the chip's size in the **body ink**, never in a
+    fainter one, and never below the chip. What keeps it subordinate is *where* it
+    is and that it is prose beneath the figures — not that it is small and pale.
+
+    Asserted against the page's own text so a later change that quietly shrinks or
+    greys the paragraph fails here rather than shipping.
     """
     pdf = render_invoice_pdf(described_invoice())
     last = _page_spans(pdf, -1)
-    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    notes = _notes_spans_on(pdf, -1)
     assert notes, "the notes must be drawn"
 
-    others = [span for span in last if float(span["size"]) != NOTES_SIZE]
+    assert len({round(float(span["size"]), 2) for span in notes}) == 1, (
+        "the paragraph must be set at one size"
+    )
+    assert float(notes[0]["size"]) >= CHIP_SIZE, (
+        f"the notes are set at {notes[0]['size']}pt, below the status chip: on a phone "
+        "that is under 6pt of screen, which is how they came to be missed"
+    )
+    # Under the body, so the hierarchy survives — but within a point of it.
+    assert float(notes[0]["size"]) <= META_SIZE, "the notes must not outrank the body"
+
+    others = [span for span in last if not _is_notes_span(span)]
     assert others, "the page needs other text for this to mean anything"
     for span in others:
         # Chrome is the smallest thing on any page; nothing else may be.
         assert float(span["size"]) >= FOOTER_SIZE, (
             f"text at {span['size']}pt is smaller than the page's own furniture"
         )
-    assert NOTES_SIZE < META_SIZE, "the notes must be smaller than the meta rows"
 
-    # And shadier: painted in the faint ink, a step up the luma ladder from the
-    # labels, so the hierarchy survives a grayscale photocopy. Counted rather than
-    # merely present, so nothing else can quietly claim the faintest ink on the page.
+    # In the body ink, not a fainter one. Counted rather than merely present, so a
+    # later palette change cannot quietly push it back to grey-on-white.
     ops = _ops(page_streams(pdf)[-1])
-    faint_text = [op for op in ops if FAINT_RGB in op and " Tj" in op]
-    assert len(faint_text) == len(notes), (
-        f"{len(faint_text)} ops use the faint ink but {len(notes)} notes spans were drawn"
+    soft_text = [op for op in ops if SOFT_RGB in op and " Tj" in op]
+    assert len(soft_text) >= len(notes), (
+        f"{len(soft_text)} ops use the body ink but {len(notes)} notes spans were drawn"
     )
 
 
@@ -728,7 +749,7 @@ def test_the_notes_sit_on_the_right_and_do_not_span_the_whole_column() -> None:
     full-width band across the foot of the page."""
     pdf = render_invoice_pdf(described_invoice())
     last = _page_spans(pdf, -1)
-    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    notes = _notes_spans_on(pdf, -1)
     assert notes
     right = max(
         float(span["x"]) + arabic_width(span["gids"], float(span["size"])) for span in notes
@@ -778,7 +799,7 @@ def test_the_notes_keep_the_breaks_the_operator_typed() -> None:
     pdf = render_invoice_pdf(arabic_invoice(description=typed))
     last = _page_spans(pdf, -1)
     notes = sorted(
-        (span for span in last if float(span["size"]) == NOTES_SIZE),
+        (span for span in last if _is_notes_span(span)),
         key=lambda span: -float(span["y"]),  # top line first
     )
     # Four typed lines, four drawn baselines — not one flattened run, and not four
@@ -808,7 +829,7 @@ def test_a_blank_line_between_typed_lines_costs_no_drawn_line() -> None:
     assert len(
         [s for s in _page_spans(render_invoice_pdf(
             arabic_invoice(description="أولا\n\nثانيا\n\nثالثا")), -1)
-         if float(s["size"]) == NOTES_SIZE]
+         if _is_notes_span(s)]
     ) == 3
 
 
@@ -1946,18 +1967,32 @@ def test_the_font_embedding_is_compressed_but_still_the_right_bytes() -> None:
 # --- the notes band: reserved, never overlapped -----------------------------------
 
 
-def _notes_spans(pdf: bytes) -> list[dict[str, str]]:
-    """Every drawn span of the notes paragraph, on whichever page drew it.
+def _is_notes_span(span: dict[str, str]) -> bool:
+    """True if *span* belongs to the notes paragraph.
 
-    Located by size — see :data:`NOTES_SIZE` for why the content cannot be used
-    to identify it.
+    Needs **both** halves, because neither identifies it alone. Size alone
+    collides with the status chip, which is set at the same :data:`NOTES_SIZE`.
+    Content alone collides with everything: a continuation page's table rows run
+    down to the content floor, which is exactly where the paragraph sits. Together
+    they are exact — no other text is set at this size *and* drawn inside the band
+    the paragraph owns, because that band is reserved away from content.
     """
+    return float(span["size"]) == NOTES_SIZE and float(span["y"]) < _band_top(NOTES_LINES)
+
+
+def _notes_spans(pdf: bytes) -> list[dict[str, str]]:
+    """Every drawn span of the notes paragraph, on whichever page drew it."""
     return [
         span
         for page in page_streams(pdf)
         for span in (m.groupdict() for m in SPAN.finditer(page))
-        if float(span["size"]) == NOTES_SIZE
+        if _is_notes_span(span)
     ]
+
+
+def _notes_spans_on(pdf: bytes, page: int) -> list[dict[str, str]]:
+    """The paragraph's spans on one page only — ``-1`` is the last page."""
+    return [span for span in _page_spans(pdf, page) if _is_notes_span(span)]
 
 
 def _rows_drawn_on(pdf: bytes, page: int) -> int:
@@ -2044,7 +2079,7 @@ def test_a_large_last_table_breaks_to_leave_room_for_the_notes() -> None:
             f"{count} items: reserving the band made the document shorter"
         )
         for span in _page_spans(with_notes, -1):
-            if float(span["size"]) == NOTES_SIZE:
+            if _is_notes_span(span):
                 continue
             assert not _overlaps(_span_box(span), band), (
                 f"{count} items: span at y={span['y']} is drawn into the notes band "
@@ -2074,7 +2109,7 @@ def test_a_large_last_table_breaks_to_leave_room_for_the_notes() -> None:
         without = render_invoice_pdf(arabic_invoice(description="", items=_items(count)))
         reserved_low = min(
             (float(span["y"]) for span in _page_spans(with_notes, -1)
-             if float(span["size"]) not in (NOTES_SIZE, FOOTER_SIZE)),
+             if not _is_notes_span(span) and float(span["size"]) != FOOTER_SIZE),
             default=float("inf"),
         )
         plain_low = min(
@@ -2105,7 +2140,7 @@ def test_the_table_continues_onto_the_next_page_and_the_notes_follow_it() -> Non
 
     # On the last page and no other: the paragraph follows the table.
     for page in range(page_count(pdf) - 1):
-        assert not [s for s in _page_spans(pdf, page) if float(s["size"]) == NOTES_SIZE], (
+        assert not _notes_spans_on(pdf, page), (
             f"the paragraph must not be repeated on page {page + 1}"
         )
     # And that last page is a real page of the document, not a fresh one made only

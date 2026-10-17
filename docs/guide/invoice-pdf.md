@@ -71,7 +71,7 @@ Daftra lets a seller write prose in two places, and both reach the page:
 
 | Where | Daftra field | Model field | Drawn as |
 |---|---|---|---|
-| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | a small, faint, unlabelled paragraph at the foot of the **last** page, bottom-right, one line per `<p>` |
+| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | an unlabelled paragraph in the body ink at the foot of the **last** page, bottom-right, one line per `<p>` |
 | one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
 
 They are **wrapped, never fitted**. This is the one thing that separates them from
@@ -97,11 +97,13 @@ line breaks — and drops the rest, so the document never sees `<p>`,
 placeholder. That conversion lives in the mapper because it is the only layer
 that sees the wire format.
 
-The invoice's notes are drawn at the **bottom-right of the last page**, in a
-smaller size and a fainter ink (`_FAINT`, one step up the luma ladder from the
-labels) than anything else on the sheet, and without a label. It reads as a
-footnote the customer turns to rather than as part of the statement — which is
-where an operator's own figures belong on a weighable invoice.
+The invoice's notes are drawn at the **bottom-right of the last page**, in the
+body ink and half a point under the body size. They used to be set at 7.5pt in a
+faint grey: legible on paper, and effectively **absent on a phone** — which is
+where these documents are actually read, since they arrive as a WhatsApp
+attachment scaled to roughly two thirds of an A4 page. So the size and the
+contrast both moved; the paragraph stays subordinate by *position* and by being
+prose beneath the figures, not by being small and pale.
 
 Pinning it to the *last* page is the awkward half. A page's foot is only the last
 page's foot once the document has been laid out, so there is no page to reserve
@@ -129,7 +131,7 @@ page. Overflowing the cap logs a WARNING naming the field — it is a truncation
 and this module's rule is that a truncation may not be silent.
 
 The two are separate fields on purpose: `notes` is about the whole document, so it
-is printed once as a footnote at the foot of the last page, where it annotates
+is printed once at the foot of the last page, where it annotates
 every page without competing with any of them. The line description is about one
 row, so it sits inside that row, under its name, in the secondary ink — at body
 ink a paragraph under every item name would be the loudest thing on the page, and

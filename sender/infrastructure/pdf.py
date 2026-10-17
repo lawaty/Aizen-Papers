@@ -29,12 +29,14 @@ What it emits:
   repeat on every continuation page (the letterhead does not: the logo is page-1
   branding), and the totals block is atomic: it is never split across a page break,
   so the last item row and the four totals always travel together.
-- The invoice's notes are drawn last, as a small, faint, unlabelled paragraph at
-  the **bottom-right of the last page** — a footnote rather than part of the
-  statement. Its space is reserved during layout: if the last page turns out to
-  be too full to hold it, the document is laid out a second time with the band
-  reserved on every page, which pushes the rows that no longer fit onto a fresh
-  last page. See :func:`render_invoice_pdf` for why that needs two passes.
+- The invoice's notes are drawn last, as an unlabelled paragraph at the
+  **bottom-right of the last page**, in the body ink and half a point under the
+  body size: these documents are read on a phone, where a page scaled to a
+  handset rendered the old 7.5pt at under 5pt of screen. Its space is
+  reserved during layout: if the last page turns out to be too full to hold it,
+  the document is laid out a second time with the band reserved on every page,
+  which pushes the rows that no longer fit onto a fresh last page. See
+  :func:`render_invoice_pdf` for why that needs two passes.
 - Every page carries a centred ``صفحة n من m`` footer. Money, quantities and the
   totals are aligned on a shared **decimal axis** rather than right-aligned, so the
   decimal points read as a column the eye can compare down.
@@ -116,12 +118,6 @@ _INK = (0.11, 0.13, 0.15)
 #: Secondary ink: labels, meta values, the footer. Y ≈ 0.46 — half of body ink, so
 #: it reads as a step quieter on paper and still passes as text when photocopied.
 _SOFT = (0.44, 0.46, 0.48)
-#: The faintest ink on the page: the notes paragraph at its foot. Y ≈ 0.60, one
-#: step quieter than :data:`_SOFT`, so it is the last thing a reader's eye lands
-#: on rather than the first. The notes are the seller's own prose and, on a
-#: weighable invoice, a set of figures the customer needs — but they are not what
-#: the document is for, and at body ink they would outrank the balance due.
-_FAINT = (0.58, 0.60, 0.62)
 #: The default rule colour — a quiet hairline. Y ≈ 0.81 — present, not loud. The
 #: header's own closing rule is the accent (see the brand-header block below).
 _HAIRLINE = (0.79, 0.81, 0.83)
@@ -258,8 +254,19 @@ _NOTES_FOOTER_LINES = 4
 #: Smaller than every other text on the page (the meta rows are 9) and a step
 #: quieter than their ink, so the paragraph reads as a footnote the customer
 #: turns to rather than a fourth block they have to reconcile.
-_NOTES_FOOTER_SIZE = 7.5
-_NOTES_FOOTER_PITCH = 9.5
+#: Set a half-point under the body text and in the body ink, because the notes
+#: are read on a phone: these documents arrive as a WhatsApp attachment, where an
+#: A4 page is scaled to roughly two thirds, and the old 7.5pt landed at under 5pt
+#: of screen — legible in print, effectively absent on the handset the customer is
+#: actually holding. A half-point under the body keeps the hierarchy and, usefully,
+#: keeps this size **unique** on the page: the tests find the paragraph by it,
+#: because neither its position nor its content identifies it (see
+#: :func:`_notes_spans` in the tests).
+_NOTES_FOOTER_SIZE = 8.5
+#: Leading for an 8.5pt naskh line. The old 9.5 was tight against 7.5pt; a
+#: calligraphic Arabic line needs more than one em or the descenders and the
+#: joining strokes of the line above crowd it.
+_NOTES_FOOTER_PITCH = 10.5
 #: The air between the last row above and the paragraph's first line.
 _NOTES_FOOTER_AIR = 10.0
 #: Right-anchored and narrower than the text column, so the paragraph sits in the
@@ -976,6 +983,13 @@ def _draw_notes_footer(canvas: _Canvas, lines: list[str]) -> None:
     The space it occupies was already reserved during layout (see
     :func:`render_invoice_pdf`), which is what lets it be drawn straight into the
     last page's op list with no second pass and no overlap.
+
+    Set in :data:`_SOFT` at :data:`_NOTES_FOOTER_SIZE` — the body ink, half a
+    point under the body size — because the reader is holding a phone. A WhatsApp
+    attachment is scaled to the screen, so the old 7.5pt rendered at under 5pt of
+    screen: present on paper, absent in the hand. Subordination comes from where
+    the paragraph is and from the fact that it is prose under the figures, not
+    from making it hard to read.
     """
     if not lines:
         return
@@ -985,7 +999,7 @@ def _draw_notes_footer(canvas: _Canvas, lines: list[str]) -> None:
         # one pitch higher, so the paragraph reads downward into the corner.
         y = _CONTENT_BOTTOM + _NOTES_FOOTER_AIR + (len(lines) - 1 - index) * _NOTES_FOOTER_PITCH
         canvas.move_to(y)
-        canvas.text(_NOTES_FOOTER_BOX, line, "invoice description", _NOTES_FOOTER_SIZE, _FAINT)
+        canvas.text(_NOTES_FOOTER_BOX, line, "invoice description", _NOTES_FOOTER_SIZE, _SOFT)
 
 
 def _header_cells() -> tuple[tuple[Box, str, str], ...]:
