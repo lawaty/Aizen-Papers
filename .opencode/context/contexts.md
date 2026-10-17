@@ -385,8 +385,14 @@ truncated figure is a wrong figure; only item *names* go through `_fit` and get
 `InvoiceItem.description` — are the one deliberate exception: `_wrap` breaks them
 at word boundaries and draws every line, because an ellipsis on a delivery
 instruction or a size deletes the half that made it worth writing and nothing on
-the page says anything was cut. An empty one draws **nothing at all** — no label,
-no `-`, no line of air — since most invoices carry neither.
+the page says anything was cut. For `Invoice.description` specifically, the
+operator's **own line breaks are preserved** (`_LINE_BREAK` splits on the full
+Unicode set — CRLF, lone CR, U+0085, U+2028, U+2029 — before wrapping), because
+a weighable invoice's figures (الوزن القائم, الوزن صافي, سعر الكيلو) are typed
+one per line and collapsing them into a running sentence destroys their meaning.
+A blank line costs neither a drawn line nor one of the four in the cap. An empty
+one draws **nothing at all** — no label, no `-`, no line of air — since most
+invoices carry neither.
 
 **The invoice notes are a footnote at the foot of the *last* page, and reserving
 its room is a two-pass layout.** `Invoice.description` is drawn small, faint

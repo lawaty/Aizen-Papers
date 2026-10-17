@@ -384,6 +384,115 @@ def test_malformed_payloads_are_rejected(mapper):
         mapper.to_invoice({"data": {"Unrelated": {}}})
 
 
+#: The operator's notes as Daftra actually stores them, captured from
+#: ``GET /invoices/82.json`` on the account whose invoices carry them. This is the
+#: payload that made the plain ``notes`` key look permanently empty: ``notes`` is
+#: ``null`` on that same invoice and the text lives here, wrapped in the rich-text
+#: editor's own markup.
+REAL_HTML_NOTES = (
+    '<p>الوزن القائم = 411.8<span style="color: rgb(0, 0, 0); -webkit-tap-highlight-color: '
+    'transparent;">&nbsp;</span><span style="-webkit-tap-highlight-color: transparent;">'
+    'كيلو</span></p><p>الوزن صافي = 397.319<span style="color: rgb(0, 0, 0); '
+    '-webkit-tap-highlight-color: transparent;">&nbsp;</span><span '
+    'style="-webkit-tap-highlight-color: transparent;">كيلو</span></p>'
+    "<p>سعر الكيلو = 188 ج</p><p>الاجمالي = 397.319&nbsp;<span style=\"-webkit-tap-"
+    'highlight-color: transparent;">* 188 =&nbsp;</span><span style="-webkit-tap-'
+    'highlight-color: transparent;"><span style="color: rgb(58, 62, 99); '
+    'background-color: rgb(248, 249, 250);">74,695.94</span>&nbsp;ج</span></p>'
+    '<span class="replace_template_notes"></span>'
+)
+
+
+def test_notes_are_read_from_the_rich_text_field_they_are_actually_written_to():
+    """Daftra stores the operator's notes in ``html_notes``, not ``notes``.
+
+    Measured across all three configured accounts: ``notes`` was empty on all 68
+    invoices while ``html_notes`` was populated on 22. An account whose notes are
+    read from ``notes`` therefore looks exactly like an operator who never types
+    one, and nothing anywhere says otherwise — which is how this went unnoticed.
+    """
+    invoice = DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "82", "no": "14B", "notes": None, "html_notes": REAL_HTML_NOTES}
+    })
+    assert invoice.description
+    assert "الوزن القائم" in invoice.description
+    assert "411.8" in invoice.description
+
+
+def test_notes_come_out_as_one_line_per_block_the_operator_typed():
+    """The ``<p>`` elements are the operator's line breaks, and they survive.
+
+    They enter a weighable invoice's figures one under another, and the PDF draws
+    one line per break — so the four paragraphs must arrive as four lines, not as
+    one run of prose that has to be re-read to tell the figures apart.
+    """
+    invoice = DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "82", "no": "14B", "html_notes": REAL_HTML_NOTES}
+    })
+    lines = invoice.description.split("\n")
+    assert lines == [
+        "الوزن القائم = 411.8 كيلو",
+        "الوزن صافي = 397.319 كيلو",
+        "سعر الكيلو = 188 ج",
+        "الاجمالي = 397.319 * 188 = 74,695.94 ج",
+    ]
+
+
+def test_no_editor_markup_reaches_the_customer_document():
+    """Not a tag, not an entity, and not the editor's placeholder span.
+
+    The value read raw would put ``<p>الوزن صافي = 397.319<span style="color:
+    rgb(0, 0, 0); ...">`` on an invoice. ``replace_template_notes`` is an empty
+    placeholder Daftra appends after the operator's own text, so it contributes
+    nothing visible — but it is skipped explicitly rather than relied upon to be
+    empty.
+    """
+    description = DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "82", "no": "14B", "html_notes": REAL_HTML_NOTES}
+    }).description
+    for junk in ("<p>", "<span", "</p>", "&nbsp;", "style=", "replace_template_notes"):
+        assert junk not in description, f"{junk} reached the document"
+
+
+def test_a_plain_notes_field_still_reads_as_it_did():
+    """The fallbacks are untouched — this is an addition, not a replacement.
+
+    A shape that writes the plain field, or the ``description`` spelling some
+    Daftra versions use, must keep working; and plain text passes through the
+    HTML reader unchanged.
+    """
+    assert DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "1", "no": "1", "notes": "تسليم صباحا", "html_notes": None}
+    }).description == "تسليم صباحا"
+    assert DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "1", "no": "1", "notes": "", "html_notes": "", "description": "من forklø"}
+    }).description == "من forklø"
+
+
+def test_line_breaks_in_a_plain_note_are_kept_too():
+    """The reader does not only understand ``<p>`` — a typed newline is a break.
+
+    An operator who types into a plain-text box across several lines means the
+    same thing as one who presses return in the rich-text editor.
+    """
+    invoice = DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "1", "no": "1", "notes": "أولا\nثانيا\nثالثا"}
+    })
+    assert invoice.description.split("\n") == ["أولا", "ثانيا", "ثالثا"]
+
+
+def test_malformed_notes_markup_never_raises():
+    """A note is never worth retiring an invoice over.
+
+    ``ValueError`` reaching the poller is classified permanent, which would
+    retire a real invoice over the one field the customer asked to be shown. So
+    broken markup degrades to whatever text could be recovered.
+    """
+    assert DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "1", "no": "1", "html_notes": "<p>تسليم <b>صباحا</p>"}
+    }).description
+
+
 def test_offline_stub_payload_matches_the_real_shape(mapper):
     """The stub is only useful as a double if it nests Client/InvoiceItem the
     way Daftra does; a flat stub would hide the nesting bug above."""

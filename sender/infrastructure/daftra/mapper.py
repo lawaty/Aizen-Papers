@@ -4,11 +4,16 @@ import logging
 import re
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
+from html.parser import HTMLParser
 
 from sender.domain.models import Customer, Invoice, InvoiceItem, Payment
 from sender.domain.phones import normalize_phone
 
 log = logging.getLogger(__name__)
+
+#: Runs of whitespace, collapsed in the notes text. Not the PDF's own pattern:
+#: this is a wire-format concern and the PDF layer must stay ignorant of HTML.
+WHITESPACE = re.compile(r"\s+")
 
 STATUS_LABELS = {
     -1: "Draft",
@@ -34,11 +39,17 @@ PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
 #: is session-gated (it redirects to the login page without a browser session),
 #: which is why the sender renders its own copy instead of linking to it.
 PDF_URL_KEYS = ("invoice_pdf_url",)
-#: The free text an invoice carries *about itself* (Daftra calls it notes). Read
-#: before ``description``: ``notes`` is what the documented API writes and what the
-#: live account sends, while ``description`` is the spelling a few Daftra shapes use
-#: for the same field, so both are accepted rather than betting on one.
-NOTES_KEYS = ("notes", "description")
+#: The free text an invoice carries *about itself* (Daftra calls it notes).
+#:
+#: ``html_notes`` is first because it is the one that actually carries anything.
+#: The operator types the notes into Daftra's **rich-text** box, and that editor
+#: writes ``html_notes`` while leaving plain ``notes`` at ``null`` — measured
+#: across all three configured accounts: ``notes`` was empty on all 68 invoices,
+#: ``html_notes`` was populated on 22 of them. Reading ``notes`` first therefore
+#: finds nothing, which looks exactly like an operator who never typed a note.
+#: ``notes`` and ``description`` stay as fallbacks for the shapes that do write
+#: the plain field.
+NOTES_KEYS = ("html_notes", "notes", "description")
 #: The free text a single line carries about itself, under its product name.
 ITEM_DESCRIPTION_KEYS = ("description",)
 #: The phone fields Daftra keeps on a client, in preference order. ``phone1``
@@ -110,6 +121,93 @@ def _is_money_present(value) -> bool:
         return DaftraInvoiceMapper._money(value) != 0
     except ValueError:
         return True
+
+
+class _NotesText(HTMLParser):
+    """Daftra's rich-text notes as the plain lines a document can draw.
+
+    Daftra's notes box is a WYSIWYG editor, so what it stores is HTML: the
+    operator's line breaks become ``<p>`` elements, and every span they
+    highlighted while typing arrives wrapped in an inline ``<span style=...>``
+    carrying the editor's own ``-webkit-tap-highlight-color``. A value read raw
+    would put ``<p>الوزن صافي = 397.319<span style="color: rgb(0, 0, 0); ...">``
+    on a customer's invoice.
+
+    So: block-level tags become **newlines**, because they are the operator's line
+    breaks and the paragraph is drawn one line per break — an operator entering
+    four figures one under another gets four lines, not one run of prose. Every
+    other tag is dropped, which is what removes the inline styling spans, and
+    character references are converted by the parser itself (``&nbsp;`` arrives as
+    a no-break space, which the PDF's whitespace collapse turns into an ordinary
+    one).
+
+    ``replace_template_notes`` is a placeholder Daftra appends after the operator's
+    own text, holding nothing the customer should see; it is skipped rather than
+    drawn, along with anything nested inside it.
+    """
+
+    #: Tags that end a line of the operator's text. ``br`` is a line with no
+    #: content of its own, the rest are block containers that wrap a line each.
+    _LINE_BREAKS = frozenset({"br", "p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"})
+    #: The placeholder class Daftra appends after the operator's notes.
+    _SKIP_CLASS = "replace_template_notes"
+
+    def __init__(self) -> None:
+        # ``convert_charrefs`` defaults on: entities become text rather than
+        # separate parser events, which is what keeps the output plain.
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "span" and self._SKIP_CLASS in dict(attrs).get("class", "").split():
+            self._skip_depth += 1
+        elif not self._skip_depth and tag in self._LINE_BREAKS:
+            self._break()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span" and self._skip_depth:
+            self._skip_depth -= 1
+        elif not self._skip_depth and tag in self._LINE_BREAKS:
+            self._break()
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_depth:
+            self._parts.append(data)
+
+    def _break(self) -> None:
+        # Only a *new* line: consecutive ``<p><p>`` or a closing tag followed by
+        # an opening one must not accumulate blank lines, which would otherwise
+        # read as paragraphs the operator never typed.
+        if self._parts and not self._parts[-1].endswith("\n"):
+            self._parts.append("\n")
+
+    def text(self) -> str:
+        lines = [WHITESPACE.sub(" ", line).strip() for line in "".join(self._parts).split("\n")]
+        return "\n".join(line for line in lines if line)
+
+
+def html_notes_to_text(value) -> str:
+    """*value* as plain text, one line per block element, or ``""``.
+
+    Total by construction: unparseable markup yields whatever text the parser
+    recovered rather than raising, because a note that renders slightly wrong is
+    better than an invoice the poller classifies permanent and retires over the
+    only field the customer asked for.
+    """
+    if value is None:
+        return ""
+    parser = _NotesText()
+    try:
+        parser.feed(str(value))
+        parser.close()
+    except Exception as exc:  # noqa: BLE001 - a note is never worth failing a send over
+        log.warning(
+            "could not read the invoice's HTML notes (%s); drawing them as plain "
+            "text instead of dropping the field", exc,
+        )
+        return WHITESPACE.sub(" ", re.sub(r"<[^>]*>", " ", str(value))).strip()
+    return parser.text()
 
 
 def _row_label(row: dict) -> str:
@@ -188,7 +286,7 @@ class DaftraInvoiceMapper:
             balance = total - paid
 
         # Parse weight/price fields from the notes free-text field.
-        notes_text = self._text(self._first(invoice, NOTES_KEYS))
+        notes_text = html_notes_to_text(self._first(invoice, NOTES_KEYS))
 
         return Invoice(
             id=str(invoice.get("id", "")),

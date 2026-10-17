@@ -71,7 +71,7 @@ Daftra lets a seller write prose in two places, and both reach the page:
 
 | Where | Daftra field | Model field | Drawn as |
 |---|---|---|---|
-| the invoice | `notes` | `Invoice.description` | a small, faint, unlabelled paragraph at the foot of the **last** page, bottom-right |
+| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | a small, faint, unlabelled paragraph at the foot of the **last** page, bottom-right, one line per `<p>` |
 | one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
 
 They are **wrapped, never fitted**. This is the one thing that separates them from
@@ -85,6 +85,17 @@ column (a URL, a long code) is broken by character rather than allowed to run in
 the neighbouring column.
 
 ### The notes paragraph: the foot of the last page
+
+**Daftra's notes arrive as HTML, and the field is `html_notes`.** The operator
+types into a rich-text editor, which writes `html_notes` and leaves plain `notes`
+at `null`. Measured across the three configured accounts: `notes` was empty on
+all 68 invoices, `html_notes` populated on 22. Reading `notes` finds nothing and
+looks exactly like an operator who never typed a note. The mapper
+(`html_notes_to_text`) turns block tags into newlines — they are the operator's
+line breaks — and drops the rest, so the document never sees `<p>`,
+`<span style=...>`, `&nbsp;`, or Daftra's trailing `replace_template_notes`
+placeholder. That conversion lives in the mapper because it is the only layer
+that sees the wire format.
 
 The invoice's notes are drawn at the **bottom-right of the last page**, in a
 smaller size and a fainter ink (`_FAINT`, one step up the luma ladder from the
