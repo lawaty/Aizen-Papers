@@ -394,9 +394,9 @@ A blank line costs neither a drawn line nor one of the four in the cap. An empty
 one draws **nothing at all** — no label, no `-`, no line of air — since most
 invoices carry neither.
 
-**The invoice notes are a footnote at the foot of the *last* page, and reserving
-its room is a two-pass layout.** `Invoice.description` is drawn in the **body ink
-at `_NOTES_FOOTER_SIZE` (8.5pt)** — half a point under the body text — and
+**The invoice notes are a footnote at the foot of the *last* page, drawn in flow
+in a single pass.** `Invoice.description` is drawn in the **body ink at
+`_NOTES_FOOTER_SIZE` (8.5pt)** — half a point under the body text — and
 **unlabelled**, right-anchored and narrower than the text column
 (`_NOTES_FOOTER_*`), so it reads as a footnote rather than a fifth meta row. Its
 subordination comes from **where it sits and from being prose under the figures,
@@ -406,21 +406,31 @@ rather than for the paper. Do not reach for a fainter palette step to quiet it
 down — the luma ladder ends at `_SOFT`. `_NOTES_FOOTER_PITCH` is 10.5 because an
 8.5pt naskh line needs more than one em before the line above crowds it.
 
-Because a page's foot is only the last page's foot *after* layout,
-`render_invoice_pdf` lays the document out once and, **only if the last page is too
-full**, lays it out a second time with the band reserved on every page
-(`_Canvas(bottom=…)`), pushing the overflow rows onto a fresh last page. The guard
-is load-bearing: reserving unconditionally would change pagination for every
-invoice to solve a problem most do not have. The band is deliberately more
-generous than the ink box (air + a full line pitch per line), so a row can never
-sit flush against the notes. The paragraph is **capped at `_NOTES_FOOTER_LINES`
-(4)** because its height is a reservation; overflowing the cap logs a WARNING
+`render_invoice_pdf` is **one pass, one page flow**: heading, items, totals, then
+`_draw_notes` straight after the totals. The notes land on the last page as a
+*property of where they sit* — the totals block is atomic and drawn last, so it is
+always on the last page and so is anything after it; no page index is computed and
+nothing depends on the page count. The gap above the paragraph
+(`_NOTES_FOOTER_AIR`, 67.5pt ≈ five 13pt lines) is measured from wherever the
+content **ended**, not from the page's bottom margin, so it is relative to the
+table by construction and cannot overlap it — there is nothing drawn below it.
+Do not re-anchor it to a fixed floor: that is what made a short invoice's
+paragraph float far below the table.
+
+The tail is **conceded by the table, not reserved against it**. While the items
+are laid out, `render_invoice_pdf` sets `_Canvas.reserve` to the totals block plus
+the notes' air and pitch, so `_Canvas.need` breaks the table *before* the tail
+rather than letting the totals and notes be orphaned below a page break; the
+reserve is cleared before `_draw_totals`. It is withheld rather than drawn as
+content, so it costs nothing on the many invoices whose table stops well short of
+the page foot. The paragraph is **capped at `_NOTES_FOOTER_LINES` (4)** because
+its height is what the reserve accounts for; overflowing the cap logs a WARNING
 naming the field — a truncation may not be silent, the same rule as the ellipsis
-ban above. `_draw_body` exists so the two passes cannot drift. The specs locate
-the paragraph by **size *and* position** (`_is_notes_span`: set at `NOTES_SIZE`
-and drawn inside the band the layout reserved), because that point size is shared
-with the status chip — the reservation is what makes it unambiguous, so new text
-drawn at 8.5pt inside the band would silently break every notes test.
+ban above. The specs locate the paragraph by **size *and* position**
+(`_is_notes_span`: set at `NOTES_SIZE` **and** below `META_Y`), because that point
+size is shared with the status chip — the chip is the only other text at this size
+and lives in the letterhead above `META_Y`, so the pair is exact. New text drawn
+at 8.5pt below the meta block would silently break every notes test.
 
 A **totalled** invoice with no line
 items also warns (`_warn_empty_items`): it is the signature of a row that was
