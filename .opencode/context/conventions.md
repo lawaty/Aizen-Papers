@@ -12,6 +12,12 @@ there rather than restated.
   unions (`int | str`) and modern typing.
 - **Money is `Decimal`, never `float`.**
 - **Models are frozen dataclasses** so payloads cannot be mutated mid-pipeline.
+- **Dataclass field order in `domain/models.py` is load-bearing.** Callers build
+  documents positionally (`InvoiceItem("ورق", Decimal("2"), Decimal("50"), Decimal("100"))`),
+  so a new field goes **last** in the order — inserting it beside a sibling
+  shifts the rest silently and turns a quantity into a description. The fields
+  after `name` are all optional-with-default, so this is easy to get wrong and
+  nothing fails until a customer's PDF carries the wrong figure.
 - **A document carries `customer_phones: tuple[str, ...]`, never a single
   phone.** Daftra keeps two phone fields on a client and either may be filled, so
   the tuple's order is the Daftra field preference (`phone2`, `phone1`, `mobile`,
@@ -75,6 +81,11 @@ there rather than restated.
   `application/`.
 - Attachment mode (`upload` / `link` / `none`) is a **domain port**
   (`InvoiceAttachmentProvider`), not a CLI flag threaded through the layers.
+- **A capability only some adapters have is probed, not ported.** The poller reads
+  a source's `last_listing_total` (the Daftra payment listing's own row count) with
+  `getattr` and treats `None` as "no opinion", so the offline stubs and test doubles
+  are not forced to implement a method that means nothing to them. Do not add such
+  a method to the `Protocol`.
 
 ## Testing
 
@@ -95,7 +106,8 @@ there rather than restated.
   usual false failure. The default lives on `DocumentPoller`, so `PaymentPoller`
   inherits it identically.
 - Each pipeline's behaviour is pinned by a parallel set of test modules —
-  `test_poller.py`/`test_payment_poller.py`, `test_reporting.py`/`test_payment_reporting.py`,
+  `test_poller.py`/`test_payment_poller.py`,
+  `test_reporting.py`/`test_payment_reporting.py`/`test_customer_reporting.py`,
   `test_daftra_payment_mapper.py` for the payments wire mapping, and
   `test_payment_payload_contract.py` / `test_payment_freeform_fallback.py` for
   what Meta would actually receive. **A change to one pipeline should be checked

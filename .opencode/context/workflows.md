@@ -14,7 +14,8 @@ gives the trace order and the traps.
 2. `DaftraInvoiceMapper.to_invoice` → normalized `Invoice`.
 3. Builder resolves the attachment port — on the legacy builder in `upload` mode
    this **renders a PDF and uploads it to Meta even for `preview`/`--dry-run`**,
-   because the payload must carry a real `media_id`.
+   because the payload must carry a real `media_id`. It happens **once per
+   recipient** now that a document fans out — see § 4.
 4. `WhatsAppClient.send` → `POST /{phone_number_id}/messages` → `wamid`.
 
 `--dry-run` stops before step 4. `show` / `list` never build a message and never
@@ -74,17 +75,24 @@ prunes daily logs older than 30 days, so there is no second cron entry to
 maintain. `$PYTHON` must name a 3.10+ interpreter — the wrapper's `python3`
 default does not work on the production host (see `decisions.md`).
 
-**`python -m sender poll-payments` is this same trace**, through `cli._run_poll_payments`
-and the shared `cli._run_poll_common` (signal handling, the whole-run lock, the
-summary, and the post-lock report refresh are one implementation for both, so the
-two cannot drift). Three things differ and only three: the state path and its
-lock, the send-cap knob (`POLL_PAYMENTS_MAX_SENDS_PER_RUN`), and the extra
-Daftra hop — a payment row names no payer, so `DaftraClient.get_payment` reads
-the linked invoice too, inside the adapter, only for payments about to be sent.
-Everything in steps 1–5 above, including seeding, backoff, the deferred-by-cap
-rule and the free-form fallback, is inherited. There is a **second cron entry**
-setting `POLL_SUBCOMMAND=poll-payments`; the wrapper, the log format and the
-lock discipline are shared, the state and the budget are not. See
+**`poll-payments` and `poll-customers` are this same trace**, through
+`cli._run_poll_payments` / `cli._run_poll_customers` and the shared
+`cli._run_poll_common` (signal handling, the whole-run lock, the summary, and the
+post-lock report refresh are one implementation for all three, so they cannot
+drift). Each sibling differs in three ways only: the state path and its lock, the
+send-cap knob (`POLL_PAYMENTS_MAX_SENDS_PER_RUN` /
+`POLL_CUSTOMERS_MAX_SENDS_PER_RUN`), and one Daftra-specific requirement — a
+`ClientPayment` row carries the payer's phone inline but never a business name,
+so `DaftraClient.get_payment` reads the **payer** too, inside the adapter, only
+for payments about to be sent (a row with no `client_id` costs one request
+instead of two), while a client row needs no second request but its listing is
+**only** newest-first under
+`sort=created&direction=desc` (`contexts.md` § 7), without which the cycle stops
+at the first seen record and silently stops announcing anyone. Everything in steps
+1–5 above, including seeding, backoff, the deferred-by-cap rule and the free-form
+fallback, is inherited. There is a **cron entry per pipeline**
+(`POLL_SUBCOMMAND=poll-payments`, `poll-customers`); the wrapper, the log format
+and the lock discipline are shared, the state and the budget are not. See
 [`contexts.md`](contexts.md) § 3.
 
 **Traps:** the project-dir `cd` is load-bearing. A second concurrent poller
@@ -125,6 +133,12 @@ degrades to a header-less send — **the poller must never die on an attachment*
 Verify a render without sending: `docs/guide/invoice-pdf.md` § *Checking a PDF by
 hand*.
 
+**Trap:** the attachment is resolved *inside* `builder.build(doc, recipient)`, and
+the poller builds once per recipient — so a two-number invoice **renders and
+uploads the same PDF twice** in `upload` mode, and the poller's request budget
+counts only Meta sends, not uploads. There is no cross-recipient PDF cache.
+Do not assume one render per document.
+
 ---
 
 ## 5. Vendored-dependency bootstrap (deployment, not development)
@@ -155,7 +169,7 @@ dated pages only, never the index. Every pipeline records into
 
 The **JSONL is the record; the HTML is derived.** A renderer bug is therefore
 fixable by re-running `python -m sender report` (with `--date` for one day, or
-`--stub` for the offline directory) without losing history, and a failed
+`--stub-dir` for the offline directory) without losing history, and a failed
 regeneration cannot destroy yesterday's page.
 
 Dates are bucketed by **host-local** time, not UTC, matching how the poll summary

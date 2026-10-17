@@ -30,6 +30,13 @@ collapses to a single recipient. The `132000` alternate-builder retry
 so the second attempt cannot re-message a number the first one reached; read
 `delivered_recipients` in an `except` branch for the same reason.
 
+**`poll-status` picks its pipeline with `--payments` / `--customers`, or with
+`--all`.** `--all` is purely additive and prints all three under a heading naming
+the file each was read from; it **refuses** to be combined with a pipeline or stub
+flag rather than silently disambiguating, and a pipeline with no state file yet
+says so explicitly instead of being omitted — so "never run" is never misread as
+"nothing to report".
+
 **Must not change silently:** adding an adapter import here is expected; adding a
 *business* rule here is not. `cli.py` is already 1,454 lines — the largest file in
 the repo — so new command logic belongs in `application/`, new parsing stays here.
@@ -136,6 +143,21 @@ are backpressure (retry); `131047`/`131048`/`131049` are quality signals treated
 as permanent, because retrying them feeds the behaviour Meta is penalising. They
 arrive as HTTP 400, so status alone misreads them.
 
+**A source that goes quiet is a tripwire; a genuinely quiet cycle is not.**
+`_warn_if_source_went_quiet`, called from `_poll_app` right after the listing,
+guards **all three** pipelines. It reports two things: an empty listing for a
+tenant that has already handled documents, and the source's own count falling
+below that — the only way to see a *narrowing*, since a page of already-seen rows
+looks identical however many sit behind it. A quiet cycle logs nothing, on
+purpose: that is the steady state, and a warning every cycle is indistinguishable
+from no warning. The narrowing threshold is deliberately **material**, not exact
+(`>= max(2, handled // 20)`), because Daftra's `total_results` disagrees with
+itself by ±1 with `limit` (126 at `limit=500`, 125 at `limit=10` on one tenant);
+do not tighten it back to `total < handled`. The count reaches the engine as
+`last_listing_total` read with `getattr` (`conventions.md` § Ports and adapters).
+Authority: [`docs/guide/payments.md`](../../docs/guide/payments.md) § *The
+quiet-listing tripwire* (whose threshold wording lags the code — `decisions.md`).
+
 ---
 
 ## 3. Payments pipeline — the invoice pipeline's twin
@@ -153,7 +175,7 @@ with `payment` where `invoice` appears". Rationale: `docs/design.md` § 11.
   `InvoicePoller` to see exactly what a pipeline owes.
 - `domain/templates.py` — `PaymentTemplateBuilder`: 4 positional parameters,
   `ar_EG`, **no header component**.
-- `infrastructure/daftra/client.py` — `DaftraClient.get_payment`, the two-call join; the wire shape lives in `DaftraPaymentMapper` (§ 7).
+- `infrastructure/daftra/client.py` — `DaftraClient.get_payment`, the two-call join to the **payer** (§ 7); the wire shape lives in `DaftraPaymentMapper`.
 - `tests/test_payment_poller.py` — the behavioural spec; `test_payment_payload_contract.py`
   pins the template parameter order the way `test_daftra_payment_mapper.py` pins the wire mapping.
 
@@ -169,16 +191,37 @@ takes **no** `--builder` and **no** `--attachment`. The one-shot commands
 
 **Must not change:** the four body parameters' **order** and formatting — a
 mismatch fails nowhere in this repo, only as a `132000`-series rejection for a
-real customer (§ 5). Each new payment costs **two** Daftra requests, because a
-payment row names no payer; that join is done in the adapter so `application`
-never learns Daftra's join order. `POLL_PAYMENTS_STATUS` is applied
+real customer (§ 5). Each new payment costs **two** Daftra requests — the payment,
+then its **payer** (`/clients/{client_id}.json`) — because a `ClientPayment` row
+carries the phone inline but never a business name; that join is done in the
+adapter so `application` never learns Daftra's join order, and a row with no
+`client_id` costs only the first request. A failure reading the payer is
+classified like any other fetch failure, so a transient one is retried with
+backoff and a 404 leaves the payment abandoned once and visible in
+`poll-status --payments`, re-drivable with
+`poll-reset --payments --payment-id`. `POLL_PAYMENTS_STATUS` is applied
 **server-side**, so a listing page is never spent on payments that will not be
-announced. A payment whose linked invoice 404s (deleted) is abandoned once and
-stays visible in `poll-status --payments`, re-drivable with
-`poll-reset --payments --payment-id`.
+announced.
 
-**The two pipelines never coordinate.** Payment ids and invoice ids **overlap in
-the same account**, so a shared "seen" set would let one retire the other.
+**It announces *client* payments — money into an account, not a bill settled.**
+`list_payments` reads `/client_payments.json`, which is a different Daftra
+resource from `/invoice_payments.json` with a **disjoint id space** (109 rows
+against 125 on the live tenant, no id in both), so this is a swap of what is
+announced, not an addition. The template decides which is right:
+`aizen_new_payment` says a payment was recorded على حسابكم and that the **account
+balance** was updated — it never mentions an invoice. `Payment.invoice_id` is
+therefore always `None` and stays on the model only because `show-payment` prints
+it; do not read it as a live join, and do not delete it either. Authority:
+[`docs/guide/payments.md`](../../docs/guide/payments.md) § *What a "new payment"
+is* and [`docs/layers/infrastructure.md`](../../docs/layers/infrastructure.md) §
+*Payment resources*.
+
+**No two pipelines coordinate.** Client, payment and invoice ids **all overlap in
+the same account** (each space runs from 1), so a shared "seen" set would let one
+retire the other — the disjointness above is only between Daftra's *two payment
+resources*, not between payments and invoices. That is also why `poll-status` /
+`poll-reset` name the pipeline with an explicit `--payments` / `--customers` flag
+instead of inferring a state file.
 
 ---
 
@@ -195,6 +238,7 @@ is a rendering of it.
 - `domain/ports.py` — the `SendOutcomeRecorder` protocol the poller is written against.
 - `presentation/cli.py` — `_run_report`, `_report_recorder`, `_refresh_report_pages`.
 - `tests/test_reporting.py` — the masking spec (`obfuscate_phone`), the `.htaccess` merge contract, and the recipients-page contract (masking on/off, hostile names, the JS status filter).
+- `tests/test_customer_reporting.py` — the multi-kind contract: kind badges, the neutral per-day titles, and the index's *By category* table.
 
 **Boundaries:** written *after* the run, outside the poll-state lock. The recorder
 is a **separate port from `PollStateStore`** — different retention, different
@@ -223,6 +267,18 @@ from the kinds actually on that day. Do not "restore" invoice wording on screen 
 a day holding one payment and two invoices would then mislabel two of its three
 rows. `kind` **defaults to invoice** on read, so JSONL written before the payments
 pipeline existed still loads and labels correctly — do not make it required.
+
+**The index lists every kind, always — absence is not evidence.** `render_index`
+takes a **third** argument, `kind_counts`: an all-history `(sent, failed)` tally per
+kind. `ReportStore.render()` builds it by walking `available_dates()`, deliberately
+**not** the `days` it was handed — the poll path calls
+`render(recorder.dates_written)`, so tallying that subset would understate the
+totals. Do not derive the category counts from the same subset as the per-date
+`counts`, and do not drop a kind that has no rows: `_KIND_ORDER` renders invoice,
+payment and customer with explicit zeros plus a Total row, because a missing
+category is indistinguishable on the page from a pipeline that was never
+deployed. Cost of that choice: one render pass reads the whole retained log
+twice (this tally, then `_all_entries()` for `recipients.html`).
 
 **`recipients.html` is a third generated page**, written by the same
 `ReportStore.render()` call as `index.html`. It answers "what did we send *this
@@ -320,12 +376,23 @@ regenerate it casually. Undrawable characters are dropped with a WARNING naming
 the field — Arabic itself must never warn. **Numeric fields overflow rather than
 ellipsise**: an over-wide amount *or quantity* is drawn in full, because a
 truncated figure is a wrong figure; only item *names* go through `_fit` and get
-`...`. A **totalled** invoice with no line
+`...`. The two **free-text** fields — `Invoice.description` (Daftra's `notes`) and
+`InvoiceItem.description` — are the one deliberate exception: `_wrap` breaks them
+at word boundaries and draws every line, because an ellipsis on a delivery
+instruction or a size deletes the half that made it worth writing and nothing on
+the page says anything was cut. An empty one draws **nothing at all** — no label,
+no `-`, no line of air — since most invoices carry neither. A **totalled**
+invoice with no line
 items also warns (`_warn_empty_items`): it is the signature of a row that was
 never re-fetched from the detail endpoint (§ 7), and the rendered table would
 otherwise tell a customer their invoice has no products. The check requires a
 non-zero total on purpose — an invoice with nothing to charge for is a legitimate
-empty state and must stay quiet. Correctness is pinned by `tests/test_pdf.py`,
+empty state and must stay quiet. A PDF **paints in operator order**, so an opaque
+fill drawn after text erases it with nothing in the file to say the words are gone:
+the zebra band is painted before its row's text and grows *downward* from that
+row's baseline, never upward past it — a band anchored above reaches back over the
+multi-line row above and paints out its description. Correctness is pinned by
+`tests/test_pdf.py`,
 `test_arabic.py`, `test_truetype.py`, `test_logo.py` (compare glyph ids, not
 rendered pixels).
 
@@ -353,9 +420,54 @@ rules inward. The internal model holds only what outbound notifications need.
 money parsing, Daftra's several date spellings, "prefer business name else
 first+last", phone normalization — because a second copy is a second place to get
 a customer's amount or number wrong. Only the envelope differs: Daftra wraps the
-three resources three ways (`data: [{Invoice:…}]`, `data: {InvoicePayment:…}`,
+three resources three ways (`data: [{Invoice:…}]`, `data: {ClientPayment:…}`,
 `data: [{Client:…}]`), and each `_*_node` accepts all of them plus a flat record,
 so a fixture's nesting can never break the mapper. A fourth mapper should subclass too.
+
+**Daftra spells one field several ways, and `*_KEYS` tuples encode that.**
+`PUBLIC_URL_KEYS`, `PDF_URL_KEYS`, `NOTES_KEYS`, `ITEM_DESCRIPTION_KEYS` and the
+phone keys are all read through `_first`, which **skips `None`/`""`/`[]`** — so
+tuple order *is* precedence, and a field Daftra sends empty falls through to the
+next spelling. That is what makes `NOTES_KEYS = ("notes", "description")` work:
+Daftra sends `notes: ""` on most invoices, and a stop-at-first-match read would
+never reach the alternate spelling. Free-text fields map to `""` when absent and
+warn about nothing — `_text` deliberately has **no default**, unlike every other
+reader in the class, because a note Daftra did not send has no honest substitute.
+
+**Daftra's listing order is not a detail, and only one endpoint has to be told.**
+`GET /clients.json` answers newest-first **only** under
+`sort=created&direction=desc`; `sort=created` alone is *oldest* first, `order=desc`
+is ignored, and the parameterless default is a stable but arbitrary permutation
+(observed live). Since the engine walks pages forward and stops at the first seen
+record (§ 2), dropping or misspelling either param stops the welcome pipeline
+early and silently — no error, just a pipeline that quietly stops working. Pinned by
+a test; authority [`docs/guide/customers.md`](../../docs/guide/customers.md) § 5.
+
+**The payments endpoint is `/client_payments.json`, and `include_client_credit`
+is deliberately absent from it.** Do not "fix" the listing by re-adding that flag.
+The flag existed only because `/invoice_payments.json` **hides `client_credit`
+rows** unless asked — 124 of 125 on one tenant, which made that endpoint report
+`listed 1, new 0` forever. The pipeline no longer reads that resource (§ 3), the
+new one hides nothing (all 109 rows live, across `cash`/`bank`/
+`manual_payment_19`), and carrying a workaround for a bug in a resource you do
+not read is cargo cult that the next reader will assume is load-bearing. Absence
+is pinned by `tests/test_daftra_payment_mapper.py` alongside the endpoint name.
+Likewise `_needs_detail` is unconditionally `True` in `PaymentPoller`: the
+listing row usually *has* a phone, but never a business name, so a
+phone-conditional fetch would trade a reachable customer for an unnamed one.
+
+**A payment's payer fields resolve per source, not by merge.** In
+`DaftraPaymentMapper.to_payment`, the read `Client` record wins **outright,
+including its empty fields** (`source = client if client else node`), so a phone
+the operator has since cleared does not survive onto the receipt; the payment row
+is the fallback for the one case that matters — the client could not be read, and
+the number Daftra wrote on the payment itself is better than skipping a
+receivable someone has already paid. That is why the mapper keeps the row's own
+`phone1`/`phone2` instead of discarding them. Authority:
+[`docs/guide/payments.md`](../../docs/guide/payments.md) § *It is not the
+invoice-payments endpoint*, and
+[`docs/layers/infrastructure.md`](../../docs/layers/infrastructure.md) § *Payment
+resources*.
 
 **One unnormalizable listing row is skipped, warned, and left unseen.**
 `to_invoices` / `to_payments` / `to_customers` each catch `ValueError` per row and

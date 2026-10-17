@@ -287,5 +287,16 @@ These contradict current production state; source and `HANDOFF-deploy.md` win.
   (`_warn_unmapped_money`, the absent-item and unparseable-date warnings, the
   exponent guard) are undocumented there. Read the mapper source and
   `contexts.md` § 7, not that section. See § 10.
+- `docs/layers/presentation.md`'s command table gives `poll-status` only `--stub`.
+  It also takes `--payments`, `--customers` and the newer `--all`, which reports
+  all three pipelines in one run and refuses to be combined with a pipeline or
+  stub flag.
 - The `POLL_MAX_SENDS_PER_RUN` and `REPORT_*` knobs are now in `.env.example`
   but still absent from `docs/guide/getting-started.md` § *Configure*.
+- `docs/guide/payments.md` § *The quiet-listing tripwire* still describes the
+  narrowing check as firing when "the source's own count is below the number
+  already handled". The code requires a **material** shortfall
+  (`>= max(2, handled // 20)`), because Daftra's `pagination.total_results`
+  disagrees with itself by ±1 depending on `limit` (126 at `limit=500`, 125 at
+  `limit=10` for the same tenant, filter and rows). `poller._warn_if_source_went_quiet`
+  is authoritative.

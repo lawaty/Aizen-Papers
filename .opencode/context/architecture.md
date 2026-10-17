@@ -17,10 +17,13 @@ A single Python package, `sender/`, run as a CLI (`python -m sender …`). It po
 Daftra ERP for **new invoices**, renders each to a PDF, and sends it to the
 customer via the Meta WhatsApp Cloud API. A **second, parallel pipeline**
 (`poll-payments`) confirms newly recorded **payments** under a second template,
-with no PDF. Two external systems, standard library plus two runtime deps
-(`requests`, `python-dotenv`). Pipeline rationale:
-[`docs/design.md`](../../docs/design.md) § 11; runbook:
-[`docs/guide/payments.md`](../../docs/guide/payments.md).
+with no PDF, and a third (`poll-customers`) welcomes newly created **customers** —
+same engine, no PDF, one state file and send cap each (subsystems:
+[`contexts.md`](contexts.md) §§ 2–3). Two external systems, standard library plus
+two runtime deps (`requests`, `python-dotenv`). Pipeline rationale:
+[`docs/design.md`](../../docs/design.md) § 11; runbooks:
+[`docs/guide/payments.md`](../../docs/guide/payments.md),
+[`docs/guide/customers.md`](../../docs/guide/customers.md).
 
 ## Layers and the dependency rule
 
@@ -77,7 +80,7 @@ See `conventions.md`.
 ## Deployment reality
 
 The app is deployed to a shared host (cPanel/FileZilla, no `pip`, no shell) and
-driven by **two** user crontab entries every 5 minutes — one per pipeline — that
+driven by **one user crontab entry per pipeline** — three, every 5 minutes — that
 call the same committed wrapper `tools/run_poll.sh` with `POLL_SUBCOMMAND`. The
 deployment path is *not* a CI/CD pipeline and *not* documented in `docs/`; host
 access, the interpreter, and the workflow are captured in
