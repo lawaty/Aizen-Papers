@@ -395,10 +395,18 @@ one draws **nothing at all** — no label, no `-`, no line of air — since most
 invoices carry neither.
 
 **The invoice notes are a footnote at the foot of the *last* page, and reserving
-its room is a two-pass layout.** `Invoice.description` is drawn small, faint
-(`_FAINT`, one step below `_SOFT`) and **unlabelled**, right-anchored and narrower
-than the text column (`_NOTES_FOOTER_*`), so it reads as a footnote rather than a
-fifth meta row. Because a page's foot is only the last page's foot *after* layout,
+its room is a two-pass layout.** `Invoice.description` is drawn in the **body ink
+at `_NOTES_FOOTER_SIZE` (8.5pt)** — half a point under the body text — and
+**unlabelled**, right-anchored and narrower than the text column
+(`_NOTES_FOOTER_*`), so it reads as a footnote rather than a fifth meta row. Its
+subordination comes from **where it sits and from being prose under the figures,
+not from being pale**: the reader is holding a phone, and a WhatsApp attachment
+scales an A4 page to roughly two thirds, so the paragraph is sized for the screen
+rather than for the paper. Do not reach for a fainter palette step to quiet it
+down — the luma ladder ends at `_SOFT`. `_NOTES_FOOTER_PITCH` is 10.5 because an
+8.5pt naskh line needs more than one em before the line above crowds it.
+
+Because a page's foot is only the last page's foot *after* layout,
 `render_invoice_pdf` lays the document out once and, **only if the last page is too
 full**, lays it out a second time with the band reserved on every page
 (`_Canvas(bottom=…)`), pushing the overflow rows onto a fresh last page. The guard
@@ -408,8 +416,13 @@ generous than the ink box (air + a full line pitch per line), so a row can never
 sit flush against the notes. The paragraph is **capped at `_NOTES_FOOTER_LINES`
 (4)** because its height is a reservation; overflowing the cap logs a WARNING
 naming the field — a truncation may not be silent, the same rule as the ellipsis
-ban above. `_draw_body` exists so the two passes cannot drift. A **totalled**
-invoice with no line
+ban above. `_draw_body` exists so the two passes cannot drift. The specs locate
+the paragraph by **size *and* position** (`_is_notes_span`: set at `NOTES_SIZE`
+and drawn inside the band the layout reserved), because that point size is shared
+with the status chip — the reservation is what makes it unambiguous, so new text
+drawn at 8.5pt inside the band would silently break every notes test.
+
+A **totalled** invoice with no line
 items also warns (`_warn_empty_items`): it is the signature of a row that was
 never re-fetched from the detail endpoint (§ 7), and the rendered table would
 otherwise tell a customer their invoice has no products. The check requires a
