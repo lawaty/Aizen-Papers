@@ -629,3 +629,120 @@ def test_to_invoices_skips_a_bad_row_without_losing_the_rest(caplog):
     assert [invoice.id for invoice in invoices] == ["1", "3"]
     assert any("could not be normalized" in record.message for record in caplog.records)
     assert any("invoice 000002" in record.message for record in caplog.records)
+
+
+# --- weights and price-per-kg ----------------------------------------------------
+
+
+NOTES_WITH_WEIGHTS = (
+    "الوزن القائم: ١٢٠ كجم\n"
+    "الوزن صافي: ١١٠ كجم\n"
+    "سعر الكيلو: ٥٠ ج.م"
+)
+
+
+def _weight_invoice(notes: str, items=None):
+    payload = {
+        "Invoice": {
+            "id": "1",
+            "no": "000001",
+            "summary_total": 5500,
+            "summary_subtotal": 5500,
+            "notes": notes,
+        }
+    }
+    if items is not None:
+        payload["Invoice"]["InvoiceItem"] = items
+    return DaftraInvoiceMapper().to_invoice(payload)
+
+
+def test_gross_weight_is_parsed_out_of_the_notes_field():
+    """Daftra has no gross-weight column, so the operator writes it in the notes.
+
+    The value reaches the model rather than being left as prose: it is drawn as a
+    figure on the customer's document, and a figure has to be a number.
+    """
+    invoice = _weight_invoice(NOTES_WITH_WEIGHTS)
+    assert invoice.gross_weight == Decimal("120")
+
+
+def test_net_weight_is_the_sum_of_item_quantities():
+    """Net weight is derived, never typed: Σ quantity, in kilograms."""
+    invoice = _weight_invoice(
+        NOTES_WITH_WEIGHTS,
+        items=[
+            {"item": "ورق", "quantity": "60", "unit_price": "50", "subtotal": 3000},
+            {"item": "كرتون", "quantity": "50", "unit_price": "50", "subtotal": 2500},
+        ],
+    )
+    assert invoice.net_weight == Decimal("110")
+
+
+def test_price_per_kg_is_the_first_items_unit_price():
+    invoice = _weight_invoice(
+        NOTES_WITH_WEIGHTS,
+        items=[
+            {"item": "ورق", "quantity": "60", "unit_price": "50", "subtotal": 3000},
+            {"item": "كرتون", "quantity": "50", "unit_price": "50", "subtotal": 2500},
+        ],
+    )
+    assert invoice.price_per_kg == Decimal("50")
+
+
+def test_weights_are_absent_rather_than_invented_when_nothing_says_them():
+    """No notes, no items: three ``None``s, not three confident zeroes.
+
+    A weight of 0.00 on a customer-facing document is a claim — that the goods
+    weigh nothing. ``None`` renders as ``-``, which claims nothing.
+    """
+    invoice = _weight_invoice("")
+    assert invoice.gross_weight is None
+    assert invoice.net_weight is None
+    assert invoice.price_per_kg is None
+
+
+def test_weight_notes_do_not_break_the_description_they_came_from():
+    """The notes are still the operator's prose.
+
+    The weight lines are read *out of* the notes, not removed from them: the PDF
+    still prints the whole note, because the operator wrote them there on purpose
+    and half a delivery instruction is worse than none.
+    """
+    notes = "التسليم صباحاً\n" + NOTES_WITH_WEIGHTS
+    invoice = _weight_invoice(notes)
+    assert invoice.description == notes
+    assert invoice.gross_weight == Decimal("120")
+
+
+def test_a_weight_line_with_no_number_is_skipped_not_guessed():
+    """A recognised label with nothing after it leaves the field ``None``.
+
+    Free text is prose; an operator who wrote the label without the figure has not
+    stated a weight, and inventing one would put a wrong number on an invoice.
+    """
+    invoice = _weight_invoice("الوزن القائم:\nالوزن صافي: 110")
+    assert invoice.gross_weight is None
+    assert invoice.net_weight is None  # derived: no items, so still None
+
+
+def test_western_digits_in_the_notes_parse_too():
+    """The operator may type 120 rather than ١٢٠; both are the same figure."""
+    invoice = _weight_invoice("الوزن القائم: 120 كجم")
+    assert invoice.gross_weight == Decimal("120")
+
+
+def test_a_fractional_weight_keeps_its_decimals():
+    invoice = _weight_invoice("الوزن القائم: ١٢٠٫٥٠")
+    assert invoice.gross_weight == Decimal("120.5")
+
+
+def test_a_comma_decimal_weight_is_not_read_as_thousands():
+    """``120,50`` is 120.5, not 12050 — the separator's meaning depends on what follows.
+
+    A stripped comma would silently multiply a weight by a thousand, and a weight
+    feeds the payable total, so the same rule that settles this for every other
+    amount in the mapper settles it here too.
+    """
+    assert _weight_invoice("الوزن القائم: 120,50").gross_weight == Decimal("120.5")
+    # A thousands separator is still a thousands separator, not a decimal point.
+    assert _weight_invoice("الوزن القائم: 1,250").gross_weight == Decimal("1250")

@@ -67,6 +67,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+import unicodedata
 import zlib
 from datetime import date
 from decimal import Decimal
@@ -271,6 +272,10 @@ _BALANCE_AIR = 6.0  # the last ordinary total to the balance line
 _TOTALS_BLOCK = (
     _TOTALS_AIR + _TOTALS_HEAD_GAP + 3 * _TOTALS_PITCH + _BALANCE_AIR + _BALANCE_SIZE
 )
+#: The weighable-goods block, reserved as one piece like the totals above it: the
+#: rule, three ordinary rows and the emphasised total. Splitting it would strand
+#: الاجمالي alone under a rule that belongs to the rows above it.
+_WEIGHT_BLOCK = _TOTALS_AIR + _TOTALS_HEAD_GAP + 4 * _TOTALS_PITCH + _BALANCE_SIZE
 #: Footers sit at 60, so content stops at :data:`_BOTTOM_Y + 18` = 74 and keeps at
 #: least 6pt of air above its own page number.
 _FOOTER_Y = 60
@@ -1105,6 +1110,60 @@ def _draw_footers(canvas: _Canvas) -> None:
         canvas.text(((_PAGE_WIDTH - width) / 2, width, "left"), text, "footer", _FOOTER_SIZE, _SOFT)
 
 
+def _draw_weight_block(canvas: _Canvas, invoice: Invoice) -> None:
+    """The weighable goods, in Arabic, in the page's right-hand column.
+
+    Four rows, each a label and a value: الوزن القائم (gross), الوزن صافي
+    (net), سعر الكيلو (price/kg), and الاجمالي — the product of the two middle
+    figures, computed here rather than typed, so the three can never disagree.
+
+    Drawn immediately after the totals block, which is what puts it on the **last**
+    page as a property of the layout rather than a special case: the totals block
+    is atomic and drawn last, so it is always on the last page, and so is
+    everything below it. One reservation for the whole block, for the same reason
+    the totals has one — four rows split across a page break would put
+    الاجمالي alone under a rule that belongs to the rows above it.
+
+    The middle two rows are what a weighable invoice is *for*, so they are the
+    figures the block leads with; الاجمالي closes it in the accent colour and a
+    size up, the same treatment المتبقي gets in the totals block above.
+
+    A value the source never stated draws as ``-``, not ``0.00``: a zero here
+    would assert that the goods weigh nothing, which is a far stronger claim than
+    "this was not filled in".
+    """
+    net = invoice.net_weight
+    price = invoice.price_per_kg
+    total = net * price if net is not None and price is not None else None
+
+    # One reservation for the whole block: the rule, the three ordinary rows and
+    # the emphasised total, so it is never split by the page break.
+    canvas.need(_WEIGHT_BLOCK)
+    canvas.gap(_TOTALS_AIR)
+    canvas.rule(colour=_INK, weight=0.75)
+    canvas.gap(_TOTALS_HEAD_GAP)
+    for label, value, field, size, colour in (
+        ("الوزن القائم", invoice.gross_weight, "gross weight", _TOTALS_SIZE, _INK),
+        ("الوزن صافي", net, "net weight", _TOTALS_SIZE, _INK),
+        ("سعر الكيلو", price, "price per kg", _TOTALS_SIZE, _INK),
+        ("الاجمالي", total, "weight total", _BALANCE_SIZE, _ACCENT),
+    ):
+        canvas.need(_TOTALS_PITCH)
+        canvas.text(_LABEL, label, f"{field} label", size, _SOFT)
+        # No currency suffix, for the same reason the totals block has none: the
+        # meta row has already established it, and a bare figure is the only way
+        # four amounts share one decimal axis.
+        _draw_figure(
+            canvas,
+            _VALUE,
+            _PLACEHOLDER if value is None else _money(value),
+            size,
+            colour,
+            _TOTALS_SIZE,
+        )
+        canvas.gap(_TOTALS_PITCH)
+
+
 def render_invoice_pdf(invoice: Invoice) -> bytes:
     """Render *invoice* as a single-or-more page PDF document.
 
@@ -1119,6 +1178,7 @@ def render_invoice_pdf(invoice: Invoice) -> bytes:
     _draw_heading(canvas, invoice, currency)
     _draw_items(canvas, invoice)
     _draw_totals(canvas, invoice)
+    _draw_weight_block(canvas, invoice)
     _draw_footers(canvas)
     return _assemble([canvas.content(page) for page in range(canvas.page_count)], canvas.glyphs)
 
@@ -1149,13 +1209,23 @@ def _warn_empty_items(invoice: Invoice) -> None:
 
 
 def _warn_unshaped(invoice: Invoice) -> None:
-    """Report Arabic-block characters that were drawn but never joined.
+    """Report Arabic-block **letters** that were drawn but never joined.
 
     A Persian or Urdu letter has no presentation form, so it is drawn as a
     stand-alone glyph in the middle of an Arabic word. It is *not* dropped — the
     subset covers the whole Arabic block, so the letter is there — but a joined
     word drawn half-joined is a defect an operator should be able to see, and
     this is the only place it is visible.
+
+    Narrowed to letters, because the defect is a letter that *could* have joined
+    and did not. A digit, a comma or a harakat has no joining form to begin with,
+    so drawing it stand-alone is correct and reporting it is noise — and this
+    became a real problem rather than a theoretical one when weights started
+    arriving in the notes as free text: an operator writes ``الوزن القائم:
+    ١٢٠ كجم``, so every weighable invoice carried three Arabic-Indic digits that
+    this warned about. A warning that fires on the ordinary case is a warning an
+    operator learns to skip, which costs the real one (a Persian letter inside a
+    product name) its whole value.
     """
     fields: list[tuple[str, object]] = [
         ("customer name", invoice.customer_name),
@@ -1170,7 +1240,7 @@ def _warn_unshaped(invoice: Invoice) -> None:
         for index, item in enumerate(invoice.items or ())
     ]
     for name, value in fields:
-        unshaped = unshaped_arabic(_flatten(value))
+        unshaped = [c for c in unshaped_arabic(_flatten(value)) if unicodedata.category(c)[0] == "L"]
         if not unshaped:
             continue
         sample = " ".join(f"U+{ord(c):04X}" for c in dict.fromkeys(unshaped))

@@ -374,6 +374,41 @@ def test_the_base_font_name_carries_a_subset_tag() -> None:
     assert render_invoice_pdf(arabic_invoice()) == pdf  # deterministic
 
 
+def parse_widths(body: str) -> dict[int, int]:
+    """The ``/W`` array as ``glyph id -> advance width``.
+
+    Written as a walk over the tokens rather than as two independent regexes
+    because the two legal forms are ambiguous to a regex: ``9 [500 12 [400 300]``
+    and a width list that happens to contain three consecutive integers are both
+    "three digits in a row", and no lookahead can tell them apart without knowing
+    where a list ended. The earlier parser got this wrong as soon as the document
+    drew a glyph whose run produced such a triple, and reported the *widths* as
+    if they were glyph ids.
+    """
+    tokens = re.findall(r"\d+|\[|\]", body)
+    widths: dict[int, int] = {}
+    index = 0
+    while index < len(tokens):
+        first = int(tokens[index])
+        if index + 1 < len(tokens) and tokens[index + 1] == "[":
+            index += 2
+            offset = 0
+            while tokens[index] != "]":
+                widths[first + offset] = int(tokens[index])
+                offset += 1
+                index += 1
+            index += 1  # the closing bracket
+        elif index + 2 < len(tokens):
+            # The "first last w" form: one width across an inclusive run of ids.
+            last, width = int(tokens[index + 1]), int(tokens[index + 2])
+            for gid in range(first, last + 1):
+                widths[gid] = width
+            index += 3
+        else:
+            break
+    return widths
+
+
 def test_only_the_used_glyph_widths_are_in_the_widths_array() -> None:
     """``/W`` covers the glyphs that were drawn, grouped into consecutive runs.
 
@@ -387,14 +422,7 @@ def test_only_the_used_glyph_widths_are_in_the_widths_array() -> None:
     body = descendant.split("/W [", 1)[1].split("] /CIDToGIDMap", 1)[0]
     emitted = {gid for span in spans(pdf) for gid in glyph_ids(span["gids"] or "")}
 
-    listed: dict[int, int] = {}
-    for first, values in re.findall(r"(\d+) \[([^\]]*)\]", body):
-        for offset, width in enumerate(values.split()):
-            listed[int(first) + offset] = int(width)
-    # Consecutive glyphs with the same width may also be written as "first last w".
-    for first, last, width in re.findall(r"(\d+) (\d+) (\d+)(?! \[)", body):
-        for gid in range(int(first), int(last) + 1):
-            listed[gid] = int(width)
+    listed = parse_widths(body)
     assert set(listed) == emitted
     for gid, width in listed.items():
         assert width == FONT.advance(gid), f"glyph {gid} has the wrong advance"
@@ -1112,6 +1140,25 @@ def test_persian_letters_are_drawn_and_reported_as_unjoined(caplog) -> None:
     assert f"{FONT.glyph_id(0x067E):04X}" in "".join(sorted(drawn))
 
 
+def test_arabic_digits_in_the_notes_do_not_warn(caplog) -> None:
+    """Digits have no joining form, so drawing them stand-alone is not a defect.
+
+    The weights arrive as free text, and the operator writes them in Arabic-Indic
+    digits (``الوزن القائم: ١٢٠``), so a warning on them would fire on every
+    weighable invoice. A warning that always fires is one an operator stops
+    reading, and then the Persian letter above goes unreported too — which is the
+    whole value of it. So the tripwire is for letters that *should* join.
+    """
+    notes = "التسليم صباحاً\nالوزن القائم: ١٢٠ كجم\nالوزن صافي: ١١٠ كجم"
+    with caplog.at_level("WARNING"):
+        pdf = render_invoice_pdf(arabic_invoice(description=notes))
+    assert "no Arabic presentation form" not in caplog.text
+    # The digits are still drawn — the point of the change is only that drawing
+    # them is not reported as a shaping defect.
+    drawn = "".join(span["gids"] for span in spans(pdf) if span["font"] == "F2")
+    assert f"{FONT.glyph_id(ord('١')):04X}" in drawn
+
+
 def test_money_is_never_truncated() -> None:
     """An amount is the one value that may not be shortened to fit.
 
@@ -1721,3 +1768,123 @@ def test_the_font_embedding_is_compressed_but_still_the_right_bytes() -> None:
     assert len(inflated) == len(FONT.font_bytes())
     assert inflated[:4] == b"\x00\x01\x00\x00"  # a TrueType sfnt version
     assert struct.unpack(">H", inflated[4:6])[0] == 14  # 14 tables in the subset
+
+
+# --- the weight block (last page only) -------------------------------------------
+
+
+def weighted_invoice(**overrides) -> Invoice:
+    """An invoice carrying the four weight/price figures, in Arabic."""
+    base = dict(
+        net_weight=Decimal("110"),
+        gross_weight=Decimal("120"),
+        price_per_kg=Decimal("50"),
+    )
+    base.update(overrides)
+    return arabic_invoice(**base)
+
+
+def _last_page_spans(pdf: bytes) -> list[dict[str, str]]:
+    """The drawn spans of the last page only."""
+    return [match.groupdict() for match in SPAN.finditer(page_streams(pdf)[-1])]
+
+
+def test_the_weight_block_is_drawn_on_the_last_page_only() -> None:
+    """Weights are a summary, and a summary printed on every page is noise.
+
+    It is last-page-only as a *property of the layout*, not as a special case:
+    the block is drawn straight after the atomic totals block, which is always on
+    the last page, so there is no page index to compute and nothing to get wrong
+    when the page count changes.
+    """
+    pdf = render_invoice_pdf(
+        weighted_invoice(
+            items=tuple(
+                InvoiceItem(
+                    name=f"صنف {index}",
+                    quantity=Decimal("1"),
+                    unit_price=Decimal("1"),
+                    total=Decimal("1"),
+                )
+                for index in range(80)
+            )
+        )
+    )
+    streams = page_streams(pdf)
+    assert len(streams) > 1, "this fixture must span several pages for the test to mean anything"
+
+    gross = shaped_gids("الوزن القائم")
+    assert gross in streams[-1], "the block must be on the last page"
+    for earlier in streams[:-1]:
+        assert gross not in earlier, "the block must not repeat on a continuation page"
+
+
+def test_all_four_weight_figures_are_drawn() -> None:
+    """Gross, net, price/kg and their product — the four the operator typed.
+
+    The figures are checked by their *values*, which are Latin and therefore
+    legible in the content stream, rather than by their Arabic labels.
+    """
+    pdf = render_invoice_pdf(weighted_invoice())
+    last = page_streams(pdf)[-1]
+    # 120.00 gross, 110.00 net, 50.00 per kg, and 110 x 50 = 5,500.00 total.
+    for figure in ("(120.00)", "(110.00)", "(50.00)", "(5,500.00)"):
+        assert figure in last, f"{figure} must be drawn on the last page"
+
+
+def test_the_weight_total_is_net_times_price_per_kg() -> None:
+    """الاجمالي is computed, never typed.
+
+    A total that disagreed with its own two factors would be the most expensive
+    possible defect on a weighable invoice: every party to it would be quoting a
+    number that arithmetic contradicts.
+    """
+    pdf = render_invoice_pdf(
+        weighted_invoice(net_weight=Decimal("137.5"), price_per_kg=Decimal("42"))
+    )
+    assert "(5,775.00)" in page_streams(pdf)[-1]
+
+
+def test_an_absent_weight_draws_a_placeholder_not_a_zero() -> None:
+    """``None`` is drawn as ``-``, so the page claims nothing it cannot support.
+
+    ``0.00`` would assert that the goods weigh nothing, which is a different and
+    much stronger statement than "this was never filled in".
+    """
+    pdf = render_invoice_pdf(weighted_invoice(gross_weight=None))
+    last = page_streams(pdf)[-1]
+    assert "(0.00)" not in last, "an absent weight must not become a zero"
+    assert "(-)" in last
+
+
+def test_the_weight_block_sits_inside_the_bottom_margin() -> None:
+    """The block is bottom-*right* and inside the printable area.
+
+    It is drawn from ``_FOOTER_Y`` upward, so the check is that no row of it sits
+    below the footer baseline and none crosses the right margin.
+    """
+    pdf = render_invoice_pdf(weighted_invoice())
+    last = page_streams(pdf)[-1]
+    baselines = [float(match.group("y")) for match in SPAN.finditer(last)]
+    assert baselines, "the last page must carry the block"
+    assert min(baselines) > 0, "nothing may be drawn below the page edge"
+    # Every drawn span stays inside the two margins.
+    for match in SPAN.finditer(last):
+        assert float(match.group("x")) >= LEFT_MARGIN - 1.0
+        assert float(match.group("x")) <= RIGHT_MARGIN + 1.0
+
+
+def test_the_weight_block_does_not_collide_with_the_footer() -> None:
+    """The page number is drawn on the last page too, and must stay legible.
+
+    Both are last-page content at similar heights, so this is the overlap the
+    layout has to actually avoid rather than merely intend.
+    """
+    pdf = render_invoice_pdf(weighted_invoice())
+    boxes = [_span_box(span) for span in _last_page_spans(pdf)]
+    for i, one in enumerate(boxes):
+        for other in boxes[i + 1 :]:
+            # Same-baseline rows sit side by side, so only compare across rows.
+            if abs(one[1] - other[1]) < 0.01:
+                continue
+            assert not _overlaps(one, other), "the weight block must not overlap other text"

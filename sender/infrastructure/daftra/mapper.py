@@ -57,6 +57,34 @@ _PHONE_KEYS = ("phone2", "phone1", "mobile", "phone")
 UNMAPPED_MONEY_KEYS = ("summary_tax1", "summary_tax2", "summary_tax3", "summary_discount", "deposit")
 UNMAPPED_ITEM_MONEY_KEYS = ("tax1", "tax2", "discount")
 
+#: The Arabic labels an operator types into the notes box, mapped to the field
+#: each one fills. Gross weight is the one of the four Daftra has no column for,
+#: so it can only be read out of the operator's free text; the other three are
+#: derived from the line items (see :meth:`DaftraInvoiceMapper._parse_weights`).
+#: Several spellings are listed per field because a hand-typed label varies —
+#: the alef in الصافي may be written with or without a hamza, and operators
+#: shorten or lengthen the word. Order matters only for ``الوزن صافي`` /
+#: ``وزن صافي``, where the longer label is a superstring of the shorter and
+#: both map to the same field.
+_WEIGHT_LABELS: dict[str, str] = {
+    "الوزن القائم": "gross_weight",
+    "الوزن الاجمالي": "gross_weight",
+    "الوزن الكلي": "gross_weight",
+    "الوزن الصافي": "net_weight",
+    "الوزن الصافى": "net_weight",
+    "وزن صافي": "net_weight",
+    "وزن صافى": "net_weight",
+    "سعر الكيلو": "price_per_kg",
+    "سعر كيلو": "price_per_kg",
+    "سعر الكيلوغرام": "price_per_kg",
+    "سعر الكيلو جرام": "price_per_kg",
+}
+#: The figure on a weight line: digits (Western or Arabic-Indic) with at most
+#: one separator, which may be a decimal point or a thousands separator because
+#: which one it is depends on what follows it — :meth:`_money` decides that, not
+#: this pattern.
+_WEIGHT_VALUE_RE = re.compile(r"[\d٠-٩]+(?:[.,٬٫][\d٠-٩]+)*")
+
 #: Arabic/Persian localizations of the ASCII number glyphs the rest of ``_money``
 #: assumes. Without this fold, an amount a proxy localized for the customer's
 #: locale would have its separators stripped by the regex and silently change
@@ -187,6 +215,17 @@ class DaftraInvoiceMapper:
         if balance is None:
             balance = total - paid
 
+        # Parse weight/price fields from the notes free-text field.
+        notes_text = self._text(self._first(invoice, NOTES_KEYS))
+        weight_fields = self._parse_weight_from_notes(notes_text)
+
+        # Net weight = Σ item.quantity; price/kg = first item's unit_price.
+        net_weight = None
+        price_per_kg = None
+        if items:
+            net_weight = sum(item.quantity for item in items)
+            price_per_kg = items[0].unit_price
+
         return Invoice(
             id=str(invoice.get("id", "")),
             number=self._number(invoice),
@@ -202,7 +241,10 @@ class DaftraInvoiceMapper:
             items=items,
             public_url=self._first(invoice, PUBLIC_URL_KEYS),
             pdf_url=self._first(invoice, PDF_URL_KEYS),
-            description=self._text(self._first(invoice, NOTES_KEYS)),
+            description=notes_text,
+            gross_weight=weight_fields.get("gross_weight"),
+            net_weight=net_weight,
+            price_per_kg=price_per_kg,
         )
 
     def to_invoices(self, raw: dict) -> list[Invoice]:
@@ -409,6 +451,45 @@ class DaftraInvoiceMapper:
                 continue
             return value
         return default
+
+    @staticmethod
+    def _parse_weight_from_notes(notes: str) -> dict[str, Decimal]:
+        """Parse the weight figures the operator typed into the notes box.
+
+        The notes are free text, and on a weighable invoice the bottom of that box
+        holds three lines the operator typed for exactly this purpose —
+        ``الوزن القائم: ١٢٠ كجم`` and the like. Gross weight is read out of them
+        because Daftra has no column for it; the other three figures are derived
+        from the line items instead (Σ quantity, the first item's unit price), so
+        only gross weight can come from here.
+
+        Returns the parsed figures keyed by field name. A line that is absent, or
+        that carries a label but no figure, is simply not in the dict — the caller
+        leaves the field ``None`` and the PDF draws ``-`` rather than inventing a
+        number a customer would then be billed against.
+
+        An unparseable figure is skipped for the same reason, and by the same
+        rule as :meth:`_money` everywhere else in this class: prose is not a shape
+        the ERP promised, so it must not retire a real invoice.
+        """
+        if not notes:
+            return {}
+        result: dict[str, Decimal] = {}
+        for line in notes.splitlines():
+            for label, key in _WEIGHT_LABELS.items():
+                if label not in line:
+                    continue
+                match = _WEIGHT_VALUE_RE.search(line)
+                if match:
+                    try:
+                        # Through _money, so Arabic-Indic digits fold to ASCII and
+                        # the decimal-vs-thousands ambiguity is settled by the
+                        # same rule that settles it for every other amount here.
+                        result[key] = DaftraInvoiceMapper._money(match.group(0))
+                    except (InvalidOperation, ValueError):
+                        pass
+                break
+        return result
 
     def _pick(self, node: dict, key: str):
         current = node
