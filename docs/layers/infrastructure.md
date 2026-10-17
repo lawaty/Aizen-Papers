@@ -132,10 +132,12 @@ first, so Arabic is drawn in its contextual forms, joined, and in visual order;
 the table is laid out right-to-left from the right margin. Text neither font can
 draw is dropped with a WARNING naming the field, and a value left empty renders
 as `-`. Money is never truncated; a too-wide name is shortened with `...`. The two
-free-text fields are the exception and are **wrapped**, not fitted: `notes` as one
-labelled paragraph above the products, `InvoiceItem.description` as a second line
-inside its own row, both drawn whole because an ellipsis there would delete part
-of what the seller wrote. See [Invoice PDF](../guide/invoice-pdf.md#the-two-free-text-fields).
+free-text fields are the exception and are **wrapped**, not fitted: `notes` as a
+small faint paragraph at the foot of the last page (whose band the layout reserves,
+re-laying the document out when the last page is too full to hold it),
+`InvoiceItem.description` as a second line inside its own row, both drawn whole
+because an ellipsis there would delete part of what the seller wrote. See
+[Invoice PDF](../guide/invoice-pdf.md#the-two-free-text-fields).
 
 ### `arabic.py` — shaping and bidi
 

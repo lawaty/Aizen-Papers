@@ -50,6 +50,34 @@ BRAND_END = 415.0  # the brand name's right edge: the logo's left edge less its 
 TITLE_END = 246.0  # the title zone's right edge
 META_Y = 639.0  # the meta rows' first baseline: below the header's closing rule
 
+#: The notes paragraph's size, restated from the writer's constants so a change
+#: to them has to be made deliberately in two places — the same contract as the
+#: margins above. It is also how the paragraph is *found* in a rendered page: it
+#: is the only text on the page set at this size, which matching on the notes'
+#: own glyph ids cannot do (the shaper's output for a prefix of the note
+#: collides with the title and the section heading).
+NOTES_SIZE = 7.5
+#: The sizes the notes paragraph must not compete with, restated the same way:
+#: the meta rows are body text and the page number is chrome.
+META_SIZE = 9.0
+FOOTER_SIZE = 8.0
+#: The faint ink the paragraph is painted in, restated so a change to the palette
+#: has to be deliberate here too.
+FAINT_RGB = "0.58 0.6 0.62"
+#: The band's reserved geometry, restated from the writer's constants on the same
+#: contract as the margins above: content may not run below this, so the paragraph
+#: always has its air and its full line pitch. It is deliberately more generous
+#: than the paragraph's ink box — reserving the ink alone would let a row sit
+#: flush against the notes, which is not what "leave room" means on a printed page.
+CONTENT_BOTTOM = 74.0
+NOTES_AIR = 10.0
+NOTES_PITCH = 9.5
+
+
+def _band_top(lines: int) -> float:
+    """The baseline no content may fall below when the paragraph is *lines* long."""
+    return CONTENT_BOTTOM + NOTES_AIR + lines * NOTES_PITCH
+
 #: Helvetica's advance widths per 1000 em, for the characters these fixtures can
 #: actually put in a string: digits, a decimal point, a thousands separator, and
 #: the letters the brand name and currency code use. From the standard Helvetica
@@ -159,6 +187,16 @@ MONEY = re.compile(r"^\d[\d,]*\.\d{2}$")
 
 def page_count(pdf: bytes) -> int:
     return int(re.search(rb"/Count (\d+)", pdf).group(1))
+
+
+def _page_spans(pdf: bytes, page: int) -> list[dict[str, str]]:
+    """The drawn spans of one page, by index. ``-1`` is the last page.
+
+    Negative indexing because the claim several tests here make is about the
+    **last** page, and writing ``len(page_streams(pdf)) - 1`` at each call site
+    is both noisier and one off-by-one away from testing the wrong page.
+    """
+    return [match.groupdict() for match in SPAN.finditer(page_streams(pdf)[page])]
 
 
 def spans(pdf: bytes) -> list[dict[str, str]]:
@@ -621,20 +659,85 @@ def _line_gids(pdf: bytes) -> list[str]:
     return lines
 
 
-def test_the_invoice_notes_are_drawn_as_a_labelled_block_above_the_products() -> None:
-    """The invoice's own free text reaches the customer, labelled and in place.
+def test_the_notes_are_a_footnote_at_the_foot_of_the_last_page() -> None:
+    """The notes live bottom-right of the last page, below everything else.
 
-    Above the items table because it is about the invoice and not about any one
-    line, and labelled because an unlabelled paragraph between the meta rows and
-    the products reads as a fifth meta row whose value has overflowed.
+    Deliberately *not* where they used to be. Above the products they read as a
+    fifth meta row whose value had overflowed, and they pushed the table down on
+    every invoice that carried one; at the foot they are what they are — a
+    footnote the customer turns to, which is also where an operator's own figures
+    belong on a weighable invoice.
+
+    Asserted against the last page's own content stream rather than page 1's,
+    because "the foot of the last page" is the whole claim and page 1 happens to
+    be the last page only for a short invoice.
     """
     pdf = render_invoice_pdf(described_invoice())
-    label = _baseline_of(pdf, shaped_gids("ملاحظات"))
-    notes = _baseline_of(pdf, shaped_gids(NOTES))
-    assert label > notes, "the label leads its own block"
-    assert notes > _baseline_of(pdf, shaped_gids("بنود الفاتورة")), "above the products"
-    # The customer name is the last Arabic meta row, and the notes are under it.
-    assert notes < _baseline_of(pdf, shaped_gids("شركة النور للديكور")), "below the meta rows"
+    last = _page_spans(pdf, -1)
+    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    assert notes, "the notes must be drawn on the last page"
+
+    highest_note = max(float(span["y"]) for span in notes)
+    for span in last:
+        # The page number is chrome and belongs at the very foot of the sheet,
+        # below the paragraph; everything the customer reconciles must be above it.
+        if float(span["size"]) in (NOTES_SIZE, FOOTER_SIZE):
+            continue
+        assert float(span["y"]) > highest_note, (
+            f"span at y={span['y']} sits below the notes, which must come last"
+        )
+    # No label any more: an unlabelled footnote needs none, and the label was the
+    # thing that made it read as a meta row.
+    assert shaped_gids("ملاحظات") not in page_text(pdf)
+
+
+def test_the_notes_paragraph_is_smaller_and_shadier_than_every_other_text() -> None:
+    """A footnote is set apart by size and ink, not by being in a box.
+
+    The point of moving to the corner is that the notes stop competing with the
+    figures the invoice exists to state, so at the meta rows' size and ink they
+    would still be read as part of the statement rather than as a footnote.
+    """
+    pdf = render_invoice_pdf(described_invoice())
+    last = _page_spans(pdf, -1)
+    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    assert notes, "the notes must be drawn"
+
+    others = [span for span in last if float(span["size"]) != NOTES_SIZE]
+    assert others, "the page needs other text for this to mean anything"
+    for span in others:
+        # Chrome is the smallest thing on any page; nothing else may be.
+        assert float(span["size"]) >= FOOTER_SIZE, (
+            f"text at {span['size']}pt is smaller than the page's own furniture"
+        )
+    assert NOTES_SIZE < META_SIZE, "the notes must be smaller than the meta rows"
+
+    # And shadier: painted in the faint ink, a step up the luma ladder from the
+    # labels, so the hierarchy survives a grayscale photocopy. Counted rather than
+    # merely present, so nothing else can quietly claim the faintest ink on the page.
+    ops = _ops(page_streams(pdf)[-1])
+    faint_text = [op for op in ops if FAINT_RGB in op and " Tj" in op]
+    assert len(faint_text) == len(notes), (
+        f"{len(faint_text)} ops use the faint ink but {len(notes)} notes spans were drawn"
+    )
+
+
+def test_the_notes_sit_on_the_right_and_do_not_span_the_whole_column() -> None:
+    """Bottom-*right*: the paragraph is anchored at the right margin and is narrower
+    than the text column, so it reads as a footnote in the corner rather than a
+    full-width band across the foot of the page."""
+    pdf = render_invoice_pdf(described_invoice())
+    last = _page_spans(pdf, -1)
+    notes = [span for span in last if float(span["size"]) == NOTES_SIZE]
+    assert notes
+    right = max(
+        float(span["x"]) + arabic_width(span["gids"], float(span["size"])) for span in notes
+    )
+    assert right <= RIGHT_MARGIN + 0.01, "the paragraph must stay inside the right margin"
+    # Its left edge stays clear of the margin by more than a token's width, so it
+    # occupies the right portion of the page rather than the whole text column.
+    left = min(float(span["x"]) for span in notes)
+    assert left > LEFT_MARGIN + 100.0, "the paragraph should occupy the right portion only"
 
 
 def test_an_invoice_with_no_notes_draws_no_notes_block_at_all() -> None:
@@ -654,24 +757,38 @@ def test_an_invoice_with_no_notes_draws_no_notes_block_at_all() -> None:
     assert _baseline_of(pdf, shaped_gids("بنود الفاتورة")) == META_Y - 4 * 13
 
 
-def test_the_notes_are_wrapped_and_never_ellipsised() -> None:
+def test_the_notes_are_wrapped_and_never_ellipsised(caplog) -> None:
     """A note is prose, so it wraps; it is never fitted with an ellipsis.
 
-    An ellipsised note drops the half of a delivery address, a size or a payment
+    An ellipsis would drop the half of a delivery address, a size or a payment
     term that made it worth writing — and unlike a shortened name the customer has
     no way to tell that anything was left out.
+
+    The paragraph is **capped** at four lines, because its height is what the
+    layout reserves and an unbounded one would let a long note cost the customer
+    extra pages of table. So this asserts both halves of that contract: the lines
+    that do fit are wrapped rather than fitted, and a note that overruns the cap is
+    *reported* rather than quietly shortened — the cap is a truncation, and the
+    module's whole rule is that a truncation may not be silent.
     """
-    words = ["توصيل", "داخل", "القاهرة", "خلال", "أسبوع"] * 12
-    pdf = render_invoice_pdf(arabic_invoice(description=f"بداية {' '.join(words)} خاتمة"))
-    assert "..." not in stream_text(pdf)
-    # Every word is drawn, all 62 of them: nothing was dropped to make the note fit.
-    lines = _line_gids(pdf)
+    words = ["توصيل", "داخل", "القاهرة", "خلال", "أسبوع"]
+    # Three lines' worth: fits under the cap, so nothing is dropped, and wraps.
+    fitting = render_invoice_pdf(
+        arabic_invoice(description="بداية " + " ".join(words * 6) + " خاتمة")
+    )
+    assert "..." not in stream_text(fitting)
+    lines = _line_gids(fitting)
     for word in set(words) | {"بداية", "خاتمة"}:
         assert any(shaped_gids(word) in line for line in lines), f"{word} was dropped"
-    # And it took more than one line to do it — the note wrapped rather than being
-    # fitted onto one, which is the whole difference from a name being shortened.
     carried = [line for line in lines if shaped_gids("توصيل") in line]
-    assert len(carried) > 1, f"a {len(words)}-word note fitted on one line: {lines}"
+    assert len(carried) > 1, f"the note fitted on one line rather than wrapping: {lines}"
+
+    # Far too long for the cap: reported, and never an ellipsis.
+    with caplog.at_level("WARNING"):
+        pdf = render_invoice_pdf(arabic_invoice(description=" ".join(words * 12)))
+    assert "..." not in stream_text(pdf)
+    assert "only 4 fit" in caplog.text, "an overrun paragraph must say so, not vanish"
+    assert "NOT drawn" in caplog.text
 
 
 def test_every_wrapped_notes_line_stays_inside_the_text_column() -> None:
@@ -1770,121 +1887,188 @@ def test_the_font_embedding_is_compressed_but_still_the_right_bytes() -> None:
     assert struct.unpack(">H", inflated[4:6])[0] == 14  # 14 tables in the subset
 
 
-# --- the weight block (last page only) -------------------------------------------
+
+# --- the notes band: reserved, never overlapped -----------------------------------
 
 
-def weighted_invoice(**overrides) -> Invoice:
-    """An invoice carrying the four weight/price figures, in Arabic."""
-    base = dict(
-        net_weight=Decimal("110"),
-        gross_weight=Decimal("120"),
-        price_per_kg=Decimal("50"),
-    )
-    base.update(overrides)
-    return arabic_invoice(**base)
+def _notes_spans(pdf: bytes) -> list[dict[str, str]]:
+    """Every drawn span of the notes paragraph, on whichever page drew it.
 
-
-def _last_page_spans(pdf: bytes) -> list[dict[str, str]]:
-    """The drawn spans of the last page only."""
-    return [match.groupdict() for match in SPAN.finditer(page_streams(pdf)[-1])]
-
-
-def test_the_weight_block_is_drawn_on_the_last_page_only() -> None:
-    """Weights are a summary, and a summary printed on every page is noise.
-
-    It is last-page-only as a *property of the layout*, not as a special case:
-    the block is drawn straight after the atomic totals block, which is always on
-    the last page, so there is no page index to compute and nothing to get wrong
-    when the page count changes.
+    Located by size — see :data:`NOTES_SIZE` for why the content cannot be used
+    to identify it.
     """
-    pdf = render_invoice_pdf(
-        weighted_invoice(
-            items=tuple(
-                InvoiceItem(
-                    name=f"صنف {index}",
-                    quantity=Decimal("1"),
-                    unit_price=Decimal("1"),
-                    total=Decimal("1"),
-                )
-                for index in range(80)
-            )
+    return [
+        span
+        for page in page_streams(pdf)
+        for span in (m.groupdict() for m in SPAN.finditer(page))
+        if float(span["size"]) == NOTES_SIZE
+    ]
+
+
+def _rows_drawn_on(pdf: bytes, page: int) -> int:
+    """How many money figures the given page draws.
+
+    Counted rather than named so the comparison does not depend on which columns
+    a fixture fills: every item row draws three figures and the totals a fixed
+    handful, so a *change* in this number between two renderings of the same
+    invoice is the signal that rows moved between pages. The notes are excluded by
+    construction — a figure inside the paragraph is drawn as Arabic-Indic glyph
+    ids through the Arabic font, never as a Latin literal like these.
+    """
+    return len(re.findall(r"\(\d[\d,]*\.\d{2}\) Tj", page_streams(pdf)[page]))
+
+
+def test_the_notes_band_is_reserved_so_the_table_cannot_reach_it() -> None:
+    """Nothing on the last page may be drawn into the notes paragraph's space.
+
+    The band is measured from the paragraph's own drawn lines rather than from the
+    writer's constants, so this is a statement about what is actually on the page:
+    every other span — item rows, the totals, the rule, the page number — has to
+    clear it.
+    """
+    # Enough items that the last page carries a run of rows right up to its floor.
+    pdf = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(60)))
+    assert page_count(pdf) > 1, "this fixture must span several pages to mean anything"
+
+    notes = _notes_spans(pdf)
+    assert notes, "the paragraph must be drawn"
+    size = NOTES_SIZE
+    band_bottom = min(float(span["y"]) for span in notes) - 0.25 * size
+    band_top = max(float(span["y"]) for span in notes) + 0.75 * size
+    band = (LEFT_MARGIN, band_bottom, RIGHT_MARGIN, band_top)
+
+    for span in _page_spans(pdf, -1):
+        if float(span["size"]) == NOTES_SIZE:
+            continue
+        assert not _overlaps(_span_box(span), band), (
+            f"span at y={span['y']} is drawn into the notes band "
+            f"({band_bottom:.1f}–{band_top:.1f})"
         )
-    )
-    streams = page_streams(pdf)
-    assert len(streams) > 1, "this fixture must span several pages for the test to mean anything"
-
-    gross = shaped_gids("الوزن القائم")
-    assert gross in streams[-1], "the block must be on the last page"
-    for earlier in streams[:-1]:
-        assert gross not in earlier, "the block must not repeat on a continuation page"
 
 
-def test_all_four_weight_figures_are_drawn() -> None:
-    """Gross, net, price/kg and their product — the four the operator typed.
+def test_a_large_last_table_breaks_to_leave_room_for_the_notes() -> None:
+    """When the last page would collide, the table breaks instead of overprinting.
 
-    The figures are checked by their *values*, which are Latin and therefore
-    legible in the content stream, rather than by their Arabic labels.
+    Swept over item counts and **self-targeting**: rather than hard-coding a count
+    that happens to collide — which is a test of that number, and breaks the day
+    a row's height changes — each count is rendered without notes and its last
+    page's lowest content line is measured. The counts whose last page would run
+    into the paragraph's band are exactly the ones this has to get right, and those
+    are the ones asserted on.
+
+    It is a narrow window by construction, which is why it is searched for rather
+    than assumed: the band is ~20pt tall and a row is 13pt, so only one or two
+    item counts in every page-full's worth land inside it.
+
+    Two things are asserted. Every count, at every fill level, must leave the band
+    clear — that is the guarantee. And at least one count must genuinely pay for
+    the band, so the guarantee cannot pass vacuously.
     """
-    pdf = render_invoice_pdf(weighted_invoice())
-    last = page_streams(pdf)[-1]
-    # 120.00 gross, 110.00 net, 50.00 per kg, and 110 x 50 = 5,500.00 total.
-    for figure in ("(120.00)", "(110.00)", "(50.00)", "(5,500.00)"):
-        assert figure in last, f"{figure} must be drawn on the last page"
+    at_risk: list[int] = []
+    # Wide enough to span a whole page's worth of thresholds — the band bites in
+    # a ~20pt window every 13pt row, so a narrower sweep risks missing the only
+    # count that exercises the break, and would then pass vacuously.
+    for count in range(20, 71):
+        without = render_invoice_pdf(arabic_invoice(description="", items=_items(count)))
+        # The paragraph's own drawn extent is the ink box; the *reserved* extent is
+        # larger (air plus a full pitch per line), and it is the reservation the
+        # layout must honour, so both are needed and they are not the same number.
+        with_notes = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(count)))
+        notes = _notes_spans(with_notes)
+        assert notes, f"{count} items: the paragraph was not drawn"
+        band_top = _band_top(len(notes))
+        band = (
+            LEFT_MARGIN,
+            min(float(s["y"]) for s in notes) - 0.25 * NOTES_SIZE,
+            RIGHT_MARGIN,
+            max(float(s["y"]) for s in notes) + 0.75 * NOTES_SIZE,
+        )
 
-
-def test_the_weight_total_is_net_times_price_per_kg() -> None:
-    """الاجمالي is computed, never typed.
-
-    A total that disagreed with its own two factors would be the most expensive
-    possible defect on a weighable invoice: every party to it would be quoting a
-    number that arithmetic contradicts.
-    """
-    pdf = render_invoice_pdf(
-        weighted_invoice(net_weight=Decimal("137.5"), price_per_kg=Decimal("42"))
-    )
-    assert "(5,775.00)" in page_streams(pdf)[-1]
-
-
-def test_an_absent_weight_draws_a_placeholder_not_a_zero() -> None:
-    """``None`` is drawn as ``-``, so the page claims nothing it cannot support.
-
-    ``0.00`` would assert that the goods weigh nothing, which is a different and
-    much stronger statement than "this was never filled in".
-    """
-    pdf = render_invoice_pdf(weighted_invoice(gross_weight=None))
-    last = page_streams(pdf)[-1]
-    assert "(0.00)" not in last, "an absent weight must not become a zero"
-    assert "(-)" in last
-
-
-def test_the_weight_block_sits_inside_the_bottom_margin() -> None:
-    """The block is bottom-*right* and inside the printable area.
-
-    It is drawn from ``_FOOTER_Y`` upward, so the check is that no row of it sits
-    below the footer baseline and none crosses the right margin.
-    """
-    pdf = render_invoice_pdf(weighted_invoice())
-    last = page_streams(pdf)[-1]
-    baselines = [float(match.group("y")) for match in SPAN.finditer(last)]
-    assert baselines, "the last page must carry the block"
-    assert min(baselines) > 0, "nothing may be drawn below the page edge"
-    # Every drawn span stays inside the two margins.
-    for match in SPAN.finditer(last):
-        assert float(match.group("x")) >= LEFT_MARGIN - 1.0
-        assert float(match.group("x")) <= RIGHT_MARGIN + 1.0
-
-
-def test_the_weight_block_does_not_collide_with_the_footer() -> None:
-    """The page number is drawn on the last page too, and must stay legible.
-
-    Both are last-page content at similar heights, so this is the overlap the
-    layout has to actually avoid rather than merely intend.
-    """
-    pdf = render_invoice_pdf(weighted_invoice())
-    boxes = [_span_box(span) for span in _last_page_spans(pdf)]
-    for i, one in enumerate(boxes):
-        for other in boxes[i + 1 :]:
-            # Same-baseline rows sit side by side, so only compare across rows.
-            if abs(one[1] - other[1]) < 0.01:
+        # The guarantee, at every count: nothing on the last page is in the band.
+        assert page_count(with_notes) >= page_count(without), (
+            f"{count} items: reserving the band made the document shorter"
+        )
+        for span in _page_spans(with_notes, -1):
+            if float(span["size"]) == NOTES_SIZE:
                 continue
-            assert not _overlaps(one, other), "the weight block must not overlap other text"
+            assert not _overlaps(_span_box(span), band), (
+                f"{count} items: span at y={span['y']} is drawn into the notes band "
+                f"(top {band_top:.1f})"
+            )
+
+        # Is this count one where the last page *would* have run into the band?
+        lowest = min(
+            (float(span["y"]) for span in _page_spans(without, -1)
+             if float(span["size"]) != FOOTER_SIZE),
+            default=None,
+        )
+        if lowest is not None and lowest < band_top:
+            at_risk.append(count)
+
+    assert at_risk, (
+        "no item count in the sweep produced a last page that would run into the "
+        "reserved band, so this test cannot prove the reservation works"
+    )
+
+    # At each of those, the reservation is demonstrably what saved the layout: the
+    # un-reserved render puts content below the band, the reserved one does not.
+    # Asserted as a pair so a change that silently stopped reserving fails here
+    # rather than passing because both renders happened to agree.
+    for count in at_risk:
+        with_notes = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(count)))
+        without = render_invoice_pdf(arabic_invoice(description="", items=_items(count)))
+        reserved_low = min(
+            (float(span["y"]) for span in _page_spans(with_notes, -1)
+             if float(span["size"]) not in (NOTES_SIZE, FOOTER_SIZE)),
+            default=float("inf"),
+        )
+        plain_low = min(
+            (float(span["y"]) for span in _page_spans(without, -1)
+             if float(span["size"]) != FOOTER_SIZE),
+            default=float("inf"),
+        )
+        assert plain_low < band_top, (
+            f"{count} items was chosen as at-risk but its un-reserved last page "
+            f"already clears the band ({plain_low:.1f} vs {band_top:.1f})"
+        )
+        assert reserved_low >= band_top, (
+            f"{count} items: content still runs to y={reserved_low:.1f}, inside the "
+            f"band reserved to {band_top:.1f}; the table did not break to leave room"
+        )
+
+
+def test_the_table_continues_onto_the_next_page_and_the_notes_follow_it() -> None:
+    """The overflow lands on a *new* last page, and the paragraph lands with it.
+
+    This is the awkward half of pinning a block to the last page: re-laying out with
+    the band reserved can add a page, and the paragraph has to follow the content
+    to the new last page rather than staying behind on the old one.
+    """
+    pdf = render_invoice_pdf(arabic_invoice(description=NOTES, items=_items(120)))
+    assert page_count(pdf) > 1
+    assert _notes_spans(pdf), "the paragraph must be drawn somewhere"
+
+    # On the last page and no other: the paragraph follows the table.
+    for page in range(page_count(pdf) - 1):
+        assert not [s for s in _page_spans(pdf, page) if float(s["size"]) == NOTES_SIZE], (
+            f"the paragraph must not be repeated on page {page + 1}"
+        )
+    # And that last page is a real page of the document, not a fresh one made only
+    # to hold the paragraph: it carries table rows above the band.
+    assert _rows_drawn_on(pdf, -1) > 3
+
+
+def test_an_invoice_whose_last_page_is_empty_reserves_nothing() -> None:
+    """A short invoice keeps its pagination: the band costs its table no rows.
+
+    The second layout pass is guarded on the last page actually being full, so the
+    common case — one page, most of it blank — is laid out exactly once. An
+    unconditional reservation would cost that invoice a page for nothing, and this
+    is why the re-layout is guarded.
+    """
+    with_notes = render_invoice_pdf(described_invoice())
+    without = render_invoice_pdf(described_invoice(description=""))
+    assert page_count(with_notes) == page_count(without) == 1
+    assert _rows_drawn_on(with_notes, -1) == _rows_drawn_on(without, -1), (
+        "a one-page invoice must lose no table rows to the notes band"
+    )

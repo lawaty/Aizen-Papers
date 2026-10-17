@@ -71,7 +71,7 @@ Daftra lets a seller write prose in two places, and both reach the page:
 
 | Where | Daftra field | Model field | Drawn as |
 |---|---|---|---|
-| the invoice | `notes` | `Invoice.description` | one labelled, wrapped paragraph (`ملاحظات`) under the meta rows, above the products |
+| the invoice | `notes` | `Invoice.description` | a small, faint, unlabelled paragraph at the foot of the **last** page, bottom-right |
 | one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
 
 They are **wrapped, never fitted**. This is the one thing that separates them from
@@ -84,12 +84,45 @@ two fields at word boundaries and draws every line, and a word too wide for its
 column (a URL, a long code) is broken by character rather than allowed to run into
 the neighbouring column.
 
-The two are separate fields on purpose: `notes` is about the invoice and is
-printed once above the products, because a customer reading the items first would
-never reach a note placed below them. The line description is about one row, so it
-sits inside that row, under its name, in the secondary ink — at body ink a
-paragraph under every item name would be the loudest thing on the page, and the
-figures are what a customer reconciles. A row with no description takes no extra
+### The notes paragraph: the foot of the last page
+
+The invoice's notes are drawn at the **bottom-right of the last page**, in a
+smaller size and a fainter ink (`_FAINT`, one step up the luma ladder from the
+labels) than anything else on the sheet, and without a label. It reads as a
+footnote the customer turns to rather than as part of the statement — which is
+where an operator's own figures belong on a weighable invoice.
+
+Pinning it to the *last* page is the awkward half. A page's foot is only the last
+page's foot once the document has been laid out, so there is no page to reserve
+room on until after the fact. So `render_invoice_pdf` lays the document out once,
+and **only if the last page turns out to be too full** does it lay it out a second
+time with the paragraph's height reserved on every page — which pushes the rows
+that no longer fit onto a fresh last page, the one that then has room. A second
+pass is a plain re-layout and needs no third: once the band is reserved,
+`_Canvas.need` cannot place content below it, so the last page is guaranteed to
+have the space.
+
+The reservation is deliberately more generous than the paragraph's ink box — it
+reserves the air plus a full line pitch per line, so a table row can never sit
+flush against the notes. Reserving the ink alone would avoid a literal overlap
+while still looking like a mistake on paper.
+
+A short invoice is therefore laid out exactly once and loses no rows to the
+band. That guard is the point: reserving unconditionally would cost every invoice
+room, including the majority whose last page is half empty, and would change
+pagination for all of them to solve a problem most of them do not have.
+
+The paragraph is **capped at four lines**, because its height is a reservation:
+the more lines it takes, the more of the last page's table is pushed onto another
+page. Overflowing the cap logs a WARNING naming the field — it is a truncation,
+and this module's rule is that a truncation may not be silent.
+
+The two are separate fields on purpose: `notes` is about the whole document, so it
+is printed once as a footnote at the foot of the last page, where it annotates
+every page without competing with any of them. The line description is about one
+row, so it sits inside that row, under its name, in the secondary ink — at body
+ink a paragraph under every item name would be the loudest thing on the page, and
+the figures are what a customer reconciles. A row with no description takes no extra
 line at all, and neither field draws anything when it is empty: no label, no `-`,
 and no line of air.
 

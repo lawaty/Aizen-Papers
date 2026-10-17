@@ -29,6 +29,12 @@ What it emits:
   repeat on every continuation page (the letterhead does not: the logo is page-1
   branding), and the totals block is atomic: it is never split across a page break,
   so the last item row and the four totals always travel together.
+- The invoice's notes are drawn last, as a small, faint, unlabelled paragraph at
+  the **bottom-right of the last page** — a footnote rather than part of the
+  statement. Its space is reserved during layout: if the last page turns out to
+  be too full to hold it, the document is laid out a second time with the band
+  reserved on every page, which pushes the rows that no longer fit onto a fresh
+  last page. See :func:`render_invoice_pdf` for why that needs two passes.
 - Every page carries a centred ``صفحة n من m`` footer. Money, quantities and the
   totals are aligned on a shared **decimal axis** rather than right-aligned, so the
   decimal points read as a column the eye can compare down.
@@ -110,6 +116,12 @@ _INK = (0.11, 0.13, 0.15)
 #: Secondary ink: labels, meta values, the footer. Y ≈ 0.46 — half of body ink, so
 #: it reads as a step quieter on paper and still passes as text when photocopied.
 _SOFT = (0.44, 0.46, 0.48)
+#: The faintest ink on the page: the notes paragraph at its foot. Y ≈ 0.60, one
+#: step quieter than :data:`_SOFT`, so it is the last thing a reader's eye lands
+#: on rather than the first. The notes are the seller's own prose and, on a
+#: weighable invoice, a set of figures the customer needs — but they are not what
+#: the document is for, and at body ink they would outrank the balance due.
+_FAINT = (0.58, 0.60, 0.62)
 #: The default rule colour — a quiet hairline. Y ≈ 0.81 — present, not loud. The
 #: header's own closing rule is the accent (see the brand-header block below).
 _HAIRLINE = (0.79, 0.81, 0.83)
@@ -237,8 +249,22 @@ _META_PITCH = _LINE
 #: and the pitch of the wrapped lines under it. A shade tighter than
 #: :data:`_META_PITCH`, because this block is a paragraph under one label rather
 #: than a list of label-and-value rows — at the full pitch it reads as more rows.
-_NOTES_AIR = 10.0
-_NOTES_PITCH = 12.0
+#: The notes paragraph, at the foot of the **last** page. It is capped rather
+#: than grown because its height is a *reservation*: the more lines it takes, the
+#: more of the last page's table has to be pushed onto another page, so an
+#: unbounded paragraph would let a long note cost the customer extra pages.
+#: Four lines is what a weighable invoice's figures actually occupy.
+_NOTES_FOOTER_LINES = 4
+#: Smaller than every other text on the page (the meta rows are 9) and a step
+#: quieter than their ink, so the paragraph reads as a footnote the customer
+#: turns to rather than a fourth block they have to reconcile.
+_NOTES_FOOTER_SIZE = 7.5
+_NOTES_FOOTER_PITCH = 9.5
+#: The air between the last row above and the paragraph's first line.
+_NOTES_FOOTER_AIR = 10.0
+#: Right-anchored and narrower than the text column, so the paragraph sits in the
+#: page's bottom-*right* rather than spanning it — the shape a footnote takes.
+_NOTES_FOOTER_WIDTH = 250.0
 #: The table's own verticals, all relative to the running baseline.
 _HEADING_AIR = 13.0  # air between the meta block and the section heading
 _BAND_AIR = 17.0  # section heading to the header band
@@ -272,10 +298,6 @@ _BALANCE_AIR = 6.0  # the last ordinary total to the balance line
 _TOTALS_BLOCK = (
     _TOTALS_AIR + _TOTALS_HEAD_GAP + 3 * _TOTALS_PITCH + _BALANCE_AIR + _BALANCE_SIZE
 )
-#: The weighable-goods block, reserved as one piece like the totals above it: the
-#: rule, three ordinary rows and the emphasised total. Splitting it would strand
-#: الاجمالي alone under a rule that belongs to the rows above it.
-_WEIGHT_BLOCK = _TOTALS_AIR + _TOTALS_HEAD_GAP + 4 * _TOTALS_PITCH + _BALANCE_SIZE
 #: Footers sit at 60, so content stops at :data:`_BOTTOM_Y + 18` = 74 and keeps at
 #: least 6pt of air above its own page number.
 _FOOTER_Y = 60
@@ -283,7 +305,7 @@ _CONTENT_BOTTOM = _BOTTOM_Y + 18
 
 #: The fixed chrome words, named so the layout does not repeat them inline.
 _TITLE_TEXT = "فاتورة"
-_NOTES_LABEL = "ملاحظات"
+_NOTES_FOOTER_BOX: Box = (_RIGHT - _NOTES_FOOTER_WIDTH, _NOTES_FOOTER_WIDTH, "right")
 _ITEMS_HEADING = "بنود الفاتورة"
 _ITEMS_EMPTY = "لا توجد بنود في هذه الفاتورة"
 
@@ -632,10 +654,17 @@ class _Canvas:
     dictionary (``/W``, ``/ToUnicode``) is written after the last page.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, bottom: float = _CONTENT_BOTTOM) -> None:
         self._pages: list[list[bytes]] = [[]]
         self._page = 0
         self._y = _TOP_Y
+        #: The baseline no content may run below. Normally the page's own bottom
+        #: margin, but raised for the whole document when a band at the foot of
+        #: the last page has to be kept clear for something — see
+        #: :func:`render_invoice_pdf`. It is a per-canvas value rather than a
+        #: constant because it is a property of *this* layout, and a reservation
+        #: for one document must not silently move the text on every other.
+        self._bottom = bottom
         #: glyph id -> the code point it was drawn for.
         self.glyphs: dict[int, str] = {}
 
@@ -752,7 +781,7 @@ class _Canvas:
 
     def need(self, height: float = _LINE) -> bool:
         """Break to a new page when *height* no longer fits. True if it did."""
-        if self._y - height >= _CONTENT_BOTTOM:
+        if self._y - height >= self._bottom:
             return False
         self._pages.append([])
         self._page = len(self._pages) - 1
@@ -888,35 +917,56 @@ def _draw_heading(canvas: _Canvas, invoice: Invoice, currency: str) -> None:
         canvas.move_to(y - index * _META_PITCH)
         canvas.text(_LABEL, label, f"{field} label", _META_SIZE, _SOFT)
         canvas.text(_VALUE, _fitted(value, _META_SIZE, width), field, _META_SIZE, _INK)
-    _draw_notes(canvas, invoice)
 
 
-def _draw_notes(canvas: _Canvas, invoice: Invoice) -> None:
-    """The invoice's own free text, as a labelled paragraph above the products.
+def _notes_footer_lines(invoice: Invoice) -> list[str]:
+    """The notes as the lines the bottom-right paragraph will draw.
 
-    Placed above the items table because it is about the invoice rather than about
-    any one line: a seller who writes "delivery within Cairo" or "pay within 14
-    days" means it of the whole document, and a customer reading the products
-    first would never reach it below them.
+    Wrapped (not fitted — see :func:`_wrap`) and then capped at
+    :data:`_NOTES_FOOTER_LINES`, because the paragraph's height is what the
+    layout reserves on the last page.
 
-    In the secondary ink, like every other label on the page. The notes are prose
-    the operator chose to add, not a figure anyone is reconciling — at body ink
-    they would read as the most important thing on the page, which is not true.
-
-    Wrapped rather than fitted (see :func:`_wrap`), and every line asks for its own
-    space, so a note long enough to reach the foot of the page continues onto the
-    next one instead of being drawn into the footer.
+    Overflowing the cap is **reported rather than silently dropped**. The rest of
+    the module refuses to ellipsise free text precisely because an ellipsis on a
+    delivery instruction or a size deletes the half that made it worth writing,
+    and nothing on the page says anything was cut; a cap is the same hazard, so it
+    gets the same tripwire. On a weighable invoice the operator's own figures live
+    here, and silently drawing the first four lines of them would state a wrong
+    net weight rather than a missing one.
     """
-    lines = _wrap(invoice.description, _META_SIZE, _FULL[1], "invoice description")
+    lines = _wrap(invoice.description, _NOTES_FOOTER_SIZE, _NOTES_FOOTER_WIDTH, "invoice description")
+    if len(lines) > _NOTES_FOOTER_LINES:
+        log.warning(
+            "invoice PDF: the notes need %d lines at the foot of the page but only "
+            "%d fit; the remaining %d line(s) are NOT drawn and nothing on the page "
+            "says so. Shorten the note, or raise _NOTES_FOOTER_LINES — each extra "
+            "line costs the customer's table a row on the last page",
+            len(lines), _NOTES_FOOTER_LINES, len(lines) - _NOTES_FOOTER_LINES,
+        )
+    return lines[:_NOTES_FOOTER_LINES]
+
+
+def _draw_notes_footer(canvas: _Canvas, lines: list[str]) -> None:
+    """The notes paragraph, bottom-right of the **last** page.
+
+    Positioned from the page's own geometry rather than flowed, because it is
+    furniture: the foot of the last page is a fixed place, and a paragraph that
+    landed wherever the content happened to stop would be on the second-last page
+    of a two-page invoice and buried under the table of a full one.
+
+    The space it occupies was already reserved during layout (see
+    :func:`render_invoice_pdf`), which is what lets it be drawn straight into the
+    last page's op list with no second pass and no overlap.
+    """
     if not lines:
         return
-    canvas.need(_NOTES_AIR + (len(lines) + 1) * _NOTES_PITCH)
-    canvas.gap(_NOTES_AIR)
-    canvas.text(_FULL, _NOTES_LABEL, "description label", _META_SIZE, _SOFT)
-    for line in lines:
-        canvas.need(_NOTES_PITCH)
-        canvas.gap(_NOTES_PITCH)
-        canvas.text(_FULL, line, "invoice description", _META_SIZE, _SOFT)
+    canvas.on_page(canvas.page_count - 1, _FOOTER_Y)
+    for index, line in enumerate(lines):
+        # The last line sits just above the content floor; each earlier line is
+        # one pitch higher, so the paragraph reads downward into the corner.
+        y = _CONTENT_BOTTOM + _NOTES_FOOTER_AIR + (len(lines) - 1 - index) * _NOTES_FOOTER_PITCH
+        canvas.move_to(y)
+        canvas.text(_NOTES_FOOTER_BOX, line, "invoice description", _NOTES_FOOTER_SIZE, _FAINT)
 
 
 def _header_cells() -> tuple[tuple[Box, str, str], ...]:
@@ -1110,58 +1160,16 @@ def _draw_footers(canvas: _Canvas) -> None:
         canvas.text(((_PAGE_WIDTH - width) / 2, width, "left"), text, "footer", _FOOTER_SIZE, _SOFT)
 
 
-def _draw_weight_block(canvas: _Canvas, invoice: Invoice) -> None:
-    """The weighable goods, in Arabic, in the page's right-hand column.
+def _draw_body(canvas: _Canvas, invoice: Invoice, currency: str) -> None:
+    """The flowing part of the document: everything but the page furniture.
 
-    Four rows, each a label and a value: الوزن القائم (gross), الوزن صافي
-    (net), سعر الكيلو (price/kg), and الاجمالي — the product of the two middle
-    figures, computed here rather than typed, so the three can never disagree.
-
-    Drawn immediately after the totals block, which is what puts it on the **last**
-    page as a property of the layout rather than a special case: the totals block
-    is atomic and drawn last, so it is always on the last page, and so is
-    everything below it. One reservation for the whole block, for the same reason
-    the totals has one — four rows split across a page break would put
-    الاجمالي alone under a rule that belongs to the rows above it.
-
-    The middle two rows are what a weighable invoice is *for*, so they are the
-    figures the block leads with; الاجمالي closes it in the accent colour and a
-    size up, the same treatment المتبقي gets in the totals block above.
-
-    A value the source never stated draws as ``-``, not ``0.00``: a zero here
-    would assert that the goods weigh nothing, which is a far stronger claim than
-    "this was not filled in".
+    Split out because :func:`render_invoice_pdf` lays it out **twice** on the
+    documents that need it, and a second copy of this call list is exactly the
+    kind of thing that would then drift between the two passes.
     """
-    net = invoice.net_weight
-    price = invoice.price_per_kg
-    total = net * price if net is not None and price is not None else None
-
-    # One reservation for the whole block: the rule, the three ordinary rows and
-    # the emphasised total, so it is never split by the page break.
-    canvas.need(_WEIGHT_BLOCK)
-    canvas.gap(_TOTALS_AIR)
-    canvas.rule(colour=_INK, weight=0.75)
-    canvas.gap(_TOTALS_HEAD_GAP)
-    for label, value, field, size, colour in (
-        ("الوزن القائم", invoice.gross_weight, "gross weight", _TOTALS_SIZE, _INK),
-        ("الوزن صافي", net, "net weight", _TOTALS_SIZE, _INK),
-        ("سعر الكيلو", price, "price per kg", _TOTALS_SIZE, _INK),
-        ("الاجمالي", total, "weight total", _BALANCE_SIZE, _ACCENT),
-    ):
-        canvas.need(_TOTALS_PITCH)
-        canvas.text(_LABEL, label, f"{field} label", size, _SOFT)
-        # No currency suffix, for the same reason the totals block has none: the
-        # meta row has already established it, and a bare figure is the only way
-        # four amounts share one decimal axis.
-        _draw_figure(
-            canvas,
-            _VALUE,
-            _PLACEHOLDER if value is None else _money(value),
-            size,
-            colour,
-            _TOTALS_SIZE,
-        )
-        canvas.gap(_TOTALS_PITCH)
+    _draw_heading(canvas, invoice, currency)
+    _draw_items(canvas, invoice)
+    _draw_totals(canvas, invoice)
 
 
 def render_invoice_pdf(invoice: Invoice) -> bytes:
@@ -1170,15 +1178,36 @@ def render_invoice_pdf(invoice: Invoice) -> bytes:
     Returns the complete file as ``bytes``, ready to upload. Never raises for odd
     data: a value neither font can represent is dropped with a WARNING, and a
     value that is empty renders as ``-``.
+
+    The notes are drawn at the foot of the **last** page, which is the awkward half
+    of that: a page's foot is only the *last* page's foot once the document has
+    been laid out, so there is no page to reserve room on until after the fact.
+    So the document is laid out once, and only if the last page turns out to be
+    too full for the paragraph is it laid out a second time with the paragraph's
+    height reserved on every page — which pushes the rows that no longer fit onto
+    a fresh last page, the one that then has room. The second pass is a plain
+    re-layout and needs no third: with the band reserved, :meth:`_Canvas.need`
+    cannot place content below it, so the last page is guaranteed to have the
+    space.
+
+    The alternative — reserving the band unconditionally — would cost every
+    invoice the room, including the great majority whose last page is half empty,
+    and would change pagination for all of them to solve a problem most of them do
+    not have.
     """
     currency = _flatten(invoice.currency)
     _warn_unshaped(invoice)
     _warn_empty_items(invoice)
+    notes = _notes_footer_lines(invoice)
+    band = _NOTES_FOOTER_AIR + len(notes) * _NOTES_FOOTER_PITCH
+
     canvas = _Canvas()
-    _draw_heading(canvas, invoice, currency)
-    _draw_items(canvas, invoice)
-    _draw_totals(canvas, invoice)
-    _draw_weight_block(canvas, invoice)
+    _draw_body(canvas, invoice, currency)
+    if notes and canvas.y < _CONTENT_BOTTOM + band:
+        canvas = _Canvas(bottom=_CONTENT_BOTTOM + band)
+        _draw_body(canvas, invoice, currency)
+
+    _draw_notes_footer(canvas, notes)
     _draw_footers(canvas)
     return _assemble([canvas.content(page) for page in range(canvas.page_count)], canvas.glyphs)
 

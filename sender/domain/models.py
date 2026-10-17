@@ -57,19 +57,9 @@ class Invoice:
     #: Free text about the invoice as a whole (Daftra's ``notes``) — delivery
     #: instructions, a payment term, a thank-you. Distinct from the per-line
     #: :attr:`InvoiceItem.description`: this one belongs to the document, so the
-    #: PDF prints it once, above the products. Empty when the seller wrote nothing,
-    #: which is the common case.
+    #: PDF prints it once, as a small faint paragraph at the foot of the last page.
+    #: Empty when the seller wrote nothing, which is the common case.
     description: str = ""
-    #: Gross weight in kg, parsed from the notes field (Daftra has no dedicated
-    #: gross-weight column). ``None`` when the notes do not contain a parseable
-    #: gross-weight line. The PDF draws a bottom-right block on the last page
-    #: showing gross weight, net weight, price/kg, and their product.
-    gross_weight: Decimal | None = None
-    #: Net weight in kg — Σ item.quantity. ``None`` when there are no items.
-    net_weight: Decimal | None = None
-    #: Price per kg — the unit_price of the first item. ``None`` when there
-    #: are no items.
-    price_per_kg: Decimal | None = None
 
 
 #: Outcome statuses a :class:`SendOutcome` can carry. These mirror the poller's
