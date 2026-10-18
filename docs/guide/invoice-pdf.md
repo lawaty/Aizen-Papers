@@ -71,7 +71,7 @@ Daftra lets a seller write prose in two places, and both reach the page:
 
 | Where | Daftra field | Model field | Drawn as |
 |---|---|---|---|
-| the invoice | `html_notes` (Daftra's rich-text box; `notes`/`description` as fallbacks) | `Invoice.description` | an unlabelled paragraph in the body ink on the **last** page, right-aligned and set about four and a half lines below the table, one line per `<p>` |
+| the invoice | `html_notes` (Daftra's rich-text box — the only notes column this client fills) | `Invoice.description` | an unlabelled paragraph in the body ink on the **last** page, right-aligned and set about four and a half lines below the table, one line per `<p>` |
 | one line item | `InvoiceItem.description` | `InvoiceItem.description` | a second line under the item's name, in the name column |
 
 They are **wrapped, never fitted**. This is the one thing that separates them from
@@ -87,10 +87,13 @@ the neighbouring column.
 ### The notes paragraph: under the table, on the last page
 
 Daftra's notes arrive as HTML, and the field is `html_notes`. The operator types
-into a rich-text editor, which writes `html_notes` and leaves plain `notes` at
-`null`. Measured across the three configured accounts: `notes` was empty on all 68
-invoices, `html_notes` populated on 22. Reading `notes` finds nothing and looks
-exactly like an operator who never typed a note. The mapper
+into a rich-text editor, which writes `html_notes` and leaves `notes` and
+`description` at `null`. Measured across the three configured accounts: `notes`
+and `description` were empty on all 68 invoices, `html_notes` populated on 22. So
+those two are **not** read as fallbacks — they are empty columns, not alternate
+spellings, and reading them was what hid the notes on every real invoice for as
+long as `notes` was tried first. An invoice whose `html_notes` is empty genuinely
+has no notes. The mapper
 (`html_notes_to_text`) turns block tags into newlines — they are the operator's
 line breaks — and drops the rest, so the document never sees `<p>`,
 `<span style=...>`, `&nbsp;`, or Daftra's trailing `replace_template_notes`

@@ -743,32 +743,44 @@ def test_the_notes_sit_about_five_lines_under_the_table() -> None:
     An earlier version anchored the paragraph to the page's bottom margin, so on a
     short invoice it floated far below the table no matter how large the air
     constant was — the distance being compared was to the page, not to the table.
-    Drawing it in flow makes the gap relative to where the last row ended, so this
-    measures that directly: the distance between the last thing drawn above it and
-    the paragraph's first line.
+    Drawing it in flow makes the gap relative to where the last row ended.
+
+    Measured to the paragraph's **first** line, which is what the air sits above.
+    Measuring to its last instead would report the gap plus every line of the
+    paragraph, which is a number that changes with how much the operator wrote —
+    and this test used a fixture whose notes wrapped to a *single* line, so it
+    never noticed. Run over the four lines a weighable invoice actually has, where
+    it does.
     """
-    pdf = render_invoice_pdf(described_invoice())
-    last = _page_spans(pdf, -1)
-    notes = [span for span in last if _is_notes_span(span)]
-    assert notes, "the notes must be drawn"
-    lowest_note = min(float(span["y"]) for span in notes)
-
-    # The nearest thing drawn above the paragraph — the totals block's last line —
-    # not merely the highest thing on the page, which is the letterhead.
-    above = [
-        float(span["y"])
-        for span in last
-        if not _is_notes_span(span)
-        and float(span["size"]) != FOOTER_SIZE
-        and float(span["y"]) > lowest_note
-    ]
-    assert above, "the page needs content above the notes for this to measure"
-
-    gap = min(above) - lowest_note
-    assert abs(gap - NOTES_AIR) < 0.01, (
-        f"the paragraph sits {gap:.1f}pt under the table, not the stated "
-        f"{NOTES_AIR:.1f}pt"
+    four_lines = (
+        "التسليم صباحاً عند باب المصنع\n"
+        "الوزن القائم: ١٢٠ كجم\n"
+        "الوزن صافي: ١١٠ كجم\n"
+        "سعر الكيلو: ٥٠ ج.م"
     )
+    for description in (NOTES, four_lines):
+        pdf = render_invoice_pdf(described_invoice(description=description))
+        last = _page_spans(pdf, -1)
+        notes = [span for span in last if _is_notes_span(span)]
+        assert notes, "the notes must be drawn"
+        top_note = max(float(span["y"]) for span in notes)
+
+        # The nearest thing drawn above the paragraph — the totals block's last
+        # line — not merely the highest thing on the page, which is the letterhead.
+        above = [
+            float(span["y"])
+            for span in last
+            if not _is_notes_span(span)
+            and float(span["size"]) != FOOTER_SIZE
+            and float(span["y"]) > top_note
+        ]
+        assert above, "the page needs content above the notes for this to measure"
+
+        gap = min(above) - top_note
+        assert abs(gap - NOTES_AIR) < 0.01, (
+            f"the paragraph sits {gap:.1f}pt under the table, not the stated "
+            f"{NOTES_AIR:.1f}pt"
+        )
     # And that is about five of the page's 13pt lines — near the table, not on the
     # floor, whatever the page's length.
     assert 4.5 * 13 <= NOTES_AIR <= 5.5 * 13

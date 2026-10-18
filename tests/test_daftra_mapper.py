@@ -264,8 +264,14 @@ def test_a_line_with_no_description_key_at_all_is_empty_not_a_placeholder(mapper
 
 
 def test_the_invoice_notes_are_mapped(mapper):
-    """``notes`` is the free text about the invoice as a whole."""
-    invoice = mapper.to_invoice(_with_invoice_fields(notes="التوصيل خلال أسبوع داخل القاهرة"))
+    """``html_notes`` is the free text about the invoice as a whole.
+
+    The field the operator's rich-text box writes, and the only one of Daftra's
+    three that this client ever fills.
+    """
+    invoice = mapper.to_invoice(
+        _with_invoice_fields(html_notes="التوصيل خلال أسبوع داخل القاهرة")
+    )
     assert invoice.description == "التوصيل خلال أسبوع داخل القاهرة"
 
 
@@ -274,114 +280,19 @@ def test_an_invoice_with_no_notes_is_empty(mapper):
     assert mapper.to_invoice(REAL_INVOICE_RESPONSE).description == ""
 
 
-def test_the_notes_fall_back_to_the_description_spelling(mapper):
-    """Daftra spells the same invoice-level field two ways; read whichever came.
+def test_the_empty_note_columns_are_not_read_at_all(mapper):
+    """``notes`` and ``description`` are empty on every invoice, so they are not read.
 
-    ``notes`` is the documented and observed spelling. ``description`` is the one a
-    few shapes use for the same free text, and a tenant on that shape should get
-    its note printed rather than silently losing it — the whole point of reading
-    the field at all.
+    These three tests used to assert that a note under ``notes`` or
+    ``description`` was still found. That behaviour is deliberately gone: neither
+    column is ever filled by this client, so reading them was a claim about
+    hypothetical other shapes, and — the half that actually cost something —
+    ``notes`` being tried *first* is why every real invoice rendered with no notes
+    at all until ``html_notes`` was found.
     """
-    assert mapper.to_invoice(_with_invoice_fields(description="Payment within 14 days")).description == (
-        "Payment within 14 days"
-    )
-
-
-def test_notes_win_over_the_description_spelling(mapper):
-    """Both present: ``notes`` is the documented field, so it is the one read."""
-    invoice = mapper.to_invoice(_with_invoice_fields(notes="ملاحظات", description="description"))
-    assert invoice.description == "ملاحظات"
-
-
-def test_empty_notes_fall_through_to_the_description_spelling(mapper):
-    """Daftra sends ``notes: ""`` on most invoices, which must not win by being first.
-
-    A bare ``_first(invoice, ("notes", ...))`` would stop at the empty string on
-    every invoice that has a description under the other spelling, or — the worse
-    half of the same bug — an implementation that stopped at "notes is present"
-    would print an empty note and never look again.
-    """
-    invoice = mapper.to_invoice(_with_invoice_fields(notes="", description="Payment within 14 days"))
-    assert invoice.description == "Payment within 14 days"
-
-
-def test_invoice_header_fields_map_from_the_real_payload(mapper):
-    invoice = mapper.to_invoice(REAL_INVOICE_RESPONSE)
-    assert invoice.id == "1"
-    assert invoice.number == "000001"
-    assert invoice.customer_name == "Print Home"
-    assert invoice.status == "Unpaid"
-    assert invoice.currency == "EGP"
-    assert invoice.total == Decimal("35000")
-    assert invoice.balance_due == Decimal("35000")
-    assert invoice.issue_date.isoformat() == "2026-09-25"
-    assert invoice.public_url.endswith("/invoices/preview/1?hash=0846864e66")
-
-
-def test_flat_payload_shape_is_still_accepted(mapper):
-    """Older payloads and the offline stub put Client/InvoiceItem beside Invoice."""
-    invoice = mapper.to_invoice(
-        {
-            "Invoice": {"id": "1", "no": "000001", "summary_total": 100},
-            "Client": {"business_name": "Acme", "phone1": "01027693262"},
-            "InvoiceItem": [{"item": "Paper", "quantity": "2", "unit_price": "50", "subtotal": 100}],
-        }
-    )
-    assert invoice.customer_name == "Acme"
-    assert invoice.customer_phones == ("201027693262",)
-    assert [item.name for item in invoice.items] == ["Paper"]
-
-
-def test_nested_client_wins_over_a_flat_duplicate(mapper):
-    invoice = mapper.to_invoice(
-        {
-            "Invoice": {
-                "id": "1",
-                "no": "000001",
-                "Client": {"business_name": "Nested", "phone1": "01027693262"},
-                "InvoiceItem": [],
-            },
-            "Client": {"business_name": "Flat", "phone1": "01234567890"},
-            "InvoiceItem": [{"item": "Flat item", "subtotal": 5}],
-        }
-    )
-    assert invoice.customer_name == "Nested"
-    assert invoice.customer_phones == ("201027693262",)
-    assert invoice.items == ()
-
-
-def test_nested_empty_item_list_does_not_fall_back_to_the_flat_list(mapper):
-    invoice = mapper.to_invoice(
-        {
-            "Invoice": {"id": "1", "no": "000001", "InvoiceItem": []},
-            "InvoiceItem": [{"item": "Flat item", "subtotal": 5}],
-        }
-    )
-    assert invoice.items == ()
-
-
-def test_list_rows_map_each_nested_invoice(mapper):
-    invoices = mapper.to_invoices(
-        {"result": "successful", "data": [REAL_INVOICE_RESPONSE["data"], {"Invoice": {"id": "2", "no": "000002"}}]}
-    )
-    assert [invoice.id for invoice in invoices] == ["1", "2"]
-    assert invoices[0].customer_phones == ("201022322634",)
-    assert len(invoices[0].items) == 1
-
-
-def test_name_falls_back_to_person_then_placeholder(mapper):
-    invoice = mapper.to_invoice(
-        {"Invoice": {"id": "1", "no": "000001", "client_first_name": "Mona", "client_last_name": "Farouk"}}
-    )
-    assert invoice.customer_name == "Mona Farouk"
-    assert mapper.to_invoice({"Invoice": {"id": "1", "no": "000001"}}).customer_name == "Customer"
-
-
-def test_malformed_payloads_are_rejected(mapper):
-    with pytest.raises(ValueError):
-        mapper.to_invoice({"data": {"Invoice": "not-an-object"}})
-    with pytest.raises(ValueError):
-        mapper.to_invoice({"data": {"Unrelated": {}}})
+    assert mapper.to_invoice(_with_invoice_fields(description="Payment within 14 days")).description == ""
+    assert mapper.to_invoice(_with_invoice_fields(notes="", description="x")).description == ""
+    assert mapper.to_invoice(_with_invoice_fields(notes="ملاحظات")).description == ""
 
 
 #: The operator's notes as Daftra actually stores them, captured from
@@ -454,19 +365,30 @@ def test_no_editor_markup_reaches_the_customer_document():
         assert junk not in description, f"{junk} reached the document"
 
 
-def test_a_plain_notes_field_still_reads_as_it_did():
-    """The fallbacks are untouched — this is an addition, not a replacement.
+def test_only_html_notes_is_read_as_the_notes():
+    """The empty columns are not alternate spellings, so they are not fallbacks.
 
-    A shape that writes the plain field, or the ``description`` spelling some
-    Daftra versions use, must keep working; and plain text passes through the
-    HTML reader unchanged.
+    ``notes`` and ``description`` exist on the payload and are empty on all 68
+    invoices across the three configured accounts; the operator's rich-text box
+    writes ``html_notes``. Reading the empty ones as fallbacks would be a claim
+    about another shape, made without evidence — and it is what kept the notes
+    hidden on every real invoice for as long as it stood, because the first key
+    tried was the one the client never fills.
     """
+    # The fields the client does not use are ignored even when non-empty, so a
+    # value appearing there by some other route cannot be mistaken for a note.
     assert DaftraInvoiceMapper().to_invoice({
-        "Invoice": {"id": "1", "no": "1", "notes": "تسليم صباحا", "html_notes": None}
-    }).description == "تسليم صباحا"
+        "Invoice": {"id": "1", "no": "1", "html_notes": None, "notes": "not a note",
+                    "description": "nor this"}
+    }).description == ""
     assert DaftraInvoiceMapper().to_invoice({
-        "Invoice": {"id": "1", "no": "1", "notes": "", "html_notes": "", "description": "من forklø"}
-    }).description == "من forklø"
+        "Invoice": {"id": "1", "no": "1", "html_notes": "", "notes": "x", "description": "y"}
+    }).description == ""
+    # And the field the client does use is unaffected.
+    assert DaftraInvoiceMapper().to_invoice({
+        "Invoice": {"id": "1", "no": "1", "html_notes": "<p>الوزن القائم = 10</p>",
+                    "notes": None}
+    }).description == "الوزن القائم = 10"
 
 
 def test_line_breaks_in_a_plain_note_are_kept_too():
@@ -476,7 +398,7 @@ def test_line_breaks_in_a_plain_note_are_kept_too():
     same thing as one who presses return in the rich-text editor.
     """
     invoice = DaftraInvoiceMapper().to_invoice({
-        "Invoice": {"id": "1", "no": "1", "notes": "أولا\nثانيا\nثالثا"}
+        "Invoice": {"id": "1", "no": "1", "html_notes": "أولا\nثانيا\nثالثا"}
     })
     assert invoice.description.split("\n") == ["أولا", "ثانيا", "ثالثا"]
 

@@ -41,15 +41,20 @@ PUBLIC_URL_KEYS = ("invoice_html_url", "public_url", "permalink")
 PDF_URL_KEYS = ("invoice_pdf_url",)
 #: The free text an invoice carries *about itself* (Daftra calls it notes).
 #:
-#: ``html_notes`` is first because it is the one that actually carries anything.
-#: The operator types the notes into Daftra's **rich-text** box, and that editor
-#: writes ``html_notes`` while leaving plain ``notes`` at ``null`` — measured
-#: across all three configured accounts: ``notes`` was empty on all 68 invoices,
-#: ``html_notes`` was populated on 22 of them. Reading ``notes`` first therefore
-#: finds nothing, which looks exactly like an operator who never typed a note.
-#: ``notes`` and ``description`` stay as fallbacks for the shapes that do write
-#: the plain field.
-NOTES_KEYS = ("html_notes", "notes", "description")
+#: One key, not a tuple of spellings. Daftra exposes ``notes``, ``html_notes`` and
+#: ``description``, but they are not alternate spellings of a field this client
+#: fills — measured across all three configured accounts, ``notes`` and
+#: ``description`` were **empty on all 68 invoices**, while ``html_notes`` was
+#: populated on 22. The operator types into a rich-text editor, and that editor
+#: writes ``html_notes``; the other two are empty columns.
+#:
+#: So the alternative spellings are not read as a fallback. An unpopulated
+#: fallback is not free: it is a claim that the field might be filled in another
+#: shape, made without evidence, and it invites the next reader to believe the
+#: empty ``notes`` was worth falling back to — which is how reading it first hid
+#: the notes on every real invoice for so long. An invoice whose ``html_notes`` is
+#: empty genuinely has no notes.
+NOTES_KEYS = ("html_notes",)
 #: The free text a single line carries about itself, under its product name.
 ITEM_DESCRIPTION_KEYS = ("description",)
 #: The phone fields Daftra keeps on a client, in preference order. ``phone1``
