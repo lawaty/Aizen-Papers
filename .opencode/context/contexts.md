@@ -475,19 +475,29 @@ three resources three ways (`data: [{Invoice:…}]`, `data: {ClientPayment:…}`
 so a fixture's nesting can never break the mapper. A fourth mapper should subclass too.
 
 **Daftra spells one field several ways, and `*_KEYS` tuples encode that.**
-`PUBLIC_URL_KEYS`, `PDF_URL_KEYS`, `NOTES_KEYS`, `ITEM_DESCRIPTION_KEYS` and the
-phone keys are all read through `_first`, which **skips `None`/`""`/`[]`** — so
-tuple order *is* precedence, and a field Daftra sends empty falls through to the
-next spelling. Free-text fields map to `""` when absent and warn about nothing —
-`_text` deliberately has **no default**, unlike every other reader in the class,
-because a note Daftra did not send has no honest substitute.
+`PUBLIC_URL_KEYS`, `PDF_URL_KEYS`, `ITEM_DESCRIPTION_KEYS` and the phone keys are
+all read through `_first`, which **skips `None`/`""`/`[]`** — so tuple order *is*
+precedence, and a field Daftra sends empty falls through to the next spelling.
+Free-text fields map to `""` when absent and warn about nothing — `_text`
+deliberately has **no default**, unlike every other reader in the class, because a
+note Daftra did not send has no honest substitute.
+
+**`NOTES_KEYS` is a single key, not a fallback tuple.** Daftra exposes `notes`,
+`html_notes` and `description`, but they are not alternate spellings of a field
+this client fills: measured across all three configured accounts, `notes` and
+`description` were **empty on all 68 invoices** while `html_notes` was populated
+on 22. Only `html_notes` is read; an invoice whose `html_notes` is empty genuinely
+has no notes. The empty columns are deliberately *not* kept as fallbacks — an
+unpopulated fallback is a claim about another shape made without evidence, and
+reading `notes` first is what hid the notes on every real invoice. Pinned by
+`tests/test_daftra_mapper.py`.
 
 **The mapper is the only layer that knows HTML exists.** Daftra's notes box is a
 rich-text editor: it writes `html_notes` and leaves plain `notes` at `null`, so
-`NOTES_KEYS` leads with `html_notes` and falls back to `notes` / `description`.
-Reading `notes` first finds nothing on real invoices — measured, `notes` was
-empty on all 68 and `html_notes` populated on 22 — and the result is
-indistinguishable from an operator who never typed a note, so it fails silently.
+`NOTES_KEYS` reads `html_notes` alone. Reading `notes` first finds nothing on real
+invoices — measured, `notes` was empty on all 68 and `html_notes` populated on 22
+— and the result is indistinguishable from an operator who never typed a note, so
+it fails silently.
 `html_notes_to_text` (a `html.parser` subclass, per the stdlib-only rule in
 `conventions.md`) turns the markup into plain text **at this boundary**: the
 domain model and `infrastructure/pdf.py` never see a tag, and do not strip one.
